@@ -1,0 +1,68 @@
+[package]
+name = "vybrid"
+version = "1.0.0"
+edition = "2021"
+description = "AI-powered coding assistant using GLM-4.7"
+authors = ["Vybrid Team"]
+license = "MIT"
+
+[[bin]]
+name = "vybrid"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "signal", "process"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Environment
+dotenvy = "0.15"
+
+# CLI
+dialoguer = "0.11"
+console = "0.15"
+
+# File watching (daemon mode)
+notify = "7"
+notify-debouncer-mini = "0.5"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Streaming
+futures = "0.3"
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# Directories
+dirs = "5"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Regex for grep
+regex = "1"
+
+# Glob patterns
+glob = "0.3"
+
+# File locking
+fs2 = "0.4"
+
+# Ctrl+C handling
+ctrlc = "3.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
