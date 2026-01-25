@@ -11,10 +11,12 @@ use console::style;
 use dialoguer::Select;
 use futures::StreamExt;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::client::glm::{GlmClient, Message, ToolCall};
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::daemon::queue::{ExecutionRequest, MessageQueue};
 use crate::tools::definitions::get_all_tools;
 use crate::tools::executor::execute_tool;
 
@@ -82,6 +84,12 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         config.api_base_url.clone(),
         config.model.clone(),
     );
+
+    // Initialize message queue for daemon communication
+    let message_queue = Arc::new(MessageQueue::new(
+        config.messages_dir.clone(),
+        config.progress_dir.clone(),
+    ));
 
     let tools = get_all_tools();
     let mut conversation = Conversation::new(&get_system_prompt());
@@ -167,6 +175,38 @@ async fn run_agent_mode(config: Config) -> Result<()> {
                 }
                 Err(e) => ui::print_error(&format!("Failed to read '{}': {}", path, e)),
             }
+            continue;
+        }
+
+        // Handle /delegate command - send task to daemon
+        if input.starts_with("/delegate ") {
+            let task = &input[10..];
+            if task.trim().is_empty() {
+                ui::print_error("Usage: /delegate <task description>");
+                continue;
+            }
+            
+            match delegate_to_daemon(&message_queue, task).await {
+                Ok(result) => {
+                    println!("\n{}", style("Daemon Response:").cyan().bold());
+                    println!("{}", style("─".repeat(50)).dim());
+                    println!("{}", result);
+                    println!("{}", style("─".repeat(50)).dim());
+                    
+                    // Optionally add result to conversation context
+                    conversation.add_user_message(&format!(
+                        "I delegated this task to the daemon: \"{}\"\n\nResult:\n{}",
+                        task, result
+                    ));
+                }
+                Err(e) => ui::print_error(&format!("Delegation failed: {}", e)),
+            }
+            continue;
+        }
+
+        // Handle /daemon-status command
+        if input == "/daemon" || input == "/daemon-status" {
+            check_daemon_status(&config);
             continue;
         }
 
@@ -340,6 +380,166 @@ async fn run_daemon_mode(config: Config) -> Result<()> {
     daemon::start_daemon_pool(config).await
 }
 
+/// Delegate a task to the daemon pool
+async fn delegate_to_daemon(queue: &Arc<MessageQueue>, task: &str) -> Result<String> {
+    // Check if daemon is running by looking for the lock file
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let lock_file = home.join(".vybrid").join("daemon_pool").join("pool.lock");
+    
+    if !lock_file.exists() {
+        return Err(anyhow::anyhow!(
+            "Daemon is not running. Start it with: vybrid → Daemon Mode"
+        ));
+    }
+
+    // Get current working directory
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    // Create execution request
+    let request = ExecutionRequest::new(task.to_string(), cwd);
+    let request_id = request.id.clone();
+
+    println!(
+        "\n{} Delegating to daemon...",
+        style("→").cyan()
+    );
+    println!("  Request ID: {}", style(&request_id[..8]).yellow());
+    println!("  Task: {}", style(task).dim());
+
+    // Send request to queue
+    queue.send_request(&request)?;
+    println!("  {} Request sent", style("✓").green());
+
+    // Poll for response with progress updates
+    println!("  {} Waiting for daemon response...", style("⏳").yellow());
+
+    let timeout_secs = 300; // 5 minute timeout
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(500);
+    let mut last_stage = String::new();
+
+    loop {
+        // Check timeout
+        if start.elapsed().as_secs() >= timeout_secs {
+            return Err(anyhow::anyhow!("Daemon response timeout after {} seconds", timeout_secs));
+        }
+
+        // Check for response file
+        let response_path = home
+            .join(".vybrid")
+            .join("messages")
+            .join(format!("response_{}.json", request_id));
+
+        if response_path.exists() {
+            // Read and parse response
+            let content = std::fs::read_to_string(&response_path)?;
+            let response: crate::daemon::queue::ExecutionResponse = serde_json::from_str(&content)?;
+
+            // Clean up request file
+            let request_path = home
+                .join(".vybrid")
+                .join("messages")
+                .join(format!("request_{}.json", request_id));
+            let _ = std::fs::remove_file(&request_path);
+            let _ = std::fs::remove_file(&response_path);
+
+            // Clean up progress file
+            let progress_path = home
+                .join(".vybrid")
+                .join("progress")
+                .join(format!("progress_{}.json", request_id));
+            let _ = std::fs::remove_file(&progress_path);
+
+            match response.status.as_str() {
+                "success" => {
+                    println!(
+                        "  {} Completed in {:.2}s",
+                        style("✓").green(),
+                        response.processing_time.unwrap_or(0.0)
+                    );
+                    return Ok(response.result);
+                }
+                "error" => {
+                    return Err(anyhow::anyhow!("Daemon error: {}", response.result));
+                }
+                "cancelled" => {
+                    return Err(anyhow::anyhow!("Request was cancelled"));
+                }
+                _ => {
+                    return Err(anyhow::anyhow!("Unknown response status: {}", response.status));
+                }
+            }
+        }
+
+        // Check for progress updates
+        let progress_path = home
+            .join(".vybrid")
+            .join("progress")
+            .join(format!("progress_{}.json", request_id));
+
+        if progress_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&progress_path) {
+                if let Ok(progress) = serde_json::from_str::<crate::daemon::queue::ProgressUpdate>(&content) {
+                    if progress.stage != last_stage {
+                        last_stage = progress.stage.clone();
+                        if let Some(msg) = &progress.message {
+                            println!("  {} {} - {}", style("↻").blue(), progress.stage, style(msg).dim());
+                        } else {
+                            println!("  {} {}", style("↻").blue(), progress.stage);
+                        }
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Check if daemon is running
+fn check_daemon_status(config: &Config) {
+    let lock_file = config.daemon_lock_file();
+    
+    println!();
+    println!("{}", style("Daemon Status:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+
+    if !lock_file.exists() {
+        println!("  Status: {} Not running", style("●").red());
+        println!("  Start with: {} → select Daemon Mode", style("vybrid").yellow());
+    } else {
+        match std::fs::read_to_string(&lock_file) {
+            Ok(content) => {
+                if let Ok(lock) = serde_json::from_str::<serde_json::Value>(&content) {
+                    println!("  Status: {} Running", style("●").green());
+                    if let Some(pid) = lock.get("pid") {
+                        println!("  PID: {}", style(pid).yellow());
+                    }
+                    if let Some(workers) = lock.get("workers") {
+                        println!("  Workers: {}", style(workers).yellow());
+                    }
+                    if let Some(session) = lock.get("session_id").and_then(|s| s.as_str()) {
+                        println!("  Session: {}", style(&session[..8]).yellow());
+                    }
+                    if let Some(timestamp) = lock.get("timestamp").and_then(|t| t.as_str()) {
+                        println!("  Started: {}", style(timestamp).dim());
+                    }
+                }
+            }
+            Err(_) => {
+                println!("  Status: {} Unknown (lock file unreadable)", style("●").yellow());
+            }
+        }
+    }
+
+    println!();
+    println!("{}", style("Usage:").cyan());
+    println!("  {} - Send task to daemon", style("/delegate <task>").yellow());
+    println!();
+}
+
 /// Get the system prompt for agent mode
 fn get_system_prompt() -> String {
     r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains.
@@ -423,5 +623,10 @@ fn show_help() {
     println!("  {}       - Start new conversation", style("/new").yellow());
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
+    println!();
+    println!("{}", style("Daemon Commands:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+    println!("  {} - Delegate task to daemon", style("/delegate <task>").yellow());
+    println!("  {}    - Check daemon status", style("/daemon").yellow());
     println!();
 }
