@@ -17,7 +17,16 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        // Load .env file if it exists
+        // 1. First, load global config from ~/.vybrid/.env (if it exists)
+        //    This allows vybrid to be launched from any directory
+        if let Some(home) = dirs::home_dir() {
+            let global_env = home.join(".vybrid").join(".env");
+            if global_env.exists() {
+                dotenvy::from_path(&global_env).ok();
+            }
+        }
+
+        // 2. Then load local .env (can override global settings for project-specific config)
         dotenvy::dotenv().ok();
 
         let api_key = std::env::var("ZAI_API_KEY")

@@ -32,8 +32,9 @@ async fn main() -> Result<()> {
         Ok(c) => c,
         Err(e) => {
             ui::print_error(&format!("Configuration error: {}", e));
-            eprintln!("\nPlease create a .env file with:");
+            eprintln!("\nPlease create ~/.vybrid/.env with:");
             eprintln!("  ZAI_API_KEY=your_api_key_here");
+            eprintln!("\nOr create a local .env file in your project directory.");
             std::process::exit(1);
         }
     };
