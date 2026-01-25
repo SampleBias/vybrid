@@ -2,7 +2,7 @@
 name = "vybrid"
 version = "1.0.0"
 edition = "2021"
-description = "AI-powered coding assistant using GLM-4.7"
+description = "AI powered coding assistant built from the trenches with Rust to save humanity from bloat."
 authors = ["Vybrid Team"]
 license = "MIT"
 
