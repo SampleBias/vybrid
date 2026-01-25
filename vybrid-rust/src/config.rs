@@ -46,7 +46,7 @@ impl Config {
 
         Ok(Self {
             api_key,
-            api_base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_base_url: "https://api.z.ai/api/coding/paas/v4".to_string(),
             model: "glm-4.7".to_string(),
             vybrid_dir,
             messages_dir,
