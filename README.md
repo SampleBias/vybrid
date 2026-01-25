@@ -1,6 +1,6 @@
 # Vybrid
 
-AI-powered coding assistant using GLM-4.7 from Z.AI.
+AI powered coding assistant built from the trenches with Rust to save humanity from bloat.
 
 ## Features
 
