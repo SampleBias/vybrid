@@ -2,7 +2,22 @@ use crate::client::glm::{FunctionDef, Tool};
 use serde_json::json;
 
 /// Get all available tools for function calling
-pub fn get_all_tools() -> Vec<Tool> {
+/// 
+/// # Arguments
+/// * `daemon_available` - Whether the daemon pool is running and available for delegation
+pub fn get_all_tools(daemon_available: bool) -> Vec<Tool> {
+    let mut tools = get_base_tools();
+    
+    // Only add delegation tools if daemon is available
+    if daemon_available {
+        tools.extend(get_delegation_tools());
+    }
+    
+    tools
+}
+
+/// Get base tools that are always available
+fn get_base_tools() -> Vec<Tool> {
     vec![
         // File reading
         Tool {
@@ -244,6 +259,65 @@ pub fn get_all_tools() -> Vec<Tool> {
                         }
                     },
                     "required": ["task_description"]
+                }),
+            },
+        },
+    ]
+}
+
+/// Get delegation tools (only available when daemon is running)
+fn get_delegation_tools() -> Vec<Tool> {
+    vec![
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "delegate_to_daemon".to_string(),
+                description: r#"Delegate a task to background daemon workers for parallel or asynchronous execution. 
+Use this tool for:
+- Long-running operations (builds, tests, large file processing)
+- Multiple independent tasks that can run in parallel
+- Background work while continuing to interact with the user
+- Tasks that don't require immediate results
+
+The daemon pool has multiple workers that can process tasks concurrently.
+For quick operations (simple file reads, single commands), execute directly instead."#.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {
+                            "type": "string",
+                            "description": "The task description to delegate to daemon workers. Be specific and include all necessary context."
+                        },
+                        "priority": {
+                            "type": "integer",
+                            "description": "Task priority (1 = highest/urgent, 5 = lowest/background). Default is 1.",
+                            "minimum": 1,
+                            "maximum": 5
+                        },
+                        "wait_for_result": {
+                            "type": "boolean",
+                            "description": "If true, wait for the daemon to complete and return the result. If false, queue the task and continue immediately (fire-and-forget). Default is true."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Timeout in seconds when waiting for result. Default is 300 (5 minutes). Only applies if wait_for_result is true.",
+                            "minimum": 10,
+                            "maximum": 600
+                        }
+                    },
+                    "required": ["task"]
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "check_daemon_status".to_string(),
+                description: "Check the current status of the daemon pool including number of workers, uptime, and availability.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
                 }),
             },
         },

@@ -125,7 +125,8 @@ impl Worker {
     }
 
     async fn execute_ai_request(&self, request: &ExecutionRequest) -> Result<String> {
-        let tools = get_all_tools();
+        // Daemon workers don't have delegation tools (false) to prevent circular dependencies
+        let tools = get_all_tools(false);
         let system_prompt = get_daemon_system_prompt();
 
         let mut messages = vec![
@@ -217,12 +218,14 @@ impl Worker {
             }
 
             // Execute tool calls
+            // Note: Daemon workers don't have delegation capability to avoid circular dependencies
             for tool_call in &tool_calls {
                 eprintln!("  → Executing: {}", tool_call.function.name);
 
                 let result = execute_tool(
                     &tool_call.function.name,
                     &tool_call.function.arguments,
+                    None, // No config = no delegation tools available in daemon mode
                 ).await?;
 
                 messages.push(Message {

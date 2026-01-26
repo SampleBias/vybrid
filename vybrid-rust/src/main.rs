@@ -91,8 +91,16 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         config.progress_dir.clone(),
     ));
 
-    let tools = get_all_tools();
-    let mut conversation = Conversation::new(&get_system_prompt());
+    // Check initial daemon availability and show status
+    let daemon_available = config.is_daemon_available();
+    if daemon_available {
+        println!("{}", style("Daemon pool detected - delegation tools enabled").green().dim());
+    } else {
+        println!("{}", style("Daemon pool not running - delegation tools disabled").yellow().dim());
+    }
+    println!();
+
+    let mut conversation = Conversation::new(&get_system_prompt(daemon_available));
 
     loop {
         // Prompt for input
@@ -133,7 +141,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
                 continue;
             }
             "/tools" => {
-                show_available_tools();
+                show_available_tools(config.is_daemon_available());
                 continue;
             }
             "/help" => {
@@ -213,8 +221,12 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         // Add user message to conversation
         conversation.add_user_message(input);
 
+        // Check daemon availability before each AI request (dynamic tool availability)
+        let daemon_available = config.is_daemon_available();
+        let tools = get_all_tools(daemon_available);
+
         // Process with AI
-        if let Err(e) = process_ai_response(&client, &mut conversation, &tools).await {
+        if let Err(e) = process_ai_response(&client, &mut conversation, &tools, &config).await {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -229,6 +241,7 @@ async fn process_ai_response(
     client: &GlmClient,
     conversation: &mut Conversation,
     tools: &[crate::client::glm::Tool],
+    config: &Config,
 ) -> Result<()> {
     let stream = client
         .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
@@ -339,7 +352,7 @@ async fn process_ai_response(
 
             ui::print_tool_call(&tool_call.function.name);
 
-            let result = execute_tool(&tool_call.function.name, &tool_call.function.arguments).await;
+            let result = execute_tool(&tool_call.function.name, &tool_call.function.arguments, Some(config)).await;
 
             match &result {
                 Ok(output) => {
@@ -368,7 +381,7 @@ async fn process_ai_response(
         ui::print_info("Processing results...");
 
         // Recursive call for follow-up (with depth limit built into the loop)
-        Box::pin(process_ai_response(client, conversation, tools)).await?;
+        Box::pin(process_ai_response(client, conversation, tools, config)).await?;
     }
 
     Ok(())
@@ -541,8 +554,8 @@ fn check_daemon_status(config: &Config) {
 }
 
 /// Get the system prompt for agent mode
-fn get_system_prompt() -> String {
-    r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains.
+fn get_system_prompt(daemon_available: bool) -> String {
+    let base_prompt = r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains.
 Your expertise spans system design, algorithms, testing, and best practices.
 You provide thoughtful, well-structured solutions while explaining your reasoning.
 
@@ -579,7 +592,48 @@ Available tools:
 - google_search: Search for information online
 - create_project_structure: Initialize project files
 - get_current_todo_items: List incomplete tasks
-- mark_todo_complete: Mark a task as done
+- mark_todo_complete: Mark a task as done"#;
+
+    let daemon_section = if daemon_available {
+        r#"
+
+DAEMON DELEGATION (AVAILABLE):
+The daemon pool is running with background workers. You have access to delegation tools:
+- delegate_to_daemon: Send tasks to background workers for parallel/async execution
+- check_daemon_status: Check daemon pool status and worker availability
+
+DELEGATION GUIDELINES:
+Use delegate_to_daemon for:
+• Long-running operations (builds, tests, large file processing)
+• Multiple independent tasks that can run in parallel
+• Background work while continuing to interact with the user
+• Tasks that don't need immediate results
+
+Execute directly (without delegation) for:
+• Quick file reads/writes
+• Simple grep searches  
+• Single commands with immediate results
+• Tasks where you need the result before proceeding
+
+DELEGATION BEST PRACTICES:
+1. For parallel work: Delegate multiple tasks with wait_for_result=false, then check status
+2. For sequential work: Use wait_for_result=true (default)
+3. Set appropriate priority (1=urgent, 5=background)
+4. Provide clear, detailed task descriptions - daemon workers have full context"#
+    } else {
+        r#"
+
+DAEMON DELEGATION (NOT AVAILABLE):
+The daemon pool is not currently running. Delegation tools are disabled.
+All tasks will be executed directly in this session.
+
+To enable delegation:
+1. Start a new terminal
+2. Run: vybrid → select Daemon Mode
+3. Return to this session - delegation tools will become available"#
+    };
+
+    let guidelines = r#"
 
 Guidelines:
 1. ALWAYS start any project work by creating project structure files
@@ -588,22 +642,34 @@ Guidelines:
 4. Explain what you're doing and why
 5. Be thorough in analysis and recommendations
 
-IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#.to_string()
+IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#;
+
+    format!("{}{}{}", base_prompt, daemon_section, guidelines)
 }
 
 /// Show available tools
-fn show_available_tools() {
+fn show_available_tools(daemon_available: bool) {
     println!();
     println!("{}", style("Available Tools:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
 
-    let tools = get_all_tools();
+    let tools = get_all_tools(daemon_available);
     for tool in tools {
+        // Truncate description for display
+        let desc: String = tool.function.description.lines().next().unwrap_or("").to_string();
         println!(
             "  {} - {}",
             style(&tool.function.name).yellow(),
-            style(&tool.function.description).dim()
+            style(&desc).dim()
         );
+    }
+
+    if daemon_available {
+        println!();
+        println!("{}", style("Delegation tools enabled (daemon running)").green().dim());
+    } else {
+        println!();
+        println!("{}", style("Delegation tools disabled (start daemon to enable)").yellow().dim());
     }
 
     println!();
