@@ -241,6 +241,7 @@ pub fn format_delegation_result(result: &DelegationResult) -> String {
 }
 
 /// Check the status of a previously delegated task
+#[allow(dead_code)]
 pub fn check_delegation_status(config: &Config, request_id: &str) -> DelegationResult {
     let response_path = config
         .messages_dir

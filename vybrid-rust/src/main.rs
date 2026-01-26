@@ -44,8 +44,8 @@ async fn main() -> Result<()> {
     // Display banner
     ui::display_banner();
 
-    // Mode selection
-    let mode = select_mode()?;
+    // Mode selection (pass config to show daemon status)
+    let mode = select_mode(&config)?;
 
     match mode {
         Mode::Agent => run_agent_mode(config).await,
@@ -54,16 +54,24 @@ async fn main() -> Result<()> {
 }
 
 /// Interactive mode selection
-fn select_mode() -> Result<Mode> {
+fn select_mode(config: &Config) -> Result<Mode> {
     println!();
-    let options = &[
-        "[A] Agent Mode - Full AI Engineer with tools",
-        "[D] Daemon Mode - Background service for processing requests",
+    
+    // Check daemon status to show in menu
+    let daemon_status = if config.is_daemon_available() {
+        style("● daemon running").green().to_string()
+    } else {
+        style("○ daemon stopped").yellow().to_string()
+    };
+    
+    let options = vec![
+        format!("[A] Agent Mode - Full AI Engineer with tools ({})", daemon_status),
+        "[D] Daemon Mode - Background service for processing requests".to_string(),
     ];
 
     let selection = Select::new()
         .with_prompt("Select mode")
-        .items(options)
+        .items(&options)
         .default(0)
         .interact()?;
 
