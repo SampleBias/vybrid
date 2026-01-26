@@ -692,7 +692,21 @@ fn show_help() {
     println!();
     println!("{}", style("Daemon Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
-    println!("  {} - Delegate task to daemon", style("/delegate <task>").yellow());
+    println!("  {} - Manual delegation to daemon", style("/delegate <task>").yellow());
     println!("  {}    - Check daemon status", style("/daemon").yellow());
+    println!();
+    println!("{}", style("Automatic Delegation:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+    println!("  When the daemon pool is running, the AI automatically");
+    println!("  gains access to delegation tools:");
+    println!("    {} - Delegate tasks to background workers", style("delegate_to_daemon").yellow());
+    println!("    {}  - Check daemon pool status", style("check_daemon_status").yellow());
+    println!();
+    println!("  The AI will intelligently decide when to delegate based on:");
+    println!("    • Long-running operations (builds, tests)");
+    println!("    • Parallel independent tasks");
+    println!("    • Background work that doesn't need immediate results");
+    println!();
+    println!("  Run {} to see if delegation tools are enabled.", style("/tools").yellow());
     println!();
 }
