@@ -28,10 +28,6 @@ dotenvy = "0.15"
 dialoguer = "0.11"
 console = "0.15"
 
-# File watching (daemon mode)
-notify = "7"
-notify-debouncer-mini = "0.5"
-
 # UUID
 uuid = { version = "1", features = ["v4"] }
 
@@ -55,9 +51,6 @@ regex = "1"
 
 # Glob patterns
 glob = "0.3"
-
-# File locking
-fs2 = "0.4"
 
 # Ctrl+C handling
 ctrlc = "3.4"

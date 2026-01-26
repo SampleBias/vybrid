@@ -1,5 +1,4 @@
 pub mod definitions;
-pub mod delegate;
 pub mod executor;
 pub mod file_ops;
 pub mod grep;

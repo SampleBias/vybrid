@@ -19,18 +19,9 @@ pub fn display_banner() {
 }
 
 /// Display mode selection header
-pub fn display_mode_header(mode: &str) {
-    match mode {
-        "agent" => {
-            println!("\n{}", style("Agent Mode Active").green().bold());
-            println!("Commands: 'exit' to quit, '!' for shell mode, '!<cmd>' for single command");
-        }
-        "daemon" => {
-            println!("\n{}", style("Daemon Mode Active").yellow().bold());
-            println!("Background service running. Press Ctrl+C to stop.");
-        }
-        _ => {}
-    }
+pub fn display_mode_header() {
+    println!("\n{}", style("Agent Mode Active").green().bold());
+    println!("Commands: 'exit' to quit, '!' for shell mode, '!<cmd>' for single command");
 }
 
 /// Display current working directory

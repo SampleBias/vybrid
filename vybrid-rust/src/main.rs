@@ -1,31 +1,20 @@
 mod client;
 mod config;
 mod conversation;
-mod daemon;
 mod shell;
 mod tools;
 mod ui;
 
 use anyhow::Result;
 use console::style;
-use dialoguer::Select;
 use futures::StreamExt;
 use std::io::{self, Write};
-use std::sync::Arc;
 
 use crate::client::glm::{GlmClient, Message, ToolCall};
 use crate::config::Config;
 use crate::conversation::Conversation;
-use crate::daemon::queue::{ExecutionRequest, MessageQueue};
 use crate::tools::definitions::get_all_tools;
 use crate::tools::executor::execute_tool;
-
-/// Application mode
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Mode {
-    Agent,
-    Daemon,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,47 +33,13 @@ async fn main() -> Result<()> {
     // Display banner
     ui::display_banner();
 
-    // Mode selection (pass config to show daemon status)
-    let mode = select_mode(&config)?;
-
-    match mode {
-        Mode::Agent => run_agent_mode(config).await,
-        Mode::Daemon => run_daemon_mode(config).await,
-    }
-}
-
-/// Interactive mode selection
-fn select_mode(config: &Config) -> Result<Mode> {
-    println!();
-    
-    // Check daemon status to show in menu
-    let daemon_status = if config.is_daemon_available() {
-        style("● daemon running").green().to_string()
-    } else {
-        style("○ daemon stopped").yellow().to_string()
-    };
-    
-    let options = vec![
-        format!("[A] Agent Mode - Full AI Engineer with tools ({})", daemon_status),
-        "[D] Daemon Mode - Background service for processing requests".to_string(),
-    ];
-
-    let selection = Select::new()
-        .with_prompt("Select mode")
-        .items(&options)
-        .default(0)
-        .interact()?;
-
-    Ok(match selection {
-        0 => Mode::Agent,
-        1 => Mode::Daemon,
-        _ => Mode::Agent,
-    })
+    // Run agent mode directly
+    run_agent_mode(config).await
 }
 
 /// Run agent mode - interactive AI assistant
 async fn run_agent_mode(config: Config) -> Result<()> {
-    ui::display_mode_header("agent");
+    ui::display_mode_header();
     ui::display_cwd();
 
     let client = GlmClient::new(
@@ -93,22 +48,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         config.model.clone(),
     );
 
-    // Initialize message queue for daemon communication
-    let message_queue = Arc::new(MessageQueue::new(
-        config.messages_dir.clone(),
-        config.progress_dir.clone(),
-    ));
-
-    // Check initial daemon availability and show status
-    let daemon_available = config.is_daemon_available();
-    if daemon_available {
-        println!("{}", style("Daemon pool detected - delegation tools enabled").green().dim());
-    } else {
-        println!("{}", style("Daemon pool not running - delegation tools disabled").yellow().dim());
-    }
-    println!();
-
-    let mut conversation = Conversation::new(&get_system_prompt(daemon_available));
+    let mut conversation = Conversation::new(&get_system_prompt());
 
     loop {
         // Prompt for input
@@ -140,7 +80,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
             "clear" => {
                 ui::clear_screen();
                 ui::display_banner();
-                ui::display_mode_header("agent");
+                ui::display_mode_header();
                 ui::display_cwd();
                 continue;
             }
@@ -149,7 +89,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
                 continue;
             }
             "/tools" => {
-                show_available_tools(config.is_daemon_available());
+                show_available_tools();
                 continue;
             }
             "/help" => {
@@ -194,47 +134,13 @@ async fn run_agent_mode(config: Config) -> Result<()> {
             continue;
         }
 
-        // Handle /delegate command - send task to daemon
-        if input.starts_with("/delegate ") {
-            let task = &input[10..];
-            if task.trim().is_empty() {
-                ui::print_error("Usage: /delegate <task description>");
-                continue;
-            }
-            
-            match delegate_to_daemon(&message_queue, task).await {
-                Ok(result) => {
-                    println!("\n{}", style("Daemon Response:").cyan().bold());
-                    println!("{}", style("─".repeat(50)).dim());
-                    println!("{}", result);
-                    println!("{}", style("─".repeat(50)).dim());
-                    
-                    // Optionally add result to conversation context
-                    conversation.add_user_message(&format!(
-                        "I delegated this task to the daemon: \"{}\"\n\nResult:\n{}",
-                        task, result
-                    ));
-                }
-                Err(e) => ui::print_error(&format!("Delegation failed: {}", e)),
-            }
-            continue;
-        }
-
-        // Handle /daemon-status command
-        if input == "/daemon" || input == "/daemon-status" {
-            check_daemon_status(&config);
-            continue;
-        }
-
         // Add user message to conversation
         conversation.add_user_message(input);
 
-        // Check daemon availability before each AI request (dynamic tool availability)
-        let daemon_available = config.is_daemon_available();
-        let tools = get_all_tools(daemon_available);
+        let tools = get_all_tools();
 
         // Process with AI
-        if let Err(e) = process_ai_response(&client, &mut conversation, &tools, &config).await {
+        if let Err(e) = process_ai_response(&client, &mut conversation, &tools).await {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -249,7 +155,6 @@ async fn process_ai_response(
     client: &GlmClient,
     conversation: &mut Conversation,
     tools: &[crate::client::glm::Tool],
-    config: &Config,
 ) -> Result<()> {
     let stream = client
         .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
@@ -360,7 +265,7 @@ async fn process_ai_response(
 
             ui::print_tool_call(&tool_call.function.name);
 
-            let result = execute_tool(&tool_call.function.name, &tool_call.function.arguments, Some(config)).await;
+            let result = execute_tool(&tool_call.function.name, &tool_call.function.arguments).await;
 
             match &result {
                 Ok(output) => {
@@ -389,181 +294,15 @@ async fn process_ai_response(
         ui::print_info("Processing results...");
 
         // Recursive call for follow-up (with depth limit built into the loop)
-        Box::pin(process_ai_response(client, conversation, tools, config)).await?;
+        Box::pin(process_ai_response(client, conversation, tools)).await?;
     }
 
     Ok(())
 }
 
-/// Run daemon mode - background service
-async fn run_daemon_mode(config: Config) -> Result<()> {
-    ui::display_mode_header("daemon");
-    daemon::start_daemon_pool(config).await
-}
-
-/// Delegate a task to the daemon pool
-async fn delegate_to_daemon(queue: &Arc<MessageQueue>, task: &str) -> Result<String> {
-    // Check if daemon is running by looking for the lock file
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let lock_file = home.join(".vybrid").join("daemon_pool").join("pool.lock");
-    
-    if !lock_file.exists() {
-        return Err(anyhow::anyhow!(
-            "Daemon is not running. Start it with: vybrid → Daemon Mode"
-        ));
-    }
-
-    // Get current working directory
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| ".".to_string());
-
-    // Create execution request
-    let request = ExecutionRequest::new(task.to_string(), cwd);
-    let request_id = request.id.clone();
-
-    println!(
-        "\n{} Delegating to daemon...",
-        style("→").cyan()
-    );
-    println!("  Request ID: {}", style(&request_id[..8]).yellow());
-    println!("  Task: {}", style(task).dim());
-
-    // Send request to queue
-    queue.send_request(&request)?;
-    println!("  {} Request sent", style("✓").green());
-
-    // Poll for response with progress updates
-    println!("  {} Waiting for daemon response...", style("⏳").yellow());
-
-    let timeout_secs = 300; // 5 minute timeout
-    let start = std::time::Instant::now();
-    let poll_interval = std::time::Duration::from_millis(500);
-    let mut last_stage = String::new();
-
-    loop {
-        // Check timeout
-        if start.elapsed().as_secs() >= timeout_secs {
-            return Err(anyhow::anyhow!("Daemon response timeout after {} seconds", timeout_secs));
-        }
-
-        // Check for response file
-        let response_path = home
-            .join(".vybrid")
-            .join("messages")
-            .join(format!("response_{}.json", request_id));
-
-        if response_path.exists() {
-            // Read and parse response
-            let content = std::fs::read_to_string(&response_path)?;
-            let response: crate::daemon::queue::ExecutionResponse = serde_json::from_str(&content)?;
-
-            // Clean up request file
-            let request_path = home
-                .join(".vybrid")
-                .join("messages")
-                .join(format!("request_{}.json", request_id));
-            let _ = std::fs::remove_file(&request_path);
-            let _ = std::fs::remove_file(&response_path);
-
-            // Clean up progress file
-            let progress_path = home
-                .join(".vybrid")
-                .join("progress")
-                .join(format!("progress_{}.json", request_id));
-            let _ = std::fs::remove_file(&progress_path);
-
-            match response.status.as_str() {
-                "success" => {
-                    println!(
-                        "  {} Completed in {:.2}s",
-                        style("✓").green(),
-                        response.processing_time.unwrap_or(0.0)
-                    );
-                    return Ok(response.result);
-                }
-                "error" => {
-                    return Err(anyhow::anyhow!("Daemon error: {}", response.result));
-                }
-                "cancelled" => {
-                    return Err(anyhow::anyhow!("Request was cancelled"));
-                }
-                _ => {
-                    return Err(anyhow::anyhow!("Unknown response status: {}", response.status));
-                }
-            }
-        }
-
-        // Check for progress updates
-        let progress_path = home
-            .join(".vybrid")
-            .join("progress")
-            .join(format!("progress_{}.json", request_id));
-
-        if progress_path.exists() {
-            if let Ok(content) = std::fs::read_to_string(&progress_path) {
-                if let Ok(progress) = serde_json::from_str::<crate::daemon::queue::ProgressUpdate>(&content) {
-                    if progress.stage != last_stage {
-                        last_stage = progress.stage.clone();
-                        if let Some(msg) = &progress.message {
-                            println!("  {} {} - {}", style("↻").blue(), progress.stage, style(msg).dim());
-                        } else {
-                            println!("  {} {}", style("↻").blue(), progress.stage);
-                        }
-                    }
-                }
-            }
-        }
-
-        tokio::time::sleep(poll_interval).await;
-    }
-}
-
-/// Check if daemon is running
-fn check_daemon_status(config: &Config) {
-    let lock_file = config.daemon_lock_file();
-    
-    println!();
-    println!("{}", style("Daemon Status:").cyan().bold());
-    println!("{}", style("─".repeat(40)).dim());
-
-    if !lock_file.exists() {
-        println!("  Status: {} Not running", style("●").red());
-        println!("  Start with: {} → select Daemon Mode", style("vybrid").yellow());
-    } else {
-        match std::fs::read_to_string(&lock_file) {
-            Ok(content) => {
-                if let Ok(lock) = serde_json::from_str::<serde_json::Value>(&content) {
-                    println!("  Status: {} Running", style("●").green());
-                    if let Some(pid) = lock.get("pid") {
-                        println!("  PID: {}", style(pid).yellow());
-                    }
-                    if let Some(workers) = lock.get("workers") {
-                        println!("  Workers: {}", style(workers).yellow());
-                    }
-                    if let Some(session) = lock.get("session_id").and_then(|s| s.as_str()) {
-                        println!("  Session: {}", style(&session[..8]).yellow());
-                    }
-                    if let Some(timestamp) = lock.get("timestamp").and_then(|t| t.as_str()) {
-                        println!("  Started: {}", style(timestamp).dim());
-                    }
-                }
-            }
-            Err(_) => {
-                println!("  Status: {} Unknown (lock file unreadable)", style("●").yellow());
-            }
-        }
-    }
-
-    println!();
-    println!("{}", style("Usage:").cyan());
-    println!("  {} - Send task to daemon", style("/delegate <task>").yellow());
-    println!();
-}
-
 /// Get the system prompt for agent mode
-fn get_system_prompt(daemon_available: bool) -> String {
-    let base_prompt = r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains.
+fn get_system_prompt() -> String {
+    r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains.
 Your expertise spans system design, algorithms, testing, and best practices.
 You provide thoughtful, well-structured solutions while explaining your reasoning.
 
@@ -600,48 +339,7 @@ Available tools:
 - google_search: Search for information online
 - create_project_structure: Initialize project files
 - get_current_todo_items: List incomplete tasks
-- mark_todo_complete: Mark a task as done"#;
-
-    let daemon_section = if daemon_available {
-        r#"
-
-DAEMON DELEGATION (AVAILABLE):
-The daemon pool is running with background workers. You have access to delegation tools:
-- delegate_to_daemon: Send tasks to background workers for parallel/async execution
-- check_daemon_status: Check daemon pool status and worker availability
-
-DELEGATION GUIDELINES:
-Use delegate_to_daemon for:
-• Long-running operations (builds, tests, large file processing)
-• Multiple independent tasks that can run in parallel
-• Background work while continuing to interact with the user
-• Tasks that don't need immediate results
-
-Execute directly (without delegation) for:
-• Quick file reads/writes
-• Simple grep searches  
-• Single commands with immediate results
-• Tasks where you need the result before proceeding
-
-DELEGATION BEST PRACTICES:
-1. For parallel work: Delegate multiple tasks with wait_for_result=false, then check status
-2. For sequential work: Use wait_for_result=true (default)
-3. Set appropriate priority (1=urgent, 5=background)
-4. Provide clear, detailed task descriptions - daemon workers have full context"#
-    } else {
-        r#"
-
-DAEMON DELEGATION (NOT AVAILABLE):
-The daemon pool is not currently running. Delegation tools are disabled.
-All tasks will be executed directly in this session.
-
-To enable delegation:
-1. Start a new terminal
-2. Run: vybrid → select Daemon Mode
-3. Return to this session - delegation tools will become available"#
-    };
-
-    let guidelines = r#"
+- mark_todo_complete: Mark a task as done
 
 Guidelines:
 1. ALWAYS start any project work by creating project structure files
@@ -650,18 +348,16 @@ Guidelines:
 4. Explain what you're doing and why
 5. Be thorough in analysis and recommendations
 
-IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#;
-
-    format!("{}{}{}", base_prompt, daemon_section, guidelines)
+IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#.to_string()
 }
 
 /// Show available tools
-fn show_available_tools(daemon_available: bool) {
+fn show_available_tools() {
     println!();
     println!("{}", style("Available Tools:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
 
-    let tools = get_all_tools(daemon_available);
+    let tools = get_all_tools();
     for tool in tools {
         // Truncate description for display
         let desc: String = tool.function.description.lines().next().unwrap_or("").to_string();
@@ -670,14 +366,6 @@ fn show_available_tools(daemon_available: bool) {
             style(&tool.function.name).yellow(),
             style(&desc).dim()
         );
-    }
-
-    if daemon_available {
-        println!();
-        println!("{}", style("Delegation tools enabled (daemon running)").green().dim());
-    } else {
-        println!();
-        println!("{}", style("Delegation tools disabled (start daemon to enable)").yellow().dim());
     }
 
     println!();
@@ -697,24 +385,5 @@ fn show_help() {
     println!("  {}       - Start new conversation", style("/new").yellow());
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
-    println!();
-    println!("{}", style("Daemon Commands:").cyan().bold());
-    println!("{}", style("─".repeat(40)).dim());
-    println!("  {} - Manual delegation to daemon", style("/delegate <task>").yellow());
-    println!("  {}    - Check daemon status", style("/daemon").yellow());
-    println!();
-    println!("{}", style("Automatic Delegation:").cyan().bold());
-    println!("{}", style("─".repeat(40)).dim());
-    println!("  When the daemon pool is running, the AI automatically");
-    println!("  gains access to delegation tools:");
-    println!("    {} - Delegate tasks to background workers", style("delegate_to_daemon").yellow());
-    println!("    {}  - Check daemon pool status", style("check_daemon_status").yellow());
-    println!();
-    println!("  The AI will intelligently decide when to delegate based on:");
-    println!("    • Long-running operations (builds, tests)");
-    println!("    • Parallel independent tasks");
-    println!("    • Background work that doesn't need immediate results");
-    println!();
-    println!("  Run {} to see if delegation tools are enabled.", style("/tools").yellow());
     println!();
 }
