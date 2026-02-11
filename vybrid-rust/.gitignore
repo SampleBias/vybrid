@@ -5,6 +5,9 @@ Cargo.lock
 # Environment files
 .env
 
+# Installation script (for local use only)
+install.sh
+
 # IDE
 .idea/
 .vscode/

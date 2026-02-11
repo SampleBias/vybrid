@@ -33,9 +33,29 @@ cargo build
 cargo build --release  # Optimized release build (LTO enabled, stripped)
 ```
 
+### Installation (Run from any directory)
+```bash
+./install.sh  # Installs vybrid to ~/.local/bin and updates PATH
+source ~/.bashrc  # Apply changes to current session
+```
+
+After installation, you can run `vybrid` from any directory.
+
+### Manual Installation
+If the install script doesn't work:
+```bash
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/vybrid ~/.local/bin/vybrid
+chmod +x ~/.local/bin/vybrid
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ### Running
 ```bash
-cargo run
+vybrid  # From any directory after installation
+cargo run  # Or run directly from project directory
 ```
 
 ### Development
@@ -95,17 +115,50 @@ SERPAPI_KEY=your_serpapi_key_here    # Optional - For Google search functionalit
 ```
 
 ### Configuration Loading Priority
-1. Global config: `~/.vybrid/.env` (if exists)
+1. Global config: `~/.vybrid/.env` (if exists) - **Recommended for using vybrid from any directory**
 2. Local config: `.env` in current directory (overrides global)
 3. Environment variables (directly set)
 
 ### Directory Structure Created by Vybrid
 ```
 ~/.vybrid/
-├── .env              # Global API keys
+├── .env              # Global API keys (for running vybrid from any directory)
 ├── messages/         # Message storage
 └── progress/         # Progress tracking
+
+~/.local/bin/
+└── vybrid           # Installed binary (if using install.sh)
 ```
+
+### Installing Vybrid for System-Wide Use
+
+To run `vybrid` from any directory (not just the project directory):
+
+```bash
+cd /path/to/vybrid-rust
+./install.sh
+source ~/.bashrc
+```
+
+This will:
+1. Build the release binary
+2. Install it to `~/.local/bin/vybrid`
+3. Add `~/.local/bin` to your PATH
+4. Set up global config directory at `~/.vybrid/.env`
+
+After installation, you can run `vybrid` from any working directory.
+
+### Setting Up API Keys
+
+For running from any directory, add your API key to `~/.vybrid/.env`:
+
+```bash
+mkdir -p ~/.vybrid
+echo "GLM_API_KEY=your_api_key_here" > ~/.vybrid/.env
+echo "SERPAPI_KEY=your_serpapi_key_here" >> ~/.vybrid/.env  # Optional
+```
+
+For project-specific usage, you can also create a `.env` file in the project directory.
 
 ## Code Conventions
 
