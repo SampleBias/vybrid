@@ -59,6 +59,7 @@ vybrid-rust/
 │   ├── main.rs              # CLI entry point, agent loop
 │   ├── config.rs            # Configuration loading
 │   ├── conversation.rs      # Conversation history management
+│   ├── project_docs.rs      # Project documentation management
 │   ├── ui.rs                # Terminal UI and formatting
 │   ├── client/
 │   │   ├── mod.rs           # Client module
@@ -389,6 +390,53 @@ Type `!` alone to enter interactive shell:
 - Directory changes persist within shell session
 - State maintained across commands
 - Type empty line or `exit` to return to Vybrid
+
+## Project Documentation Feature
+
+The `/docs` command allows you to add project-specific context documentation that the AI agent will automatically use when answering questions. This is particularly useful for:
+
+- Framework-specific documentation (e.g., Fyrox, Bevy, Lumol)
+- Project conventions and coding standards
+- Architecture notes and design decisions
+- API references specific to your project
+
+### Usage
+
+```
+/docs                    - Show current project docs
+/docs add <file>         - Add docs from a file
+/docs read               - Enter interactive mode to add docs
+/docs clear              - Clear all project docs
+```
+
+### Storage
+
+Project documentation is stored in `.vybrid/docs.md` in the current project directory. This means each project can have its own documentation context.
+
+### Automatic Context Injection
+
+When you send a message to the AI, project docs are automatically appended to your message with a `---` separator. The AI will use this context when generating responses.
+
+### Example: Adding Bevy Framework Documentation
+
+```bash
+/docs read
+> Project uses Bevy game engine (version 0.14)
+> ECS architecture: Systems operate on Queries over Components
+> Components are data structs with derive(Component)
+> Resources are global data shared across systems
+> Use #[derive(Resource)] for resources
+> Schedule systems using App::add_systems()
+> (empty line to finish)
+```
+
+### Example: Adding Documentation from a File
+
+```bash
+/docs add framework_docs.md
+```
+
+This makes all documentation in `framework_docs.md` available to the AI assistant.
 
 ## Project Files Created by Vybrid
 

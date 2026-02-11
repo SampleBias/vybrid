@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod conversation;
+mod project_docs;
 mod shell;
 mod tools;
 mod ui;
@@ -13,6 +14,7 @@ use std::io::{self, Write};
 use crate::client::glm::{GlmClient, Message, ToolCall};
 use crate::config::Config;
 use crate::conversation::Conversation;
+use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::get_all_tools;
 use crate::tools::executor::execute_tool;
 
@@ -48,6 +50,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         config.model.clone(),
     );
 
+    let project_docs = ProjectDocs::new();
     let mut conversation = Conversation::new(&get_system_prompt());
 
     loop {
@@ -111,6 +114,12 @@ async fn run_agent_mode(config: Config) -> Result<()> {
             _ => {}
         }
 
+        // Handle /docs command
+        if input.starts_with("/docs") {
+            handle_docs_command(&input, &project_docs);
+            continue;
+        }
+
         // Handle single shell commands (!command)
         if input.starts_with('!') {
             let cmd = &input[1..];
@@ -134,8 +143,9 @@ async fn run_agent_mode(config: Config) -> Result<()> {
             continue;
         }
 
-        // Add user message to conversation
-        conversation.add_user_message(input);
+        // Add user message to conversation with project docs context
+        let user_message_with_context = inject_project_docs(&input, &project_docs);
+        conversation.add_user_message(&user_message_with_context);
 
         let tools = get_all_tools();
 
@@ -300,6 +310,19 @@ async fn process_ai_response(
     Ok(())
 }
 
+/// Inject project documentation context into user message
+fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String {
+    match project_docs.read() {
+        Ok(Some(docs)) => {
+            format!(
+                "{}\n\n---\n\nPROJECT CONTEXT:\n{}",
+                user_message, docs
+            )
+        }
+        Ok(None) | Err(_) => user_message.to_string(),
+    }
+}
+
 /// Get the system prompt for agent mode
 fn get_system_prompt() -> String {
     r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains and EXPERT-LEVEL MASTERY OF RUST PROGRAMMING.
@@ -396,4 +419,137 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!();
+    println!("{}", style("Project Docs Commands:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+    println!("  {}           - Show current project docs", style("/docs").yellow());
+    println!("  {}  - Add docs from a file", style("/docs add <file>").yellow());
+    println!("  {}          - Read docs interactively", style("/docs read").yellow());
+    println!("  {}         - Clear project docs", style("/docs clear").yellow());
+    println!();
+}
+
+/// Handle /docs commands
+fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
+    let parts: Vec<&str> = input.splitn(3, ' ').collect();
+
+    match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+        None | Some("show") | Some("") => {
+            // Show current docs
+            match project_docs.read() {
+                Ok(Some(content)) => {
+                    println!();
+                    println!("{}", style("Current Project Documentation:").cyan().bold());
+                    println!("{}", style("─".repeat(40)).dim());
+                    println!("{}", content);
+                    println!();
+                }
+                Ok(None) => {
+                    println!("{}", style("No project documentation found.").dim());
+                    println!(
+                        "Create one with: {}",
+                        style("/docs read").yellow()
+                    );
+                    println!(
+                        "Or add from file: {}",
+                        style("/docs add <file>").yellow()
+                    );
+                }
+                Err(e) => {
+                    ui::print_error(&format!("Failed to read project docs: {}", e));
+                }
+            }
+        }
+        Some("add") => {
+            // Add docs from a file
+            if let Some(path) = parts.get(2) {
+                match tools::file_ops::read_file(path) {
+                    Ok(content) => {
+                        match project_docs.add(&content) {
+                            Ok(_) => {
+                                println!(
+                                    "{}",
+                                    style(format!(
+                                        "Added documentation from '{}' to project docs",
+                                        path
+                                    ))
+                                    .green()
+                                );
+                            }
+                            Err(e) => {
+                                ui::print_error(&format!("Failed to add docs: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ui::print_error(&format!("Failed to read '{}': {}", path, e));
+                    }
+                }
+            } else {
+                println!(
+                    "{}",
+                    style("Usage: /docs add <file>").dim()
+                );
+            }
+        }
+        Some("read") => {
+            // Read docs interactively
+            println!();
+            println!("{}", style("Enter project documentation (empty line to finish):").cyan().bold());
+            println!("{}", style("─".repeat(40)).dim());
+
+            let mut lines = Vec::new();
+            loop {
+                print!("> ");
+                io::stdout().flush().unwrap();
+
+                let mut line = String::new();
+                match io::stdin().read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        lines.push(line.trim_end().to_string());
+                    }
+                    Err(e) => {
+                        ui::print_error(&format!("Input error: {}", e));
+                        break;
+                    }
+                }
+            }
+
+            if lines.is_empty() {
+                println!("{}", style("No documentation entered.").dim());
+                return;
+            }
+
+            let content = lines.join("\n");
+            match project_docs.add(&content) {
+                Ok(_) => {
+                    println!(
+                        "{}",
+                        style("Project documentation saved.").green()
+                    );
+                }
+                Err(e) => {
+                    ui::print_error(&format!("Failed to save docs: {}", e));
+                }
+            }
+        }
+        Some("clear") => {
+            // Clear docs
+            match project_docs.clear() {
+                Ok(_) => {
+                    println!("{}", style("Project documentation cleared.").green());
+                }
+                Err(e) => {
+                    ui::print_error(&format!("Failed to clear docs: {}", e));
+                }
+            }
+        }
+        Some(unknown) => {
+            println!("{}", style(format!("Unknown /docs subcommand: '{}'", unknown)).red());
+            println!("Available subcommands: show, add, read, clear");
+        }
+    }
 }
