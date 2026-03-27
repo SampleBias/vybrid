@@ -61,11 +61,9 @@ impl Config {
         })
     }
 
-    /// Writes or updates `ZAI_API_KEY` in `.env` in the current working directory and applies it to this config.
-    pub fn set_zai_api_key_in_cwd(&mut self, key: String) -> Result<()> {
-        let path = std::env::current_dir()
-            .context("Could not get current working directory")?
-            .join(".env");
+    /// Writes or updates `ZAI_API_KEY` in `~/.vybrid/.env` so it applies in every directory (local `.env` can still override).
+    pub fn set_zai_api_key_global(&mut self, key: String) -> Result<()> {
+        let path = self.vybrid_dir.join(".env");
         merge_env_file(&path, "ZAI_API_KEY", &key)?;
         std::env::set_var("ZAI_API_KEY", &key);
         self.api_key = Some(key);

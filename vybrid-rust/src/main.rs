@@ -53,7 +53,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     if client.is_none() {
         println!(
             "{}",
-            style("No Z.AI API key yet — use /menu to add one (saved to .env in this directory).")
+            style("No Z.AI API key yet — use /menu to add one (saved to ~/.vybrid/.env).")
                 .dim()
         );
         println!();
@@ -160,7 +160,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         let Some(ref c) = client else {
             ui::print_error(
-                "No Z.AI API key. Use /menu → add your API key (writes ./.env in this directory).",
+                "No Z.AI API key. Use /menu → add your API key (saved to ~/.vybrid/.env).",
             );
             continue;
         };
@@ -440,6 +440,10 @@ fn show_help() {
     println!("  {}       - Start new conversation", style("/new").yellow());
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
+    println!(
+        "  {}     - Menu (Z.AI API key → ~/.vybrid/.env)",
+        style("/menu").yellow()
+    );
     println!();
     println!("{}", style("Project Docs Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
@@ -579,7 +583,7 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
 /// Interactive menu (e.g. API key setup for Z.AI)
 fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()> {
     let items = vec![
-        "Add or update Z.AI API key (writes ./.env in this directory)",
+        "Add or update Z.AI API key (saved to ~/.vybrid/.env for all directories)",
         "Back",
     ];
     let sel = Select::new()
@@ -600,7 +604,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 ui::print_error("API key was empty.");
                 return Ok(());
             }
-            config.set_zai_api_key_in_cwd(key)?;
+            config.set_zai_api_key_global(key)?;
             let api_key = config
                 .api_key
                 .clone()
@@ -610,9 +614,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 config.api_base_url.clone(),
                 config.model.clone(),
             ));
-            let env_path = std::env::current_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(".env");
+            let env_path = config.vybrid_dir.join(".env");
             println!(
                 "{}",
                 style(format!("Saved ZAI_API_KEY to {}", env_path.display())).green()
