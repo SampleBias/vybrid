@@ -441,7 +441,7 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Z.AI API key → ~/.vybrid/.env)",
+        "  {}     - Menu (Z.AI & SerpAPI keys → ~/.vybrid/.env)",
         style("/menu").yellow()
     );
     println!();
@@ -580,10 +580,11 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
     }
 }
 
-/// Interactive menu (e.g. API key setup for Z.AI)
+/// Interactive menu (API keys in ~/.vybrid/.env)
 fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()> {
     let items = vec![
         "Add or update Z.AI API key (saved to ~/.vybrid/.env for all directories)",
+        "Add or update SerpAPI key (Google search; same file)",
         "Back",
     ];
     let sel = Select::new()
@@ -592,6 +593,8 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
         .default(0)
         .interact()
         .context("Menu cancelled")?;
+
+    let env_path = config.vybrid_dir.join(".env");
 
     match sel {
         0 => {
@@ -614,10 +617,25 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 config.api_base_url.clone(),
                 config.model.clone(),
             ));
-            let env_path = config.vybrid_dir.join(".env");
             println!(
                 "{}",
                 style(format!("Saved ZAI_API_KEY to {}", env_path.display())).green()
+            );
+        }
+        1 => {
+            let key: String = Input::new()
+                .with_prompt("SerpAPI key")
+                .interact_text()
+                .context("No API key entered")?;
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                ui::print_error("SerpAPI key was empty.");
+                return Ok(());
+            }
+            config.set_serpapi_key_global(key)?;
+            println!(
+                "{}",
+                style(format!("Saved SERPAPI_KEY to {}", env_path.display())).green()
             );
         }
         _ => {}

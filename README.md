@@ -57,6 +57,8 @@ SERPAPI_KEY=your_serpapi_key_here
 
 Get your API key from [Z.AI Open Platform](https://z.ai/model-api).
 
+Keep real keys out of version control: `.env` and `.env.*` are listed in the repo `.gitignore` (only `.env.example` is meant to be committed as a template).
+
 ## Usage
 
 ```bash
@@ -86,7 +88,7 @@ On startup, choose between:
 | `/tools` | List available AI tools |
 | `/new` | Start new conversation |
 | `/help` | Show help |
-| `/menu` | Menu (add or update Z.AI API key in `~/.vybrid/.env`) |
+| `/menu` | Menu (add or update Z.AI and SerpAPI keys in `~/.vybrid/.env`) |
 | `clear` | Clear screen |
 
 ### Available Tools

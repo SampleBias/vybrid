@@ -104,7 +104,7 @@ vybrid-rust/
 ## Configuration
 
 ### Environment Variables
-Create `~/.vybrid/.env` or a local `.env` file in the working directory (you can also use **`/menu`** in the CLI to add `ZAI_API_KEY` to `~/.vybrid/.env`):
+Create `~/.vybrid/.env` or a local `.env` file in the working directory (you can also use **`/menu`** in the CLI to add `ZAI_API_KEY` and `SERPAPI_KEY` to `~/.vybrid/.env`):
 
 ```bash
 ZAI_API_KEY=your_api_key_here        # Required for AI chat - Z.AI API key

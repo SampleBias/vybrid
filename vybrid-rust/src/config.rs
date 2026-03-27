@@ -69,6 +69,15 @@ impl Config {
         self.api_key = Some(key);
         Ok(())
     }
+
+    /// Writes or updates `SERPAPI_KEY` in `~/.vybrid/.env` (same persistence as Z.AI; local `.env` can still override).
+    pub fn set_serpapi_key_global(&mut self, key: String) -> Result<()> {
+        let path = self.vybrid_dir.join(".env");
+        merge_env_file(&path, "SERPAPI_KEY", &key)?;
+        std::env::set_var("SERPAPI_KEY", &key);
+        self.serpapi_key = Some(key);
+        Ok(())
+    }
 }
 
 fn format_env_value(value: &str) -> String {
