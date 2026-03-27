@@ -4,7 +4,7 @@ This guide helps agents work effectively in the Vybrid Rust codebase. Vybrid is 
 
 ## Project Overview
 
-**Vybrid** is an AI-powered coding assistant built with Rust that provides an interactive CLI with tool-calling capabilities. It uses the GLM-4.7 API from Z.AI and supports file operations, shell commands, code search, and project management.
+**Vybrid** is an AI-powered coding assistant built with Rust that provides an interactive CLI with tool-calling capabilities. It uses the GLM-5.1 model on Z.AI’s GLM Coding Plan API and supports file operations, shell commands, code search, and project management.
 
 **As an expert Rust coding agent**, Vybrid provides high-level Rust development assistance including code architecture, ownership patterns, async workflows, and ecosystem best practices.
 
@@ -12,7 +12,7 @@ This guide helps agents work effectively in the Vybrid Rust codebase. Vybrid is 
 - Built with Rust 2021 edition
 - Async runtime: tokio
 - Error handling: anyhow
-- AI model: GLM-4.7 (Z.AI API)
+- AI model: GLM-5.1 (Z.AI GLM Coding Plan)
 - Interactive CLI with streaming responses and tool calls
 
 **Agent Capabilities:**
@@ -83,7 +83,7 @@ vybrid-rust/
 │   ├── ui.rs                # Terminal UI and formatting
 │   ├── client/
 │   │   ├── mod.rs           # Client module
-│   │   └── glm.rs           # GLM-4.7 API client, streaming, types
+│   │   └── glm.rs           # Z.AI chat completions client, streaming, types
 │   ├── tools/
 │   │   ├── mod.rs           # Tools module
 │   │   ├── definitions.rs   # Tool definitions for AI
@@ -332,16 +332,17 @@ The system provides these tools to the AI:
 
 ## API Integration
 
-### GLM-4.7 API Details
-- Base URL: `https://api.z.ai/api/coding/paas/v4`
+### Z.AI GLM Coding Plan (default GLM-5.1)
+- Base URL: `https://api.z.ai/api/coding/paas/v4` ([Coding Agent setup](https://docs.z.ai/devpack/using5.1))
 - Endpoint: `/chat/completions`
 - Headers:
   - `Authorization: Bearer <api_key>`
   - `Content-Type: application/json`
   - `Accept: text/event-stream` (for streaming)
-- Model: `glm-4.7`
+- Default model: `glm-5.1` (override via code in `config.rs` if needed)
 - Max tokens: 8192
-- Temperature: 0.7
+- Temperature: 1.0 (aligned with GLM-5 family defaults)
+- Streaming requests: `tool_stream: true` for incremental tool-call arguments
 - Thinking mode: Enabled (provides reasoning_content in delta)
 
 ### Streaming Response Format
@@ -587,7 +588,7 @@ tools::executor::execute_tool(&tool_name, &arguments).await
 - Returns results to be added to conversation
 
 ### `client/glm.rs` - API Client
-- Handles communication with GLM-4.7 API
+- Handles communication with the Z.AI chat completions API
 - Provides streaming and non-streaming methods
 - Manages request/response parsing
 
@@ -628,4 +629,4 @@ eprintln!("Debug: {:?}", some_variable);
 
 **Last Updated**: January 28, 2026
 **Rust Edition**: 2021
-**AI Model**: GLM-4.7
+**AI Model**: GLM-5.1 (GLM Coding Plan)

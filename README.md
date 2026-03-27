@@ -13,7 +13,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 - Linux (Ubuntu 20.04+ recommended)
 - Rust 1.70+ (for building from source)
-- Z.AI API key for GLM-4.7
+- Z.AI API key for GLM-5.1 (GLM Coding Plan)
 
 ## Installation
 
@@ -104,7 +104,7 @@ vybrid-rust/
 │   ├── conversation.rs # Conversation history
 │   ├── ui.rs           # Terminal UI helpers
 │   ├── client/
-│   │   └── glm.rs      # GLM-4.7 API client
+│   │   └── glm.rs      # Z.AI chat completions client
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas
 │   │   ├── executor.rs     # Tool dispatcher
@@ -135,4 +135,4 @@ MIT License
 
 ## Credits
 
-Powered by [GLM-4.7](https://docs.z.ai/guides/llm/glm-4.7) from Z.AI (Zhipu AI).
+Powered by [GLM-5.1](https://docs.z.ai/devpack/using5.1) on the [GLM Coding Plan](https://docs.z.ai/devpack/overview) from Z.AI (Zhipu AI).

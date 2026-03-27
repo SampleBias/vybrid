@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 
-/// GLM-4.7 API Client
+/// GLM (Z.AI Coding Plan) chat completions client
 #[derive(Debug, Clone)]
 pub struct GlmClient {
     client: Client,
@@ -26,6 +26,9 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
     pub stream: bool,
+    /// GLM-5+ streaming tool-call parameter assembly (see Z.AI migrate-to-glm-5 guide).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_stream: Option<bool>,
     pub thinking: ThinkingConfig,
     pub max_tokens: u32,
     pub temperature: f32,
@@ -166,11 +169,12 @@ impl GlmClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: true,
+            tool_stream: Some(true),
             thinking: ThinkingConfig {
                 thinking_type: "enabled".to_string(),
             },
             max_tokens: 8192,
-            temperature: 0.7,
+            temperature: 1.0,
         };
 
         let response = self
@@ -251,11 +255,12 @@ impl GlmClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: false,
+            tool_stream: None,
             thinking: ThinkingConfig {
                 thinking_type: "enabled".to_string(),
             },
             max_tokens: 8192,
-            temperature: 0.7,
+            temperature: 1.0,
         };
 
         let response = self
