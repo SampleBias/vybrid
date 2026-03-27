@@ -8,7 +8,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{Input, Select};
+use dialoguer::{Confirm, Input, Select};
 use futures::StreamExt;
 use std::io::{self, Write};
 
@@ -53,10 +53,36 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     if client.is_none() {
         println!(
             "{}",
-            style("No Z.AI API key yet — use /menu to add one (saved to ~/.vybrid/.env).")
-                .dim()
+            style(
+                "No Z.AI API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory."
+            )
+            .dim()
         );
         println!();
+        match Confirm::new()
+            .with_prompt("Open setup menu to add API keys now?")
+            .default(true)
+            .interact()
+        {
+            Ok(true) => {
+                if let Err(e) = handle_menu(&mut config, &mut client) {
+                    ui::print_error(&format!("{}", e));
+                }
+            }
+            Ok(false) | Err(_) => {}
+        }
+        if client.is_none() {
+            println!(
+                "{}",
+                style(format!(
+                    "Tip: run /menu when ready — keys are written to:\n  {}\n  {}",
+                    config.global_env_file_path.display(),
+                    config.env_file_path.display()
+                ))
+                .dim()
+            );
+            println!();
+        }
     }
 
     let project_docs = ProjectDocs::new();
@@ -159,9 +185,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         }
 
         let Some(ref c) = client else {
-            ui::print_error(
-                "No Z.AI API key. Use /menu → add your API key (saved to ~/.vybrid/.env).",
-            );
+            ui::print_error(&format!(
+                "No Z.AI API key. Use /menu — keys are saved to {} and {}.",
+                config.global_env_file_path.display(),
+                config.env_file_path.display()
+            ));
             continue;
         };
 
@@ -441,7 +469,7 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Z.AI & SerpAPI keys → ~/.vybrid/.env)",
+        "  {}     - Menu (Z.AI & SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
         style("/menu").yellow()
     );
     println!();
@@ -580,11 +608,20 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
     }
 }
 
-/// Interactive menu (API keys in ~/.vybrid/.env)
+fn saved_env_locations(config: &Config) -> String {
+    format!(
+        "{}\n  {}",
+        config.global_env_file_path.display(),
+        config.env_file_path.display()
+    )
+}
+
+/// Interactive menu — keys written to `~/.vybrid/.env` and `vybrid-rust/.env`
 fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()> {
     let items = vec![
-        "Add or update Z.AI API key (saved to ~/.vybrid/.env for all directories)",
-        "Add or update SerpAPI key (Google search; same file)",
+        "Add both Z.AI + SerpAPI keys (SerpAPI optional — then save & use chat)",
+        "Add or update Z.AI API key only",
+        "Add or update SerpAPI key only (Google search)",
         "Back",
     ];
     let sel = Select::new()
@@ -594,10 +631,48 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
         .interact()
         .context("Menu cancelled")?;
 
-    let env_path = config.vybrid_dir.join(".env");
-
     match sel {
         0 => {
+            let key: String = Input::new()
+                .with_prompt("Z.AI API key")
+                .interact_text()
+                .context("No API key entered")?;
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                ui::print_error("Z.AI API key was empty.");
+                return Ok(());
+            }
+            config.set_zai_api_key(key)?;
+            let api_key = config
+                .api_key
+                .clone()
+                .context("API key missing after save")?;
+            *client = Some(GlmClient::new(
+                api_key,
+                config.api_base_url.clone(),
+                config.model.clone(),
+            ));
+
+            let serp: String = Input::new()
+                .with_prompt("SerpAPI key (optional — Enter to skip)")
+                .allow_empty(true)
+                .interact_text()
+                .context("SerpAPI prompt failed")?;
+            let serp = serp.trim();
+            if !serp.is_empty() {
+                config.set_serpapi_key(serp.to_string())?;
+            }
+
+            println!(
+                "{}",
+                style(format!(
+                    "Saved key(s) — you can start chatting. Files updated:\n  {}",
+                    saved_env_locations(config)
+                ))
+                .green()
+            );
+        }
+        1 => {
             let key: String = Input::new()
                 .with_prompt("Z.AI API key")
                 .interact_text()
@@ -607,7 +682,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 ui::print_error("API key was empty.");
                 return Ok(());
             }
-            config.set_zai_api_key_global(key)?;
+            config.set_zai_api_key(key)?;
             let api_key = config
                 .api_key
                 .clone()
@@ -619,10 +694,14 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
             ));
             println!(
                 "{}",
-                style(format!("Saved ZAI_API_KEY to {}", env_path.display())).green()
+                style(format!(
+                    "Saved ZAI_API_KEY to:\n  {}",
+                    saved_env_locations(config)
+                ))
+                .green()
             );
         }
-        1 => {
+        2 => {
             let key: String = Input::new()
                 .with_prompt("SerpAPI key")
                 .interact_text()
@@ -632,10 +711,14 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 ui::print_error("SerpAPI key was empty.");
                 return Ok(());
             }
-            config.set_serpapi_key_global(key)?;
+            config.set_serpapi_key(key)?;
             println!(
                 "{}",
-                style(format!("Saved SERPAPI_KEY to {}", env_path.display())).green()
+                style(format!(
+                    "Saved SERPAPI_KEY to:\n  {}",
+                    saved_env_locations(config)
+                ))
+                .green()
             );
         }
         _ => {}

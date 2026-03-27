@@ -45,7 +45,7 @@ sudo cp target/release/vybrid /usr/local/bin/
 
 ## Configuration
 
-Create a `.env` file in your working directory or set environment variables:
+Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (project wins if both define the same variable). When you save via **`/menu`**, both files are updated so you only configure once and can run Vybrid from **any directory**. Use **`/menu`** or create the files manually:
 
 ```bash
 # Required: Z.AI API Key
@@ -54,6 +54,8 @@ ZAI_API_KEY=your_api_key_here
 # Optional: SerpAPI for Google Search
 SERPAPI_KEY=your_serpapi_key_here
 ```
+
+If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 
 Get your API key from [Z.AI Open Platform](https://z.ai/model-api).
 
@@ -88,7 +90,7 @@ On startup, choose between:
 | `/tools` | List available AI tools |
 | `/new` | Start new conversation |
 | `/help` | Show help |
-| `/menu` | Menu (add or update Z.AI and SerpAPI keys in `~/.vybrid/.env`) |
+| `/menu` | Menu (add keys; saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
 | `clear` | Clear screen |
 
 ### Available Tools
@@ -130,7 +132,9 @@ vybrid-rust/
 
 ## Data Directory
 
-Vybrid stores data in `~/.vybrid/`:
+- **API keys**: mirrored in **`~/.vybrid/.env`** and **`vybrid-rust/.env`** (same values; use from any cwd)
+
+Vybrid also stores runtime data in `~/.vybrid/`:
 
 - `messages/` - Inter-process communication for daemon mode
 - `daemon_pool/` - Daemon lock files

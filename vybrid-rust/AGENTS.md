@@ -104,7 +104,7 @@ vybrid-rust/
 ## Configuration
 
 ### Environment Variables
-Create `~/.vybrid/.env` or a local `.env` file in the working directory (you can also use **`/menu`** in the CLI to add `ZAI_API_KEY` and `SERPAPI_KEY` to `~/.vybrid/.env`):
+Use **`/menu`** or create env files manually. Saves go to **`~/.vybrid/.env`** and **`vybrid-rust/.env`** (same keys; kept in sync) so Vybrid finds keys when launched from any directory.
 
 ```bash
 ZAI_API_KEY=your_api_key_here        # Required for AI chat - Z.AI API key
@@ -114,15 +114,18 @@ GLM_API_KEY=alternative_key_here     # Alternative - falls back to this if ZAI_A
 SERPAPI_KEY=your_serpapi_key_here    # Optional - For Google search functionality
 ```
 
-### Configuration Loading Priority
-1. Global config: `~/.vybrid/.env` (if exists) - **Recommended for using vybrid from any directory**
-2. Local config: `.env` in current directory (overrides global)
-3. Environment variables (directly set)
+### Configuration Loading
+1. **`~/.vybrid/.env`** (if present)
+2. **`vybrid-rust/.env`** — `CARGO_MANIFEST_DIR/.env` unless **`VYBRID_ROOT`** points at `vybrid-rust` (later file overrides duplicate keys)
+3. Shell environment variables
 
 ### Directory Structure Created by Vybrid
 ```
+vybrid-rust/
+└── .env              # API keys (mirror) — gitignored
+
 ~/.vybrid/
-├── .env              # Global API keys (for running vybrid from any directory)
+├── .env              # API keys (mirror) — not in repo
 ├── messages/         # Message storage
 └── progress/         # Progress tracking
 
@@ -144,21 +147,15 @@ This will:
 1. Build the release binary
 2. Install it to `~/.local/bin/vybrid`
 3. Add `~/.local/bin` to your PATH
-4. Set up global config directory at `~/.vybrid/.env`
+4. Create `~/.vybrid/` for runtime data (messages, progress, API key mirror)
 
-After installation, you can run `vybrid` from any working directory.
+Keys are **`~/.vybrid/.env`** plus **`vybrid-rust/.env`** (same content). Launches from any cwd use `~/.vybrid/.env` if the project path is unavailable; optional **`VYBRID_ROOT`** still applies to the project `.env` path.
 
 ### Setting Up API Keys
 
-For running from any directory, add your API key to `~/.vybrid/.env`:
-
 ```bash
-mkdir -p ~/.vybrid
-echo "GLM_API_KEY=your_api_key_here" > ~/.vybrid/.env
-echo "SERPAPI_KEY=your_serpapi_key_here" >> ~/.vybrid/.env  # Optional
+vybrid   # from any directory after first /menu; or: ~/.vybrid/.env + vybrid-rust/.env
 ```
-
-For project-specific usage, you can also create a `.env` file in the project directory.
 
 ## Code Conventions
 
@@ -611,7 +608,7 @@ cargo build && cargo run
 
 ### Check Configuration
 ```bash
-cat ~/.vybrid/.env  # or local .env
+cat vybrid-rust/.env   # API keys (or $VYBRID_ROOT/.env)
 ```
 
 ### Test a Tool Directly (in code)
