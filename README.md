@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/vybrid-banner.png" alt="Vybrid — AI Coding Assistant from the Trenches built in Rust" width="800" />
+</p>
+
 # Vybrid
 
 AI powered coding assistant built from the trenches with Rust to save humanity from bloat.
