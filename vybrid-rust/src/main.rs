@@ -6,8 +6,9 @@ mod shell;
 mod tools;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use console::style;
+use dialoguer::{Input, Select};
 use futures::StreamExt;
 use std::io::{self, Write};
 
@@ -20,14 +21,11 @@ use crate::tools::executor::execute_tool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load configuration
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             ui::print_error(&format!("Configuration error: {}", e));
-            eprintln!("\nPlease create ~/.vybrid/.env with:");
-            eprintln!("  ZAI_API_KEY=your_api_key_here");
-            eprintln!("\nOr create a local .env file in your project directory.");
+            eprintln!("\nCould not initialize config directories or environment.");
             std::process::exit(1);
         }
     };
@@ -40,15 +38,26 @@ async fn main() -> Result<()> {
 }
 
 /// Run agent mode - interactive AI assistant
-async fn run_agent_mode(config: Config) -> Result<()> {
+async fn run_agent_mode(mut config: Config) -> Result<()> {
     ui::display_mode_header();
     ui::display_cwd();
 
-    let client = GlmClient::new(
-        config.api_key.clone(),
-        config.api_base_url.clone(),
-        config.model.clone(),
-    );
+    let mut client = config.api_key.as_ref().map(|key| {
+        GlmClient::new(
+            key.clone(),
+            config.api_base_url.clone(),
+            config.model.clone(),
+        )
+    });
+
+    if client.is_none() {
+        println!(
+            "{}",
+            style("No Z.AI API key yet — use /menu to add one (saved to .env in this directory).")
+                .dim()
+        );
+        println!();
+    }
 
     let project_docs = ProjectDocs::new();
     let mut conversation = Conversation::new(&get_system_prompt());
@@ -99,6 +108,12 @@ async fn run_agent_mode(config: Config) -> Result<()> {
                 show_help();
                 continue;
             }
+            "/menu" => {
+                if let Err(e) = handle_menu(&mut config, &mut client) {
+                    ui::print_error(&format!("{}", e));
+                }
+                continue;
+            }
             "/new" => {
                 conversation.clear_keeping_system();
                 println!("{}", style("Started new conversation").green());
@@ -143,6 +158,13 @@ async fn run_agent_mode(config: Config) -> Result<()> {
             continue;
         }
 
+        let Some(ref c) = client else {
+            ui::print_error(
+                "No Z.AI API key. Use /menu → add your API key (writes ./.env in this directory).",
+            );
+            continue;
+        };
+
         // Add user message to conversation with project docs context
         let user_message_with_context = inject_project_docs(&input, &project_docs);
         conversation.add_user_message(&user_message_with_context);
@@ -150,7 +172,7 @@ async fn run_agent_mode(config: Config) -> Result<()> {
         let tools = get_all_tools();
 
         // Process with AI
-        if let Err(e) = process_ai_response(&client, &mut conversation, &tools).await {
+        if let Err(e) = process_ai_response(c, &mut conversation, &tools).await {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -552,4 +574,51 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
             println!("Available subcommands: show, add, read, clear");
         }
     }
+}
+
+/// Interactive menu (e.g. API key setup for Z.AI)
+fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()> {
+    let items = vec![
+        "Add or update Z.AI API key (writes ./.env in this directory)",
+        "Back",
+    ];
+    let sel = Select::new()
+        .with_prompt("Vybrid menu")
+        .items(&items)
+        .default(0)
+        .interact()
+        .context("Menu cancelled")?;
+
+    match sel {
+        0 => {
+            let key: String = Input::new()
+                .with_prompt("Z.AI API key")
+                .interact_text()
+                .context("No API key entered")?;
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                ui::print_error("API key was empty.");
+                return Ok(());
+            }
+            config.set_zai_api_key_in_cwd(key)?;
+            let api_key = config
+                .api_key
+                .clone()
+                .context("API key missing after save")?;
+            *client = Some(GlmClient::new(
+                api_key,
+                config.api_base_url.clone(),
+                config.model.clone(),
+            ));
+            let env_path = std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(".env");
+            println!(
+                "{}",
+                style(format!("Saved ZAI_API_KEY to {}", env_path.display())).green()
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }

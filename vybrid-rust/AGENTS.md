@@ -103,11 +103,11 @@ vybrid-rust/
 
 ## Configuration
 
-### Environment Variables (Required)
-Create `~/.vybrid/.env` or a local `.env` file:
+### Environment Variables
+Create `~/.vybrid/.env` or a local `.env` file in the working directory (you can also use **`/menu`** in the CLI to add `ZAI_API_KEY` to `./.env`):
 
 ```bash
-ZAI_API_KEY=your_api_key_here        # Required - Z.AI API key
+ZAI_API_KEY=your_api_key_here        # Required for AI chat - Z.AI API key
 GLM_API_KEY=alternative_key_here     # Alternative - falls back to this if ZAI_API_KEY missing
 
 # Optional

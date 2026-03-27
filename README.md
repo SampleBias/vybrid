@@ -82,6 +82,7 @@ On startup, choose between:
 | `/tools` | List available AI tools |
 | `/new` | Start new conversation |
 | `/help` | Show help |
+| `/menu` | Menu (add or update Z.AI API key in `./.env`) |
 | `clear` | Clear screen |
 
 ### Available Tools
