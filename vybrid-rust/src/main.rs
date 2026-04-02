@@ -89,7 +89,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     let mut conversation = Conversation::new(&get_system_prompt());
 
     loop {
-        // Prompt for input
+        ui::print_context_status_line(conversation.estimate_context_tokens());
         print!("{} ", style("You>").magenta().bold());
         io::stdout().flush()?;
 
@@ -200,7 +200,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         let tools = get_all_tools();
 
         // Process with AI
-        if let Err(e) = process_ai_response(c, &mut conversation, &tools).await {
+        if let Err(e) = process_ai_response(c, &mut conversation, &tools, 0).await {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -215,10 +215,28 @@ async fn process_ai_response(
     client: &GlmClient,
     conversation: &mut Conversation,
     tools: &[crate::client::glm::Tool],
+    depth: u32,
 ) -> Result<()> {
+    /// Prevents runaway tool loops (GLM 5.1 can chain many rounds).
+    const MAX_TOOL_ROUNDS: u32 = 48;
+    if depth >= MAX_TOOL_ROUNDS {
+        anyhow::bail!(
+            "Stopped: tool loop exceeded {} rounds. Try /new or a smaller task.",
+            MAX_TOOL_ROUNDS
+        );
+    }
+
+    let mut spinner = ui::SpinnerGuard::new("glm");
     let stream = client
         .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
-        .await?;
+        .await;
+    let stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            spinner.finish().await;
+            return Err(e);
+        }
+    };
 
     futures::pin_mut!(stream);
 
@@ -226,8 +244,13 @@ async fn process_ai_response(
     let mut content_started = false;
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut first_chunk = true;
 
     while let Some(chunk_result) = stream.next().await {
+        if first_chunk {
+            spinner.finish().await;
+            first_chunk = false;
+        }
         match chunk_result {
             Ok(chunk) => {
                 if let Some(choice) = chunk.choices.first() {
@@ -293,6 +316,10 @@ async fn process_ai_response(
         }
     }
 
+    if first_chunk {
+        spinner.finish().await;
+    }
+
     if content_started || reasoning_started {
         println!();
     }
@@ -349,12 +376,15 @@ async fn process_ai_response(
             conversation.add_tool_result(&tool_call.id, &result_str);
         }
 
-        // Get follow-up response
+        // Get follow-up response (next round shows its own spinner)
         println!();
-        ui::print_info("Processing results...");
-
-        // Recursive call for follow-up (with depth limit built into the loop)
-        Box::pin(process_ai_response(client, conversation, tools)).await?;
+        Box::pin(process_ai_response(
+            client,
+            conversation,
+            tools,
+            depth + 1,
+        ))
+        .await?;
     }
 
     Ok(())

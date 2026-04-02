@@ -53,4 +53,25 @@ impl Conversation {
         }
         self.messages.clear();
     }
+
+    /// Rough token estimate for the context meter (~4 chars per token for mixed text/code).
+    pub fn estimate_context_tokens(&self) -> u32 {
+        let mut chars: usize = 0;
+        for m in &self.messages {
+            if let Some(c) = &m.content {
+                chars += c.len();
+            }
+            if let Some(tcs) = &m.tool_calls {
+                for tc in tcs {
+                    chars += tc.id.len();
+                    chars += tc.function.name.len();
+                    chars += tc.function.arguments.len();
+                }
+            }
+            if let Some(id) = &m.tool_call_id {
+                chars += id.len();
+            }
+        }
+        ((chars + 3) / 4).min(u32::MAX as usize) as u32
+    }
 }

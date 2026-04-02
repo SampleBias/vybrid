@@ -1,6 +1,105 @@
 #![allow(dead_code)]
 
 use console::{style, Term};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Approximate GLM-5.1 Coding Plan context window (tokens). Used only for the CLI meter.
+pub const CONTEXT_WINDOW_TOKENS: u32 = 200_000;
+
+/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while GLM
+/// connects and before the first streamed chunk (thinking / TTFB).
+pub struct SpinnerGuard {
+    stop: Arc<AtomicBool>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SpinnerGuard {
+    pub fn new(label: impl Into<String>) -> Self {
+        let label = label.into();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = tokio::spawn(async move {
+            let frames = ["◐", "◓", "◑", "◒"];
+            let mut i = 0u32;
+            while !stop_clone.load(Ordering::Relaxed) {
+                eprint!(
+                    "\r\x1b[2K{} {} {}",
+                    style(&label).dim(),
+                    style("·").dim(),
+                    style(frames[(i % 4) as usize]).cyan()
+                );
+                let _ = std::io::stderr().flush();
+                i += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub async fn finish(&mut self) {
+        if let Some(h) = self.handle.take() {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = h.await;
+        }
+    }
+}
+
+/// Eight filled/empty circles as a discrete ring plus rough token counts.
+pub fn format_context_ring(estimated_tokens: u32, max_tokens: u32) -> String {
+    let pct = if max_tokens == 0 {
+        0.0
+    } else {
+        (estimated_tokens.min(max_tokens) as f64 / max_tokens as f64 * 100.0).min(100.0)
+    };
+    const SEGMENTS: usize = 8;
+    let filled = ((pct / 100.0) * SEGMENTS as f64).round() as usize;
+    let filled = filled.min(SEGMENTS);
+    let mut ring = String::with_capacity(SEGMENTS);
+    for i in 0..SEGMENTS {
+        if i < filled {
+            ring.push('●');
+        } else {
+            ring.push('○');
+        }
+    }
+    format!(
+        "ctx {}  {:>5.1}%  ~{} / {} tok",
+        ring,
+        pct,
+        format_tokens_short(estimated_tokens),
+        format_tokens_short(max_tokens)
+    )
+}
+
+fn format_tokens_short(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One dim line: context fill vs model window (heuristic; see `Conversation::estimate_context_tokens`).
+pub fn print_context_status_line(estimated_tokens: u32) {
+    let line = format_context_ring(estimated_tokens, CONTEXT_WINDOW_TOKENS);
+    let pct = estimated_tokens as f64 / CONTEXT_WINDOW_TOKENS as f64;
+    if pct >= 0.85 {
+        println!("{}", style(line).yellow().dim());
+    } else if pct >= 0.65 {
+        println!("{}", style(line).cyan().dim());
+    } else {
+        println!("{}", style(line).dim());
+    }
+}
 
 /// Display the Vybrid ASCII banner
 pub fn display_banner() {
