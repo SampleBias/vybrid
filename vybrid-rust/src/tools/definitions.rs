@@ -205,37 +205,56 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "enhanced_grep".to_string(),
-                description: "Advanced grep/search functionality with context lines and enhanced readability for code analysis. Searches for patterns in files with intelligent formatting.".to_string(),
+                description: "Search files with a regex pattern. Specify where to search using exactly one of: file_paths (array), file_path (string), or path (string — same meaning as file_path; common model alias).".to_string(),
                 parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": {
-                            "type": "string",
-                            "description": "The search pattern (supports regex). Use simple strings for literal matches or regex patterns for advanced searches."
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "pattern": {
+                                    "type": "string",
+                                    "description": "Search pattern (regex)."
+                                },
+                                "file_paths": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Paths or globs to search (one or more)."
+                                },
+                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
+                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
+                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
+                            },
+                            "required": ["pattern", "file_paths"]
                         },
-                        "file_paths": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "List of file paths or glob patterns to search (e.g. [\"src/**/*.rs\"]). Preferred when searching multiple paths."
+                        {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string", "description": "Search pattern (regex)." },
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Single file or glob to search."
+                                },
+                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
+                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
+                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
+                            },
+                            "required": ["pattern", "file_path"]
                         },
-                        "file_path": {
-                            "type": "string",
-                            "description": "Single file or glob to search (alternative to file_paths). Use when targeting one file."
-                        },
-                        "context_lines": {
-                            "type": "integer",
-                            "description": "Number of context lines to show before and after each match (default: 3)"
-                        },
-                        "case_sensitive": {
-                            "type": "boolean",
-                            "description": "Whether the search should be case-sensitive (default: false)"
-                        },
-                        "max_matches": {
-                            "type": "integer",
-                            "description": "Maximum number of matches to return per file (default: 20)"
+                        {
+                            "type": "object",
+                            "properties": {
+                                "pattern": { "type": "string", "description": "Search pattern (regex)." },
+                                "path": {
+                                    "type": "string",
+                                    "description": "Single file or glob (alias for file_path; same as edit_file)."
+                                },
+                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
+                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
+                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
+                            },
+                            "required": ["pattern", "path"]
                         }
-                    },
-                    "required": ["pattern"]
+                    ]
                 }),
             },
         },

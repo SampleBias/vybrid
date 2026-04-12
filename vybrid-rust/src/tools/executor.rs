@@ -111,12 +111,19 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
                     }
                 }
             }
+            if paths.is_empty() {
+                if let Some(p) = args["path"].as_str() {
+                    if !p.is_empty() {
+                        paths.push(p);
+                    }
+                }
+            }
             if pattern.is_empty() {
                 return Err(anyhow!("enhanced_grep: missing pattern"));
             }
             if paths.is_empty() {
                 return Err(anyhow!(
-                    "enhanced_grep: provide file_paths (array) or file_path (string)"
+                    "enhanced_grep: provide file_paths (array), file_path, or path (string)"
                 ));
             }
             let context = args["context_lines"].as_u64().unwrap_or(3) as usize;

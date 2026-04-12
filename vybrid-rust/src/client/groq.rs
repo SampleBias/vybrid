@@ -20,7 +20,7 @@ fn stream_api_error_user_message(body: &Value) -> String {
     let hint = match code {
         Some("tool_use_failed") => {
             if msg.contains("enhanced_grep") || msg.contains("file_paths") {
-                " If the model used `file_path` instead of `file_paths`, retry: the tool accepts either. For huge `edit_file` payloads, use smaller edits or paste the patch as text."
+                " For `enhanced_grep`, use `file_paths`, `file_path`, or `path` (plus `pattern`). For huge `edit_file` payloads, use smaller edits or paste the patch as text."
             } else if msg.contains("edit_file") && (msg.contains("file_path") || msg.contains("path")) {
                 " For `edit_file`, use either `path` or `file_path` (not both required). If the payload was huge, split into smaller edits."
             } else {
