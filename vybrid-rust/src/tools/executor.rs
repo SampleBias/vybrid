@@ -70,6 +70,11 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
                     "edit_file: missing path or file_path — provide the file to edit"
                 ));
             }
+            if original.is_empty() {
+                return Err(anyhow!(
+                    "edit_file: missing original_snippet or old_string — exact text to find in the file"
+                ));
+            }
             file_ops::edit_file(path, original, new)
         }
 

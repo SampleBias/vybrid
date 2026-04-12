@@ -7,26 +7,46 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 
+/// Shorten repetitive Groq tool-schema validation messages for the terminal.
+fn simplify_tool_validation_message(msg: &str) -> String {
+    if !msg.contains("did not match schema") && !msg.contains("tool call validation") {
+        return msg.to_string();
+    }
+    // Groq sometimes echoes the same phrase twice and lists every failed schema branch.
+    let one_line: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.len() <= 280 {
+        return one_line;
+    }
+    if let Some(idx) = one_line.find("parameters for tool") {
+        let tail: String = one_line[idx..].chars().take(140).collect();
+        return format!("Tool arguments did not match the schema ({tail}…).");
+    }
+    format!("{}…", one_line.chars().take(200).collect::<String>())
+}
+
 /// Turn a Groq/OpenAI-style SSE error JSON into a short user-facing message (no huge `failed_generation`).
 fn stream_api_error_user_message(body: &Value) -> String {
     let Some(err) = body.get("error") else {
         return "The API returned an error while streaming.".to_string();
     };
-    let msg = err
+    let raw_msg = err
         .get("message")
         .and_then(|m| m.as_str())
         .unwrap_or("Unknown API error");
+    let msg = simplify_tool_validation_message(raw_msg);
     let code = err.get("code").and_then(|c| c.as_str());
     let hint = match code {
         Some("tool_use_failed") => {
-            if msg.contains("enhanced_grep") || msg.contains("file_paths") {
-                " For `enhanced_grep`, use `file_paths`, `file_path`, or `path` (plus `pattern`). For huge `edit_file` payloads, use smaller edits or paste the patch as text."
-            } else if msg.contains("edit_file") {
-                " For `edit_file`, use `path` or `file_path`, plus either (`original_snippet` + `new_snippet`) or (`old_string` + `new_string`). If the payload was huge, split into smaller edits."
-            } else if msg.contains("create_file") && msg.contains("file_path") {
+            if msg.contains("enhanced_grep") || raw_msg.contains("enhanced_grep") {
+                " For `enhanced_grep`, send `pattern` plus `file_paths` and/or `file_path` and/or `path`. For huge payloads, use a narrower scope or paste results as text."
+            } else if msg.contains("edit_file") || raw_msg.contains("edit_file") {
+                " For `edit_file`, send `path` or `file_path`, and the before/after text via `original_snippet`/`new_snippet` and/or `old_string`/`new_string` (you can mix these names). If the payload was huge, split into smaller edits."
+            } else if (msg.contains("create_file") || raw_msg.contains("create_file"))
+                && (msg.contains("file_path") || raw_msg.contains("file_path"))
+            {
                 " For `create_file`, use `file_path` or `path` plus `content`. If the payload was huge, split into smaller writes."
             } else {
-                " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
+                " Try a smaller tool call, split the change into steps, or ask the model to output the patch as text instead of one huge tool call."
             }
         }
         _ => "",

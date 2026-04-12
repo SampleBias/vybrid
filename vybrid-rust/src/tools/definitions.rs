@@ -47,36 +47,22 @@ pub fn get_all_tools() -> Vec<Tool> {
                 name: "create_file".to_string(),
                 description: "Create a new file or overwrite an existing file with the provided content. Use `file_path` or `path` for the destination (same meaning).".to_string(),
                 parameters: json!({
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Path where the file should be created"
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Content to write"
-                                }
-                            },
-                            "required": ["file_path", "content"]
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path where the file should be created"
                         },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Path where the file should be created (alias for file_path)"
-                                },
-                                "content": {
-                                    "type": "string",
-                                    "description": "Content to write"
-                                }
-                            },
-                            "required": ["path", "content"]
+                        "path": {
+                            "type": "string",
+                            "description": "Path where the file should be created (alias for file_path)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Content to write"
                         }
-                    ]
+                    },
+                    "description": "Provide `content` and either `file_path` or `path`. (Loose keys so mixed model outputs pass API validation; missing fields are rejected when the tool runs.)"
                 }),
             },
         },
@@ -110,46 +96,18 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit_file".to_string(),
-                description: "Replace an exact snippet in a file. File: `path` or `file_path`. Snippet pair: `original_snippet` + `new_snippet`, OR `old_string` + `new_string` (OpenAI-style alias).".to_string(),
+                description: "Replace an exact snippet in a file. File: `path` or `file_path`. Snippet to find: `original_snippet` or `old_string`. Replacement: `new_snippet` or `new_string`. You may mix these (e.g. `path` + `old_string` + `new_string`).".to_string(),
                 parameters: json!({
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string", "description": "File to edit" },
-                                "original_snippet": { "type": "string", "description": "Exact text to find" },
-                                "new_snippet": { "type": "string", "description": "Replacement text" }
-                            },
-                            "required": ["path", "original_snippet", "new_snippet"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string", "description": "File to edit" },
-                                "original_snippet": { "type": "string", "description": "Exact text to find" },
-                                "new_snippet": { "type": "string", "description": "Replacement text" }
-                            },
-                            "required": ["file_path", "original_snippet", "new_snippet"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "path": { "type": "string", "description": "File to edit" },
-                                "old_string": { "type": "string", "description": "Exact text to find (alias of original_snippet)" },
-                                "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" }
-                            },
-                            "required": ["path", "old_string", "new_string"]
-                        },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "file_path": { "type": "string", "description": "File to edit" },
-                                "old_string": { "type": "string", "description": "Exact text to find (alias of original_snippet)" },
-                                "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" }
-                            },
-                            "required": ["file_path", "old_string", "new_string"]
-                        }
-                    ]
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "File to edit" },
+                        "file_path": { "type": "string", "description": "File to edit (alias of path)" },
+                        "original_snippet": { "type": "string", "description": "Exact text to find" },
+                        "new_snippet": { "type": "string", "description": "Replacement text" },
+                        "old_string": { "type": "string", "description": "Exact text to find (alias of original_snippet)" },
+                        "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" }
+                    },
+                    "description": "Provide a file (`path` or `file_path`) and the before/after text using either naming style. (Single object so API validation accepts alias mixes; missing or invalid combos fail with a clear error when the tool runs.)"
                 }),
             },
         },
@@ -223,56 +181,33 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "enhanced_grep".to_string(),
-                description: "Search files with a regex pattern. Specify where to search using exactly one of: file_paths (array), file_path (string), or path (string — same meaning as file_path; common model alias).".to_string(),
+                description: "Search files with a regex pattern. Provide `pattern` and at least one of `file_paths` (array), `file_path`, or `path` (string; same meaning as file_path).".to_string(),
                 parameters: json!({
-                    "anyOf": [
-                        {
-                            "type": "object",
-                            "properties": {
-                                "pattern": {
-                                    "type": "string",
-                                    "description": "Search pattern (regex)."
-                                },
-                                "file_paths": {
-                                    "type": "array",
-                                    "items": { "type": "string" },
-                                    "description": "Paths or globs to search (one or more)."
-                                },
-                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
-                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
-                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
-                            },
-                            "required": ["pattern", "file_paths"]
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Search pattern (regex)."
                         },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "pattern": { "type": "string", "description": "Search pattern (regex)." },
-                                "file_path": {
-                                    "type": "string",
-                                    "description": "Single file or glob to search."
-                                },
-                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
-                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
-                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
-                            },
-                            "required": ["pattern", "file_path"]
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Paths or globs to search (one or more)."
                         },
-                        {
-                            "type": "object",
-                            "properties": {
-                                "pattern": { "type": "string", "description": "Search pattern (regex)." },
-                                "path": {
-                                    "type": "string",
-                                    "description": "Single file or glob (alias for file_path; same as edit_file)."
-                                },
-                                "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
-                                "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
-                                "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
-                            },
-                            "required": ["pattern", "path"]
-                        }
-                    ]
+                        "file_path": {
+                            "type": "string",
+                            "description": "Single file or glob to search."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Single file or glob (alias for file_path)."
+                        },
+                        "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
+                        "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
+                        "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
+                    },
+                    "required": ["pattern"],
+                    "description": "`pattern` is required; also provide `file_paths` and/or `file_path` and/or `path`. (Single object so API validation accepts any combination; missing paths are rejected when the tool runs.)"
                 }),
             },
         },
