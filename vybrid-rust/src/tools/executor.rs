@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use super::{file_ops, grep, project, search, shell};
+use super::{cargo, file_ops, grep, project, search, shell};
 
 /// Execute a tool by name with given arguments
 pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
@@ -70,6 +70,31 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
             let description = args["description"].as_str();
             let working_dir = args["working_directory"].as_str();
             shell::execute_bash(command, description, working_dir).await
+        }
+
+        "run_cargo" => {
+            let subcommand = args["subcommand"].as_str().unwrap_or("");
+            let release = args["release"].as_bool().unwrap_or(false);
+            let package = args["package"].as_str();
+            let manifest_path = args["manifest_path"].as_str();
+            let extra: Vec<String> = args["extra_args"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let working_dir = args["working_directory"].as_str();
+            cargo::run_cargo(
+                subcommand,
+                release,
+                package,
+                manifest_path,
+                &extra,
+                working_dir,
+            )
+            .await
         }
 
         // Enhanced grep

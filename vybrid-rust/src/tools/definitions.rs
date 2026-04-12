@@ -143,6 +143,45 @@ pub fn get_all_tools() -> Vec<Tool> {
                 }),
             },
         },
+        // Cargo (structured; preferred over raw shell for Rust projects)
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "run_cargo".to_string(),
+                description: "Run Cargo with structured arguments (no shell). Preferred over execute_bash_command for cargo check, build, test, clippy, fmt, doc, etc. Args are passed as argv; do not use shell metacharacters in extra_args.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "subcommand": {
+                            "type": "string",
+                            "description": "Cargo subcommand: check, build, test, run, clippy, fmt, doc, clean, metadata, etc."
+                        },
+                        "release": {
+                            "type": "boolean",
+                            "description": "Pass --release when applicable (build, test, run, check, …). Default false."
+                        },
+                        "package": {
+                            "type": "string",
+                            "description": "Workspace package name for -p (optional)"
+                        },
+                        "manifest_path": {
+                            "type": "string",
+                            "description": "Path to Cargo.toml for --manifest-path (optional)"
+                        },
+                        "extra_args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Additional argv tokens after fixed flags (e.g. test filter, \"--\", \"--nocapture\"). Literal strings only—no shell."
+                        },
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Directory to run cargo in (optional; defaults to current directory)"
+                        }
+                    },
+                    "required": ["subcommand"]
+                }),
+            },
+        },
         // Enhanced grep
         Tool {
             tool_type: "function".to_string(),

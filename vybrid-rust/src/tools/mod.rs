@@ -1,3 +1,4 @@
+pub mod cargo;
 pub mod definitions;
 pub mod executor;
 pub mod file_ops;

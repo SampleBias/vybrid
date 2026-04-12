@@ -71,12 +71,19 @@ cargo test            # Run all tests
 cargo test -- --nocapture  # Show test output
 ```
 
+### Agent tool: `run_cargo` (AI function calling)
+
+Vybrid exposes a **`run_cargo`** tool for structured Cargo invocations (argv only; no shell injection). Prefer it over ad-hoc `execute_bash_command` when running `cargo check`, `build`, `test`, `clippy`, `fmt`, etc., on user projects.
+
+Canonical **Cargo quick reference**, **compile/fix loop**, and **common diagnostics** text for the system prompt lives in **[`src/rust_agent_reference.rs`](src/rust_agent_reference.rs)**. Implementation: **[`src/tools/cargo.rs`](src/tools/cargo.rs)** (timeouts, output cap, `--color never`).
+
 ## Project Structure
 
 ```
 vybrid-rust/
 ├── src/
 │   ├── main.rs              # CLI entry point, agent loop
+│   ├── rust_agent_reference.rs  # Cargo/diagnostics text for system prompt (const strings)
 │   ├── config.rs            # Configuration loading
 │   ├── conversation.rs      # Conversation history management
 │   ├── project_docs.rs      # Project documentation management
@@ -88,6 +95,7 @@ vybrid-rust/
 │   │   ├── mod.rs           # Tools module
 │   │   ├── definitions.rs   # Tool definitions for AI
 │   │   ├── executor.rs      # Tool execution dispatch
+│   │   ├── cargo.rs         # Structured `cargo` subprocess (run_cargo tool)
 │   │   ├── file_ops.rs      # File operations (read, write, edit)
 │   │   ├── grep.rs          # Code search with regex
 │   │   ├── search.rs         # Google search via SerpAPI
@@ -278,6 +286,7 @@ The system provides these tools to the AI:
 
 ### Shell/Execution
 - `execute_bash_command` - Run shell command (supports working_directory)
+- `run_cargo` - Run Cargo via argv (`check`, `build`, `test`, `clippy`, etc.); preferred for Rust builds/tests (see `src/tools/cargo.rs`)
 
 ### Search
 - `enhanced_grep` - Search files with regex, context lines, case sensitivity

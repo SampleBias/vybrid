@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod conversation;
 mod project_docs;
+mod rust_agent_reference;
 mod shell;
 mod tools;
 mod ui;
@@ -367,7 +368,9 @@ async fn process_ai_response(
                 Ok(output) => {
                     ui::print_tool_result(&tool_call.function.name, true);
                     // Show brief output for some tools
-                    if tool_call.function.name == "execute_bash_command" {
+                    if tool_call.function.name == "execute_bash_command"
+                        || tool_call.function.name == "run_cargo"
+                    {
                         let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
                         if !preview.is_empty() {
                             println!("    {}", style(preview).dim());
@@ -414,7 +417,8 @@ fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String
 
 /// Get the system prompt for agent mode
 fn get_system_prompt() -> String {
-    r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains and EXPERT-LEVEL MASTERY OF RUST PROGRAMMING.
+    format!(
+        r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains and EXPERT-LEVEL MASTERY OF RUST PROGRAMMING.
 Your Rust expertise includes ownership/borrowing, lifetimes, async/await patterns, trait systems, error handling with anyhow/thiserror, and idiomatic Rust code design.
 You provide thoughtful, well-structured solutions while explaining your reasoning, with particular strength in Rust-specific best practices.
 
@@ -452,11 +456,21 @@ You MUST follow these development rules for every project:
    - Keep todo items granular and testable
    - Log every significant action
 
+RUST CARGO QUICK REFERENCE:
+{}
+
+COMPILE / FIX LOOP:
+{}
+
+COMMON RUST DIAGNOSTICS:
+{}
+
 Available tools:
 - read_file, read_multiple_files: Read file contents
 - create_file, create_multiple_files: Create or overwrite files
 - edit_file: Make precise edits using snippet replacement
-- execute_bash_command: Run shell commands
+- run_cargo: Run Cargo (check, build, test, clippy, fmt, doc, …) with structured argv — **preferred for Rust projects** over raw shell when invoking cargo
+- execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online
 - create_project_structure: Initialize project files
@@ -467,10 +481,15 @@ Guidelines:
 1. ALWAYS start any project work by creating project structure files
 2. Read files before editing to understand context
 3. Use precise snippet matching for edits
-4. Explain what you're doing and why
-5. Be thorough in analysis and recommendations
+4. On Rust projects, use run_cargo for compile/test/lint iteration; read full compiler output before fixing
+5. Explain what you're doing and why
+6. Be thorough in analysis and recommendations
 
-IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#.to_string()
+IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#,
+        crate::rust_agent_reference::RUST_CARGO_QUICKREF,
+        crate::rust_agent_reference::RUST_COMPILE_FIX_LOOP,
+        crate::rust_agent_reference::RUST_DIAGNOSTICS_HINTS,
+    )
 }
 
 /// Show available tools
