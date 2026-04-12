@@ -181,7 +181,7 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "enhanced_grep".to_string(),
-                description: "Search files with a regex pattern. Provide `pattern` and at least one of `file_paths` (array), `file_path`, or `path` (string; same meaning as file_path).".to_string(),
+                description: "Search files with a regex pattern. Provide `pattern` and at least one of `file_paths` (array), `file_path`, or `path` (string; same meaning as file_path). The API must accept mixed shapes — use any of these keys; the client validates before running the search.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -205,9 +205,7 @@ pub fn get_all_tools() -> Vec<Tool> {
                         "context_lines": { "type": "integer", "description": "Context lines before/after matches (default 3)" },
                         "case_sensitive": { "type": "boolean", "description": "Case-sensitive search (default false)" },
                         "max_matches": { "type": "integer", "description": "Max matches per file (default 20)" }
-                    },
-                    "required": ["pattern"],
-                    "description": "`pattern` is required; also provide `file_paths` and/or `file_path` and/or `path`. (Single object so API validation accepts any combination; missing paths are rejected when the tool runs.)"
+                    }
                 }),
             },
         },

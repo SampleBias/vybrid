@@ -125,6 +125,8 @@ pub struct FunctionDef {
 #[derive(Debug, Deserialize)]
 pub struct StreamChunk {
     pub id: Option<String>,
+    /// Normal chunks include `choices`; API error payloads omit it (handled before deserializing here).
+    #[serde(default)]
     pub choices: Vec<StreamChoice>,
     pub usage: Option<Usage>,
 }
@@ -253,40 +255,47 @@ impl GroqClient {
                                         return;
                                     }
 
-                                    // Groq may emit JSON error objects in the SSE stream (no `choices` field).
-                                    if let Ok(v) = serde_json::from_str::<Value>(data_trim) {
-                                        if v.get("error").is_some() {
-                                            let msg = stream_api_error_user_message(&v);
-                                            yield Err(anyhow::Error::msg(msg));
-                                            return;
-                                        }
-                                    }
-
-                                    match serde_json::from_str::<StreamChunk>(data_trim) {
-                                        Ok(chunk) => yield Ok(chunk),
+                                    // Parse as Value first: error payloads are valid JSON but do not match `StreamChunk`
+                                    // (no `choices`), which previously produced noisy "missing field `choices`" warnings.
+                                    let v: Value = match serde_json::from_str(data_trim) {
+                                        Ok(v) => v,
                                         Err(e) => {
-                                            // Error payloads sometimes fail the first Value parse (escapes / size);
-                                            // retry as generic JSON and surface API errors without "missing choices" noise.
-                                            if let Ok(v) = serde_json::from_str::<Value>(data_trim) {
-                                                if v.get("error").is_some() {
-                                                    let msg = stream_api_error_user_message(&v);
-                                                    yield Err(anyhow::Error::msg(msg));
-                                                    return;
-                                                }
-                                            } else if data_trim.contains("tool_use_failed") {
-                                                // `failed_generation` can break JSON; still surface a clear failure.
+                                            if data_trim.contains("tool_use_failed")
+                                                || data_trim.contains("\"error\"")
+                                            {
                                                 yield Err(anyhow::Error::msg(
-                                                    "Groq tool validation failed (tool_use_failed). The model's tool arguments did not match the schema — retry with valid keys (e.g. edit_file: use `path` OR `file_path` plus snippets), or use a smaller edit.",
+                                                    "Invalid JSON in API stream (tool/API error payload may be truncated).",
                                                 ));
                                                 return;
                                             }
                                             eprintln!(
-                                                "Parse warning: {} (first 200 chars): {}",
+                                                "Parse warning: invalid JSON in SSE ({}): {}",
                                                 e,
                                                 data_trim.chars().take(200).collect::<String>()
                                             );
+                                            continue;
                                         }
+                                    };
+
+                                    if v.get("error").is_some() {
+                                        let msg = stream_api_error_user_message(&v);
+                                        yield Err(anyhow::Error::msg(msg));
+                                        return;
                                     }
+
+                                    let chunk: StreamChunk = match serde_json::from_value(v) {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Parse warning: unexpected SSE shape ({}): {}",
+                                                e,
+                                                data_trim.chars().take(200).collect::<String>()
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    yield Ok(chunk);
                                 }
                             }
                         }

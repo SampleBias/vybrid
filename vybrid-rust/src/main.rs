@@ -220,6 +220,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Groq may reject a tool call before streaming any assistant text; these errors are worth one automatic retry.
+fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("tool_use_failed")
+        || s.contains("did not match schema")
+        || s.contains("Tool call validation")
+}
+
 /// Process AI response with streaming and tool calls
 async fn process_ai_response(
     client: &GroqClient,
@@ -236,98 +244,133 @@ async fn process_ai_response(
         );
     }
 
-    let mut spinner = ui::SpinnerGuard::new("groq");
-    let stream = client
-        .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
-        .await;
-    let stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            spinner.finish().await;
-            return Err(e);
-        }
-    };
+    /// If the API rejects a tool call before any tokens arrive, retry once with a corrective user note.
+    const MAX_STREAM_ATTEMPTS: u32 = 2;
 
-    futures::pin_mut!(stream);
-
-    let mut reasoning_started = false;
-    let mut content_started = false;
+    let mut reasoning_started: bool;
+    let mut content_started: bool;
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut first_chunk = true;
+    let mut first_chunk: bool;
 
-    while let Some(chunk_result) = stream.next().await {
-        if first_chunk {
-            spinner.finish().await;
-            first_chunk = false;
-        }
-        match chunk_result {
-            Ok(chunk) => {
-                if let Some(choice) = chunk.choices.first() {
-                    // Handle reasoning content (thinking)
-                    if let Some(reasoning) = &choice.delta.reasoning_content {
-                        if !reasoning_started {
-                            println!();
-                            println!("{}", style("Thinking:").blue().dim());
-                            reasoning_started = true;
-                        }
-                        print!("{}", style(reasoning).dim());
-                        io::stdout().flush()?;
-                    }
+    let mut attempt: u32 = 0;
+    'stream: loop {
+        attempt += 1;
 
-                    // Handle content
-                    if let Some(content) = &choice.delta.content {
-                        if !content_started {
-                            if reasoning_started {
+        reasoning_started = false;
+        content_started = false;
+        final_content.clear();
+        tool_calls.clear();
+        first_chunk = true;
+
+        let mut spinner = ui::SpinnerGuard::new("groq");
+        let stream = client
+            .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
+            .await;
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                spinner.finish().await;
+                return Err(e);
+            }
+        };
+
+        futures::pin_mut!(stream);
+
+        while let Some(chunk_result) = stream.next().await {
+            if first_chunk {
+                spinner.finish().await;
+                first_chunk = false;
+            }
+            match chunk_result {
+                Ok(chunk) => {
+                    if let Some(choice) = chunk.choices.first() {
+                        // Handle reasoning content (thinking)
+                        if let Some(reasoning) = &choice.delta.reasoning_content {
+                            if !reasoning_started {
                                 println!();
-                                println!();
+                                println!("{}", style("Thinking:").blue().dim());
+                                reasoning_started = true;
                             }
-                            print!("{} ", style("Assistant>").cyan().bold());
-                            content_started = true;
+                            print!("{}", style(reasoning).dim());
+                            io::stdout().flush()?;
                         }
-                        print!("{}", content);
-                        io::stdout().flush()?;
-                        final_content.push_str(content);
-                    }
 
-                    // Handle tool calls
-                    if let Some(tc_deltas) = &choice.delta.tool_calls {
-                        for tc_delta in tc_deltas {
-                            while tool_calls.len() <= tc_delta.index {
-                                tool_calls.push(ToolCall {
-                                    id: String::new(),
-                                    call_type: "function".to_string(),
-                                    function: crate::client::groq::FunctionCall {
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    },
-                                });
-                            }
-
-                            if let Some(id) = &tc_delta.id {
-                                tool_calls[tc_delta.index].id.push_str(id);
-                            }
-                            if let Some(func) = &tc_delta.function {
-                                if let Some(name) = &func.name {
-                                    tool_calls[tc_delta.index].function.name.push_str(name);
+                        // Handle content
+                        if let Some(content) = &choice.delta.content {
+                            if !content_started {
+                                if reasoning_started {
+                                    println!();
+                                    println!();
                                 }
-                                if let Some(args) = &func.arguments {
-                                    tool_calls[tc_delta.index].function.arguments.push_str(args);
+                                print!("{} ", style("Assistant>").cyan().bold());
+                                content_started = true;
+                            }
+                            print!("{}", content);
+                            io::stdout().flush()?;
+                            final_content.push_str(content);
+                        }
+
+                        // Handle tool calls
+                        if let Some(tc_deltas) = &choice.delta.tool_calls {
+                            for tc_delta in tc_deltas {
+                                while tool_calls.len() <= tc_delta.index {
+                                    tool_calls.push(ToolCall {
+                                        id: String::new(),
+                                        call_type: "function".to_string(),
+                                        function: crate::client::groq::FunctionCall {
+                                            name: String::new(),
+                                            arguments: String::new(),
+                                        },
+                                    });
+                                }
+
+                                if let Some(id) = &tc_delta.id {
+                                    tool_calls[tc_delta.index].id.push_str(id);
+                                }
+                                if let Some(func) = &tc_delta.function {
+                                    if let Some(name) = &func.name {
+                                        tool_calls[tc_delta.index].function.name.push_str(name);
+                                    }
+                                    if let Some(args) = &func.arguments {
+                                        tool_calls[tc_delta.index].function.arguments.push_str(args);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                println!();
-                return Err(e);
+                Err(e) => {
+                    println!();
+                    if attempt < MAX_STREAM_ATTEMPTS
+                        && is_retryable_groq_stream_error(&e)
+                        && !content_started
+                        && !reasoning_started
+                    {
+                        conversation.add_user_message(&format!(
+                            "[Vybrid] The API rejected a tool call before the reply could start: {e}. This was attempt {attempt} of {MAX_STREAM_ATTEMPTS}. Please respond again; use tools only with arguments that match each tool's schema (see descriptions). For enhanced_grep, include `pattern` plus `path`, `file_path`, or `file_paths`."
+                        ));
+                        println!(
+                            "{}",
+                            style(
+                                "Groq tool validation failed — retrying once with a corrective prompt…"
+                            )
+                            .yellow()
+                        );
+                        spinner.finish().await;
+                        continue 'stream;
+                    }
+                    spinner.finish().await;
+                    return Err(e);
+                }
             }
         }
-    }
 
-    if first_chunk {
-        spinner.finish().await;
+        if first_chunk {
+            spinner.finish().await;
+        }
+
+        break 'stream;
     }
 
     if content_started || reasoning_started {
