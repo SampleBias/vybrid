@@ -7,6 +7,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 
+/// Turn a Groq/OpenAI-style SSE error JSON into a short user-facing message (no huge `failed_generation`).
+fn stream_api_error_user_message(body: &Value) -> String {
+    let Some(err) = body.get("error") else {
+        return "The API returned an error while streaming.".to_string();
+    };
+    let msg = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("Unknown API error");
+    let code = err.get("code").and_then(|c| c.as_str());
+    let hint = match code {
+        Some("tool_use_failed") => {
+            " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
+        }
+        _ => "",
+    };
+    format!("{}{}", msg, hint)
+}
+
 /// Groq OpenAI-compatible Chat Completions client (`https://api.groq.com/openai/v1`).
 #[derive(Debug, Clone)]
 pub struct GroqClient {
@@ -209,8 +228,9 @@ impl GroqClient {
                                     // Groq may emit JSON error objects in the SSE stream (no `choices` field).
                                     if let Ok(v) = serde_json::from_str::<Value>(data_trim) {
                                         if v.get("error").is_some() {
-                                            eprintln!("API error (stream): {}", data_trim);
-                                            continue;
+                                            let msg = stream_api_error_user_message(&v);
+                                            yield Err(anyhow::Error::msg(msg));
+                                            return;
                                         }
                                     }
 
