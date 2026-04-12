@@ -75,10 +75,25 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
         // Enhanced grep
         "enhanced_grep" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
-            let paths: Vec<&str> = args["file_paths"]
+            let mut paths: Vec<&str> = args["file_paths"]
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
+            if paths.is_empty() {
+                if let Some(p) = args["file_path"].as_str() {
+                    if !p.is_empty() {
+                        paths.push(p);
+                    }
+                }
+            }
+            if pattern.is_empty() {
+                return Err(anyhow!("enhanced_grep: missing pattern"));
+            }
+            if paths.is_empty() {
+                return Err(anyhow!(
+                    "enhanced_grep: provide file_paths (array) or file_path (string)"
+                ));
+            }
             let context = args["context_lines"].as_u64().unwrap_or(3) as usize;
             let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
             grep::enhanced_grep(pattern, &paths, context, case_sensitive)

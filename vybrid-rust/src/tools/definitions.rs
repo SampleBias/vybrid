@@ -159,7 +159,11 @@ pub fn get_all_tools() -> Vec<Tool> {
                         "file_paths": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "List of file paths to search in. Can include individual files or use wildcards (*.py, *.js, etc.)"
+                            "description": "List of file paths or glob patterns to search (e.g. [\"src/**/*.rs\"]). Preferred when searching multiple paths."
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Single file or glob to search (alternative to file_paths). Use when targeting one file."
                         },
                         "context_lines": {
                             "type": "integer",
@@ -174,7 +178,7 @@ pub fn get_all_tools() -> Vec<Tool> {
                             "description": "Maximum number of matches to return per file (default: 20)"
                         }
                     },
-                    "required": ["pattern", "file_paths"]
+                    "required": ["pattern"]
                 }),
             },
         },

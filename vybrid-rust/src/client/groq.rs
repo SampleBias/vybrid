@@ -19,7 +19,11 @@ fn stream_api_error_user_message(body: &Value) -> String {
     let code = err.get("code").and_then(|c| c.as_str());
     let hint = match code {
         Some("tool_use_failed") => {
-            " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
+            if msg.contains("enhanced_grep") || msg.contains("file_paths") {
+                " If the model used `file_path` instead of `file_paths`, retry: the tool accepts either. For huge `edit_file` payloads, use smaller edits or paste the patch as text."
+            } else {
+                " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
+            }
         }
         _ => "",
     };
@@ -237,7 +241,20 @@ impl GroqClient {
                                     match serde_json::from_str::<StreamChunk>(data_trim) {
                                         Ok(chunk) => yield Ok(chunk),
                                         Err(e) => {
-                                            eprintln!("Parse warning: {} for data: {}", e, data_trim);
+                                            // Error payloads sometimes fail the first Value parse (escapes / size);
+                                            // retry as generic JSON and surface API errors without "missing choices" noise.
+                                            if let Ok(v) = serde_json::from_str::<Value>(data_trim) {
+                                                if v.get("error").is_some() {
+                                                    let msg = stream_api_error_user_message(&v);
+                                                    yield Err(anyhow::Error::msg(msg));
+                                                    return;
+                                                }
+                                            }
+                                            eprintln!(
+                                                "Parse warning: {} (first 200 chars): {}",
+                                                e,
+                                                data_trim.chars().take(200).collect::<String>()
+                                            );
                                         }
                                     }
                                 }
