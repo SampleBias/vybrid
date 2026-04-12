@@ -23,6 +23,8 @@ fn stream_api_error_user_message(body: &Value) -> String {
                 " For `enhanced_grep`, use `file_paths`, `file_path`, or `path` (plus `pattern`). For huge `edit_file` payloads, use smaller edits or paste the patch as text."
             } else if msg.contains("edit_file") && (msg.contains("file_path") || msg.contains("path")) {
                 " For `edit_file`, use either `path` or `file_path` (not both required). If the payload was huge, split into smaller edits."
+            } else if msg.contains("create_file") && msg.contains("file_path") {
+                " For `create_file`, use `file_path` or `path` plus `content`. If the payload was huge, split into smaller writes."
             } else {
                 " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
             }

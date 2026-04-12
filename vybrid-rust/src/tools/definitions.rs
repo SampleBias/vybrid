@@ -45,20 +45,38 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "create_file".to_string(),
-                description: "Create a new file or overwrite an existing file with the provided content".to_string(),
+                description: "Create a new file or overwrite an existing file with the provided content. Use `file_path` or `path` for the destination (same meaning).".to_string(),
                 parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "file_path": {
-                            "type": "string",
-                            "description": "The path where the file should be created"
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Path where the file should be created"
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Content to write"
+                                }
+                            },
+                            "required": ["file_path", "content"]
                         },
-                        "content": {
-                            "type": "string",
-                            "description": "The content to write to the file"
+                        {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Path where the file should be created (alias for file_path)"
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Content to write"
+                                }
+                            },
+                            "required": ["path", "content"]
                         }
-                    },
-                    "required": ["file_path", "content"]
+                    ]
                 }),
             },
         },

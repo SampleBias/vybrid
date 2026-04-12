@@ -27,7 +27,10 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
 
         // File creation
         "create_file" => {
-            let path = args["file_path"].as_str().unwrap_or("");
+            let path = args["path"]
+                .as_str()
+                .or_else(|| args["file_path"].as_str())
+                .unwrap_or("");
             let content = args["content"].as_str().unwrap_or("");
             file_ops::create_file(path, content)
         }
