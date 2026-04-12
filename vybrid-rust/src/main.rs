@@ -21,6 +21,15 @@ use crate::tools::executor::execute_tool;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut args = std::env::args();
+    let _exe = args.next();
+    if let Some(flag) = args.next() {
+        if flag == "--version" || flag == "-V" {
+            println!("vybrid {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+    }
+
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
