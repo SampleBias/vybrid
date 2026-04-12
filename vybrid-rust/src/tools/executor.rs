@@ -57,8 +57,14 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
                 .as_str()
                 .or_else(|| args["file_path"].as_str())
                 .unwrap_or("");
-            let original = args["original_snippet"].as_str().unwrap_or("");
-            let new = args["new_snippet"].as_str().unwrap_or("");
+            let original = args["original_snippet"]
+                .as_str()
+                .or_else(|| args["old_string"].as_str())
+                .unwrap_or("");
+            let new = args["new_snippet"]
+                .as_str()
+                .or_else(|| args["new_string"].as_str())
+                .unwrap_or("");
             if path.is_empty() {
                 return Err(anyhow!(
                     "edit_file: missing path or file_path — provide the file to edit"
