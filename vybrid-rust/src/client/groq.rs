@@ -201,14 +201,23 @@ impl GroqClient {
                                 if line.starts_with("data: ") {
                                     let data = &line[6..];
 
-                                    if data.trim() == "[DONE]" {
+                                    let data_trim = data.trim();
+                                    if data_trim == "[DONE]" {
                                         return;
                                     }
 
-                                    match serde_json::from_str::<StreamChunk>(data) {
+                                    // Groq may emit JSON error objects in the SSE stream (no `choices` field).
+                                    if let Ok(v) = serde_json::from_str::<Value>(data_trim) {
+                                        if v.get("error").is_some() {
+                                            eprintln!("API error (stream): {}", data_trim);
+                                            continue;
+                                        }
+                                    }
+
+                                    match serde_json::from_str::<StreamChunk>(data_trim) {
                                         Ok(chunk) => yield Ok(chunk),
                                         Err(e) => {
-                                            eprintln!("Parse warning: {} for data: {}", e, data);
+                                            eprintln!("Parse warning: {} for data: {}", e, data_trim);
                                         }
                                     }
                                 }

@@ -92,13 +92,17 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit_file".to_string(),
-                description: "Edit an existing file by replacing a specific snippet with new content".to_string(),
+                description: "Edit an existing file by replacing a specific snippet with new content. Use path or file_path for the file (same meaning; path matches create_multiple_files).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to edit (relative or absolute)"
+                        },
                         "file_path": {
                             "type": "string",
-                            "description": "The path to the file to edit"
+                            "description": "Same as path — include path or file_path (either is valid)"
                         },
                         "original_snippet": {
                             "type": "string",
@@ -109,7 +113,7 @@ pub fn get_all_tools() -> Vec<Tool> {
                             "description": "The new text to replace the original snippet with"
                         }
                     },
-                    "required": ["file_path", "original_snippet", "new_snippet"]
+                    "required": ["original_snippet", "new_snippet"]
                 }),
             },
         },

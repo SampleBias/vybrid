@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use super::{file_ops, grep, project, search, shell};
@@ -50,9 +50,17 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
 
         // File editing
         "edit_file" => {
-            let path = args["file_path"].as_str().unwrap_or("");
+            let path = args["path"]
+                .as_str()
+                .or_else(|| args["file_path"].as_str())
+                .unwrap_or("");
             let original = args["original_snippet"].as_str().unwrap_or("");
             let new = args["new_snippet"].as_str().unwrap_or("");
+            if path.is_empty() {
+                return Err(anyhow!(
+                    "edit_file: missing path or file_path — provide the file to edit"
+                ));
+            }
             file_ops::edit_file(path, original, new)
         }
 
