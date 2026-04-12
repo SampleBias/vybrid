@@ -92,28 +92,46 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit_file".to_string(),
-                description: "Edit an existing file by replacing a specific snippet with new content. Use path or file_path for the file (same meaning; path matches create_multiple_files).".to_string(),
+                description: "Edit an existing file by replacing a specific snippet with new content. Provide the file as either `path` OR `file_path` (both are accepted; use whichever matches your habit).".to_string(),
                 parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the file to edit (relative or absolute)"
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": "Path to the file to edit (relative or absolute)"
+                                },
+                                "original_snippet": {
+                                    "type": "string",
+                                    "description": "The exact text snippet to find and replace"
+                                },
+                                "new_snippet": {
+                                    "type": "string",
+                                    "description": "The new text to replace the original snippet with"
+                                }
+                            },
+                            "required": ["path", "original_snippet", "new_snippet"]
                         },
-                        "file_path": {
-                            "type": "string",
-                            "description": "Same as path — include path or file_path (either is valid)"
-                        },
-                        "original_snippet": {
-                            "type": "string",
-                            "description": "The exact text snippet to find and replace"
-                        },
-                        "new_snippet": {
-                            "type": "string",
-                            "description": "The new text to replace the original snippet with"
+                        {
+                            "type": "object",
+                            "properties": {
+                                "file_path": {
+                                    "type": "string",
+                                    "description": "Path to the file to edit (relative or absolute)"
+                                },
+                                "original_snippet": {
+                                    "type": "string",
+                                    "description": "The exact text snippet to find and replace"
+                                },
+                                "new_snippet": {
+                                    "type": "string",
+                                    "description": "The new text to replace the original snippet with"
+                                }
+                            },
+                            "required": ["file_path", "original_snippet", "new_snippet"]
                         }
-                    },
-                    "required": ["original_snippet", "new_snippet"]
+                    ]
                 }),
             },
         },

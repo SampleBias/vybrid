@@ -21,6 +21,8 @@ fn stream_api_error_user_message(body: &Value) -> String {
         Some("tool_use_failed") => {
             if msg.contains("enhanced_grep") || msg.contains("file_paths") {
                 " If the model used `file_path` instead of `file_paths`, retry: the tool accepts either. For huge `edit_file` payloads, use smaller edits or paste the patch as text."
+            } else if msg.contains("edit_file") && (msg.contains("file_path") || msg.contains("path")) {
+                " For `edit_file`, use either `path` or `file_path` (not both required). If the payload was huge, split into smaller edits."
             } else {
                 " Try a smaller edit, split the change into steps, or ask the model to output the patch as text instead of a single huge tool call."
             }
@@ -249,6 +251,12 @@ impl GroqClient {
                                                     yield Err(anyhow::Error::msg(msg));
                                                     return;
                                                 }
+                                            } else if data_trim.contains("tool_use_failed") {
+                                                // `failed_generation` can break JSON; still surface a clear failure.
+                                                yield Err(anyhow::Error::msg(
+                                                    "Groq tool validation failed (tool_use_failed). The model's tool arguments did not match the schema — retry with valid keys (e.g. edit_file: use `path` OR `file_path` plus snippets), or use a smaller edit.",
+                                                ));
+                                                return;
                                             }
                                             eprintln!(
                                                 "Parse warning: {} (first 200 chars): {}",
