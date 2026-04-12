@@ -7,16 +7,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::pin::Pin;
 
-/// GLM (Z.AI Coding Plan) chat completions client
+/// Groq OpenAI-compatible Chat Completions client (`https://api.groq.com/openai/v1`).
 #[derive(Debug, Clone)]
-pub struct GlmClient {
+pub struct GroqClient {
     client: Client,
     api_key: String,
     base_url: String,
     model: String,
 }
 
-/// Chat completion request
+/// Chat completion request (OpenAI-compatible subset).
 #[derive(Debug, Serialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -26,10 +26,6 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
     pub stream: bool,
-    /// GLM-5+ streaming tool-call parameter assembly (see Z.AI migrate-to-glm-5 guide).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_stream: Option<bool>,
-    pub thinking: ThinkingConfig,
     pub max_tokens: u32,
     pub temperature: f32,
 }
@@ -76,13 +72,6 @@ pub struct FunctionDef {
     pub name: String,
     pub description: String,
     pub parameters: Value,
-}
-
-/// Thinking configuration
-#[derive(Debug, Serialize)]
-pub struct ThinkingConfig {
-    #[serde(rename = "type")]
-    pub thinking_type: String,
 }
 
 /// Streaming response chunk
@@ -143,8 +132,7 @@ pub struct AccumulatedToolCall {
     pub arguments: String,
 }
 
-impl GlmClient {
-    /// Create a new GLM client
+impl GroqClient {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         Self {
             client: Client::builder()
@@ -169,10 +157,6 @@ impl GlmClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: true,
-            tool_stream: Some(true),
-            thinking: ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-            },
             max_tokens: 8192,
             temperature: 1.0,
         };
@@ -186,7 +170,7 @@ impl GlmClient {
             .json(&request)
             .send()
             .await
-            .context("Failed to send request to GLM API")?;
+            .context("Failed to send request to Groq API")?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -209,26 +193,21 @@ impl GlmClient {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-                        // Process complete SSE events (data: ...\n\n)
                         while let Some(pos) = buffer.find("\n\n") {
                             let event = buffer[..pos].to_string();
                             buffer = buffer[pos + 2..].to_string();
 
-                            // Process each line in the event
                             for line in event.lines() {
                                 if line.starts_with("data: ") {
                                     let data = &line[6..];
-                                    
-                                    // Check for stream end
+
                                     if data.trim() == "[DONE]" {
                                         return;
                                     }
 
-                                    // Parse JSON chunk
                                     match serde_json::from_str::<StreamChunk>(data) {
                                         Ok(chunk) => yield Ok(chunk),
                                         Err(e) => {
-                                            // Log parse errors but continue
                                             eprintln!("Parse warning: {} for data: {}", e, data);
                                         }
                                     }
@@ -247,7 +226,7 @@ impl GlmClient {
         Ok(Box::pin(output_stream))
     }
 
-    /// Non-streaming chat completion (for simpler use cases)
+    /// Non-streaming chat completion
     pub async fn chat(&self, messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Result<Message> {
         let request = ChatRequest {
             model: self.model.clone(),
@@ -255,10 +234,6 @@ impl GlmClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: false,
-            tool_stream: None,
-            thinking: ThinkingConfig {
-                thinking_type: "enabled".to_string(),
-            },
             max_tokens: 8192,
             temperature: 1.0,
         };
@@ -271,7 +246,7 @@ impl GlmClient {
             .json(&request)
             .send()
             .await
-            .context("Failed to send request to GLM API")?;
+            .context("Failed to send request to Groq API")?;
 
         if !response.status().is_success() {
             let status = response.status();

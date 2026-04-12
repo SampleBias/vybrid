@@ -1,4 +1,4 @@
-use crate::client::glm::Message;
+use crate::client::groq::Message;
 
 /// Manages conversation history
 #[derive(Debug, Clone)]

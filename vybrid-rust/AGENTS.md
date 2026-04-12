@@ -4,7 +4,7 @@ This guide helps agents work effectively in the Vybrid Rust codebase. Vybrid is 
 
 ## Project Overview
 
-**Vybrid** is an AI-powered coding assistant built with Rust that provides an interactive CLI with tool-calling capabilities. It uses the GLM-5.1 model on Z.AI’s GLM Coding Plan API and supports file operations, shell commands, code search, and project management.
+**Vybrid** is an AI-powered coding assistant built with Rust that provides an interactive CLI with tool-calling capabilities. It uses the **`openai/gpt-oss-120b`** model on [Groq’s OpenAI-compatible API](https://console.groq.com/docs/openai) and supports file operations, shell commands, code search, and project management.
 
 **As an expert Rust coding agent**, Vybrid provides high-level Rust development assistance including code architecture, ownership patterns, async workflows, and ecosystem best practices.
 
@@ -12,7 +12,7 @@ This guide helps agents work effectively in the Vybrid Rust codebase. Vybrid is 
 - Built with Rust 2021 edition
 - Async runtime: tokio
 - Error handling: anyhow
-- AI model: GLM-5.1 (Z.AI GLM Coding Plan)
+- AI model: `openai/gpt-oss-120b` (Groq)
 - Interactive CLI with streaming responses and tool calls
 
 **Agent Capabilities:**
@@ -83,7 +83,7 @@ vybrid-rust/
 │   ├── ui.rs                # Terminal UI and formatting
 │   ├── client/
 │   │   ├── mod.rs           # Client module
-│   │   └── glm.rs           # Z.AI chat completions client, streaming, types
+│   │   └── groq.rs          # Groq OpenAI-compatible chat client, streaming, types
 │   ├── tools/
 │   │   ├── mod.rs           # Tools module
 │   │   ├── definitions.rs   # Tool definitions for AI
@@ -107,11 +107,11 @@ vybrid-rust/
 Use **`/menu`** or create env files manually. Saves go to **`~/.vybrid/.env`** and **`vybrid-rust/.env`** (same keys; kept in sync) so Vybrid finds keys when launched from any directory.
 
 ```bash
-ZAI_API_KEY=your_api_key_here        # Required for AI chat - Z.AI API key
-GLM_API_KEY=alternative_key_here     # Alternative - falls back to this if ZAI_API_KEY missing
+GROQ_API_KEY=your_api_key_here       # Required for AI chat — Groq API key
+# GROQ_MODEL=openai/gpt-oss-120b     # Optional — defaults to openai/gpt-oss-120b
 
 # Optional
-SERPAPI_KEY=your_serpapi_key_here    # Optional - For Google search functionality
+SERPAPI_KEY=your_serpapi_key_here    # Optional — Google search (google_search tool)
 ```
 
 ### Configuration Loading
@@ -240,7 +240,7 @@ Tool {
 - Use `futures::pin_mut!()` to pin streams
 - Handle SSE (Server-Sent Events) format with `"data: "` prefix and `"\n\n"` separator
 
-Example from `client/glm.rs`:
+Example from `client/groq.rs`:
 ```rust
 futures::pin_mut!(stream);
 while let Some(chunk_result) = stream.next().await {
@@ -329,18 +329,18 @@ The system provides these tools to the AI:
 
 ## API Integration
 
-### Z.AI GLM Coding Plan (default GLM-5.1)
-- Base URL: `https://api.z.ai/api/coding/paas/v4` ([Coding Agent setup](https://docs.z.ai/devpack/using5.1))
+### Groq OpenAI-compatible Chat Completions (`openai/gpt-oss-120b`)
+- Base URL: `https://api.groq.com/openai/v1` ([OpenAI compatibility](https://console.groq.com/docs/openai))
 - Endpoint: `/chat/completions`
 - Headers:
-  - `Authorization: Bearer <api_key>`
+  - `Authorization: Bearer <GROQ_API_KEY>`
   - `Content-Type: application/json`
   - `Accept: text/event-stream` (for streaming)
-- Default model: `glm-5.1` (override via code in `config.rs` if needed)
-- Max tokens: 8192
-- Temperature: 1.0 (aligned with GLM-5 family defaults)
-- Streaming requests: `tool_stream: true` for incremental tool-call arguments
-- Thinking mode: Enabled (provides reasoning_content in delta)
+- Default model: `openai/gpt-oss-120b` (optional override: env `GROQ_MODEL`)
+- Max tokens: 8192 (within model completion limit; see [model docs](https://console.groq.com/docs/model/openai/gpt-oss-120b))
+- Temperature: 1.0
+- Request body: OpenAI-compatible (`model`, `messages`, `tools`, `tool_choice`, `stream`, `max_tokens`, `temperature`) — do not send unsupported fields ([compatibility](https://console.groq.com/docs/openai))
+- Delta may include `reasoning_content` on some models; Groq may omit it
 
 ### Streaming Response Format
 ```
@@ -378,7 +378,7 @@ data: [DONE]
 - When adding tests:
   - Put unit tests in same module with `#[cfg(test)]`
   - Put integration tests in `tests/` directory
-  - Mock API calls using `mockito` or similar for GLM client tests
+  - Mock API calls using `mockito` or similar for Groq client tests
   - Test tool execution paths in executor.rs
 
 ## Dependencies Key Points
@@ -584,8 +584,8 @@ tools::executor::execute_tool(&tool_name, &arguments).await
 - Parses tool arguments and routes to implementation
 - Returns results to be added to conversation
 
-### `client/glm.rs` - API Client
-- Handles communication with the Z.AI chat completions API
+### `client/groq.rs` - API Client
+- Handles communication with the Groq OpenAI-compatible chat completions API
 - Provides streaming and non-streaming methods
 - Manages request/response parsing
 
@@ -626,4 +626,4 @@ eprintln!("Debug: {:?}", some_variable);
 
 **Last Updated**: January 28, 2026
 **Rust Edition**: 2021
-**AI Model**: GLM-5.1 (GLM Coding Plan)
+**AI Model**: `openai/gpt-oss-120b` (Groq)

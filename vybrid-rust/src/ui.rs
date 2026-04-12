@@ -5,10 +5,10 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Approximate GLM-5.1 Coding Plan context window (tokens). Used only for the CLI meter.
-pub const CONTEXT_WINDOW_TOKENS: u32 = 200_000;
+/// Approximate `openai/gpt-oss-120b` context window (tokens). Used only for the CLI meter.
+pub const CONTEXT_WINDOW_TOKENS: u32 = 131_072;
 
-/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while GLM
+/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while Groq
 /// connects and before the first streamed chunk (thinking / TTFB).
 pub struct SpinnerGuard {
     stop: Arc<AtomicBool>,

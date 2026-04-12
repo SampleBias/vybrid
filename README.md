@@ -6,6 +6,8 @@
 
 AI powered coding assistant built from the trenches with Rust to save humanity from bloat.
 
+**Repository:** [github.com/SampleBias/vybrid](https://github.com/SampleBias/vybrid)
+
 ## Features
 
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
@@ -17,15 +19,15 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 - Linux (Ubuntu 20.04+ recommended)
 - Rust 1.70+ (for building from source)
-- Z.AI API key for GLM-5.1 (GLM Coding Plan)
+- [Groq](https://console.groq.com/) API key ([`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b))
 
 ## Installation
 
 ### From Source
 
 ```bash
-# Clone or navigate to the project
-cd vybrid-rust
+git clone https://github.com/SampleBias/vybrid.git
+cd vybrid/vybrid-rust
 
 # Build release version
 cargo build --release
@@ -48,8 +50,11 @@ sudo cp target/release/vybrid /usr/local/bin/
 Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (project wins if both define the same variable). When you save via **`/menu`**, both files are updated so you only configure once and can run Vybrid from **any directory**. Use **`/menu`** or create the files manually:
 
 ```bash
-# Required: Z.AI API Key
-ZAI_API_KEY=your_api_key_here
+# Required: Groq API key
+GROQ_API_KEY=your_api_key_here
+
+# Optional: override model (default is openai/gpt-oss-120b)
+# GROQ_MODEL=openai/gpt-oss-120b
 
 # Optional: SerpAPI for Google Search
 SERPAPI_KEY=your_serpapi_key_here
@@ -57,7 +62,7 @@ SERPAPI_KEY=your_serpapi_key_here
 
 If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 
-Get your API key from [Z.AI Open Platform](https://z.ai/model-api).
+Create a key in the [Groq Console](https://console.groq.com/keys).
 
 Keep real keys out of version control: `.env` and `.env.*` are listed in the repo `.gitignore` (only `.env.example` is meant to be committed as a template).
 
@@ -113,7 +118,7 @@ vybrid-rust/
 │   ├── conversation.rs # Conversation history
 │   ├── ui.rs           # Terminal UI helpers
 │   ├── client/
-│   │   └── glm.rs      # Z.AI chat completions client
+│   │   └── groq.rs     # Groq OpenAI-compatible chat client
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas
 │   │   ├── executor.rs     # Tool dispatcher
@@ -146,4 +151,4 @@ MIT License
 
 ## Credits
 
-Powered by [GLM-5.1](https://docs.z.ai/devpack/using5.1) on the [GLM Coding Plan](https://docs.z.ai/devpack/overview) from Z.AI (Zhipu AI).
+Inference via [Groq](https://groq.com/) using the [`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b) model ([OpenAI-compatible API](https://console.groq.com/docs/openai)).

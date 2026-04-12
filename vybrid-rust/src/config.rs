@@ -53,16 +53,17 @@ impl Config {
         dotenvy::from_path(&global_env_file_path).ok();
         dotenvy::from_path(&env_file_path).ok();
 
-        let api_key = std::env::var("ZAI_API_KEY")
-            .or_else(|_| std::env::var("GLM_API_KEY"))
-            .ok();
+        let api_key = std::env::var("GROQ_API_KEY").ok();
 
         let serpapi_key = std::env::var("SERPAPI_KEY").ok();
 
+        let model = std::env::var("GROQ_MODEL")
+            .unwrap_or_else(|_| "openai/gpt-oss-120b".to_string());
+
         Ok(Self {
             api_key,
-            api_base_url: "https://api.z.ai/api/coding/paas/v4".to_string(),
-            model: "glm-5.1".to_string(),
+            api_base_url: "https://api.groq.com/openai/v1".to_string(),
+            model,
             env_file_path,
             global_env_file_path,
             vybrid_dir,
@@ -79,10 +80,10 @@ impl Config {
         Ok(())
     }
 
-    /// Writes or updates `ZAI_API_KEY` in both env files.
-    pub fn set_zai_api_key(&mut self, key: String) -> Result<()> {
-        self.persist_env_key("ZAI_API_KEY", &key)?;
-        std::env::set_var("ZAI_API_KEY", &key);
+    /// Writes or updates `GROQ_API_KEY` in both env files.
+    pub fn set_groq_api_key(&mut self, key: String) -> Result<()> {
+        self.persist_env_key("GROQ_API_KEY", &key)?;
+        std::env::set_var("GROQ_API_KEY", &key);
         self.api_key = Some(key);
         Ok(())
     }

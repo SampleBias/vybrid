@@ -12,7 +12,7 @@ use dialoguer::{Confirm, Input, Select};
 use futures::StreamExt;
 use std::io::{self, Write};
 
-use crate::client::glm::{GlmClient, Message, ToolCall};
+use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::Config;
 use crate::conversation::Conversation;
 use crate::project_docs::ProjectDocs;
@@ -43,7 +43,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     ui::display_cwd();
 
     let mut client = config.api_key.as_ref().map(|key| {
-        GlmClient::new(
+        GroqClient::new(
             key.clone(),
             config.api_base_url.clone(),
             config.model.clone(),
@@ -54,7 +54,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         println!(
             "{}",
             style(
-                "No Z.AI API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory."
+                "No Groq API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory."
             )
             .dim()
         );
@@ -186,7 +186,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         let Some(ref c) = client else {
             ui::print_error(&format!(
-                "No Z.AI API key. Use /menu — keys are saved to {} and {}.",
+                "No Groq API key. Use /menu — keys are saved to {} and {}.",
                 config.global_env_file_path.display(),
                 config.env_file_path.display()
             ));
@@ -212,12 +212,12 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
 /// Process AI response with streaming and tool calls
 async fn process_ai_response(
-    client: &GlmClient,
+    client: &GroqClient,
     conversation: &mut Conversation,
-    tools: &[crate::client::glm::Tool],
+    tools: &[crate::client::groq::Tool],
     depth: u32,
 ) -> Result<()> {
-    /// Prevents runaway tool loops (GLM 5.1 can chain many rounds).
+    /// Prevents runaway tool loops when the model chains many rounds.
     const MAX_TOOL_ROUNDS: u32 = 48;
     if depth >= MAX_TOOL_ROUNDS {
         anyhow::bail!(
@@ -226,7 +226,7 @@ async fn process_ai_response(
         );
     }
 
-    let mut spinner = ui::SpinnerGuard::new("glm");
+    let mut spinner = ui::SpinnerGuard::new("groq");
     let stream = client
         .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
         .await;
@@ -287,7 +287,7 @@ async fn process_ai_response(
                                 tool_calls.push(ToolCall {
                                     id: String::new(),
                                     call_type: "function".to_string(),
-                                    function: crate::client::glm::FunctionCall {
+                                    function: crate::client::groq::FunctionCall {
                                         name: String::new(),
                                         arguments: String::new(),
                                     },
@@ -499,7 +499,7 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Z.AI & SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
+        "  {}     - Menu (Groq & SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
         style("/menu").yellow()
     );
     println!();
@@ -647,10 +647,10 @@ fn saved_env_locations(config: &Config) -> String {
 }
 
 /// Interactive menu — keys written to `~/.vybrid/.env` and `vybrid-rust/.env`
-fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()> {
+fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
     let items = vec![
-        "Add both Z.AI + SerpAPI keys (SerpAPI optional — then save & use chat)",
-        "Add or update Z.AI API key only",
+        "Add both Groq + SerpAPI keys (SerpAPI optional — then save & use chat)",
+        "Add or update Groq API key only",
         "Add or update SerpAPI key only (Google search)",
         "Back",
     ];
@@ -664,20 +664,20 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
     match sel {
         0 => {
             let key: String = Input::new()
-                .with_prompt("Z.AI API key")
+                .with_prompt("Groq API key")
                 .interact_text()
                 .context("No API key entered")?;
             let key = key.trim().to_string();
             if key.is_empty() {
-                ui::print_error("Z.AI API key was empty.");
+                ui::print_error("Groq API key was empty.");
                 return Ok(());
             }
-            config.set_zai_api_key(key)?;
+            config.set_groq_api_key(key)?;
             let api_key = config
                 .api_key
                 .clone()
                 .context("API key missing after save")?;
-            *client = Some(GlmClient::new(
+            *client = Some(GroqClient::new(
                 api_key,
                 config.api_base_url.clone(),
                 config.model.clone(),
@@ -704,7 +704,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
         }
         1 => {
             let key: String = Input::new()
-                .with_prompt("Z.AI API key")
+                .with_prompt("Groq API key")
                 .interact_text()
                 .context("No API key entered")?;
             let key = key.trim().to_string();
@@ -712,12 +712,12 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
                 ui::print_error("API key was empty.");
                 return Ok(());
             }
-            config.set_zai_api_key(key)?;
+            config.set_groq_api_key(key)?;
             let api_key = config
                 .api_key
                 .clone()
                 .context("API key missing after save")?;
-            *client = Some(GlmClient::new(
+            *client = Some(GroqClient::new(
                 api_key,
                 config.api_base_url.clone(),
                 config.model.clone(),
@@ -725,7 +725,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GlmClient>) -> Result<()
             println!(
                 "{}",
                 style(format!(
-                    "Saved ZAI_API_KEY to:\n  {}",
+                    "Saved GROQ_API_KEY to:\n  {}",
                     saved_env_locations(config)
                 ))
                 .green()

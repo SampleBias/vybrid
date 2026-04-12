@@ -1,4 +1,4 @@
-# Local environment files — never commit API keys (Z.AI, SerpAPI, etc.)
+# Local environment files — never commit API keys (Groq, SerpAPI, etc.)
 .env
 .env.*
 !.env.example

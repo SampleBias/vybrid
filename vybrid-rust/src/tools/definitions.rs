@@ -1,4 +1,4 @@
-use crate::client::glm::{FunctionDef, Tool};
+use crate::client::groq::{FunctionDef, Tool};
 use serde_json::json;
 
 /// Get all available tools for function calling
