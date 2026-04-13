@@ -4,6 +4,39 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Default OpenAI-compatible base for [LM Studio](https://lmstudio.ai/docs/developer/openai-compat).
+pub const DEFAULT_LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+
+/// Placeholder Bearer token when LM Studio has authentication disabled.
+pub const DEFAULT_LM_STUDIO_API_KEY: &str = "lm-studio";
+
+const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+
+/// Which LLM backend Vybrid uses (`VYBRID_LLM_PROVIDER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmProvider {
+    Groq,
+    LmStudio,
+}
+
+impl LlmProvider {
+    /// Parse `groq` or `lmstudio` (case-insensitive). Returns `None` if unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "groq" => Some(Self::Groq),
+            "lmstudio" | "lm_studio" | "lm-studio" => Some(Self::LmStudio),
+            _ => None,
+        }
+    }
+
+    pub fn as_env_value(self) -> &'static str {
+        match self {
+            LlmProvider::Groq => "groq",
+            LlmProvider::LmStudio => "lmstudio",
+        }
+    }
+}
+
 /// Path to the project `.env` file: `vybrid-rust/.env` (directory containing `Cargo.toml`).
 /// Override with `VYBRID_ROOT` if the binary was moved and keys live elsewhere.
 pub fn project_env_file_path() -> PathBuf {
@@ -14,11 +47,18 @@ pub fn project_env_file_path() -> PathBuf {
     }
 }
 
+fn normalize_openai_base_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub api_key: Option<String>,
-    pub api_base_url: String,
-    pub model: String,
+    pub llm_provider: LlmProvider,
+    pub groq_api_key: Option<String>,
+    pub groq_model: String,
+    pub lm_studio_base_url: String,
+    pub lm_studio_api_key: Option<String>,
+    pub lm_studio_model: Option<String>,
     /// `vybrid-rust/.env` (see [`project_env_file_path`]).
     pub env_file_path: PathBuf,
     /// `~/.vybrid/.env` — mirror so launches from any directory find keys without `VYBRID_ROOT`.
@@ -35,16 +75,13 @@ impl Config {
         let vybrid_dir = home.join(".vybrid");
 
         // Create all required directories
-        std::fs::create_dir_all(&vybrid_dir)
-            .context("Failed to create ~/.vybrid directory")?;
+        std::fs::create_dir_all(&vybrid_dir).context("Failed to create ~/.vybrid directory")?;
 
         let messages_dir = vybrid_dir.join("messages");
         let progress_dir = vybrid_dir.join("progress");
 
-        std::fs::create_dir_all(&messages_dir)
-            .context("Failed to create messages directory")?;
-        std::fs::create_dir_all(&progress_dir)
-            .context("Failed to create progress directory")?;
+        std::fs::create_dir_all(&messages_dir).context("Failed to create messages directory")?;
+        std::fs::create_dir_all(&progress_dir).context("Failed to create progress directory")?;
 
         let global_env_file_path = vybrid_dir.join(".env");
         let env_file_path = project_env_file_path();
@@ -53,17 +90,41 @@ impl Config {
         dotenvy::from_path(&global_env_file_path).ok();
         dotenvy::from_path(&env_file_path).ok();
 
-        let api_key = std::env::var("GROQ_API_KEY").ok();
+        let llm_provider = std::env::var("VYBRID_LLM_PROVIDER")
+            .ok()
+            .and_then(|s| LlmProvider::parse(&s))
+            .unwrap_or(LlmProvider::Groq);
+
+        let groq_api_key = std::env::var("GROQ_API_KEY").ok();
 
         let serpapi_key = std::env::var("SERPAPI_KEY").ok();
 
-        let model = std::env::var("GROQ_MODEL")
-            .unwrap_or_else(|_| "openai/gpt-oss-120b".to_string());
+        let groq_model =
+            std::env::var("GROQ_MODEL").unwrap_or_else(|_| "openai/gpt-oss-120b".to_string());
+
+        let lm_studio_base_url = std::env::var("LM_STUDIO_BASE_URL")
+            .ok()
+            .map(|s| normalize_openai_base_url(&s))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| normalize_openai_base_url(DEFAULT_LM_STUDIO_BASE_URL));
+
+        let lm_studio_api_key = std::env::var("LM_STUDIO_API_KEY")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let lm_studio_model = std::env::var("LM_STUDIO_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         Ok(Self {
-            api_key,
-            api_base_url: "https://api.groq.com/openai/v1".to_string(),
-            model,
+            llm_provider,
+            groq_api_key,
+            groq_model,
+            lm_studio_base_url,
+            lm_studio_api_key,
+            lm_studio_model,
             env_file_path,
             global_env_file_path,
             vybrid_dir,
@@ -73,6 +134,32 @@ impl Config {
         })
     }
 
+    /// Resolves `(api_key, base_url, model)` for the active [`LlmProvider`] for OpenAI-compatible chat.
+    pub fn effective_chat_client_params(&self) -> Option<(String, String, String)> {
+        match self.llm_provider {
+            LlmProvider::Groq => {
+                let key = self.groq_api_key.clone()?;
+                if key.trim().is_empty() {
+                    return None;
+                }
+                Some((key, GROQ_BASE_URL.to_string(), self.groq_model.clone()))
+            }
+            LlmProvider::LmStudio => {
+                let model = self.lm_studio_model.as_ref()?.trim();
+                if model.is_empty() {
+                    return None;
+                }
+                let key = self
+                    .lm_studio_api_key
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| DEFAULT_LM_STUDIO_API_KEY.to_string());
+                Some((key, self.lm_studio_base_url.clone(), model.to_string()))
+            }
+        }
+    }
+
     /// Writes the same key to `~/.vybrid/.env` and `vybrid-rust/.env` so use from any cwd works.
     fn persist_env_key(&self, key: &str, value: &str) -> Result<()> {
         merge_env_file(&self.global_env_file_path, key, value)?;
@@ -80,11 +167,87 @@ impl Config {
         Ok(())
     }
 
-    /// Writes or updates `GROQ_API_KEY` in both env files.
+    /// Writes or updates `GROQ_API_KEY` in both env files and switches provider to Groq.
     pub fn set_groq_api_key(&mut self, key: String) -> Result<()> {
         self.persist_env_key("GROQ_API_KEY", &key)?;
         std::env::set_var("GROQ_API_KEY", &key);
-        self.api_key = Some(key);
+        self.groq_api_key = Some(key);
+        self.set_llm_provider(LlmProvider::Groq)?;
+        Ok(())
+    }
+
+    /// Writes or updates `VYBRID_LLM_PROVIDER` (`groq` or `lmstudio`).
+    pub fn set_llm_provider(&mut self, provider: LlmProvider) -> Result<()> {
+        let v = provider.as_env_value();
+        self.persist_env_key("VYBRID_LLM_PROVIDER", v)?;
+        std::env::set_var("VYBRID_LLM_PROVIDER", v);
+        self.llm_provider = provider;
+        Ok(())
+    }
+
+    pub fn set_lm_studio_base_url(&mut self, url: String) -> Result<()> {
+        let normalized = normalize_openai_base_url(&url);
+        if normalized.is_empty() {
+            anyhow::bail!("LM Studio base URL was empty.");
+        }
+        self.persist_env_key("LM_STUDIO_BASE_URL", &normalized)?;
+        std::env::set_var("LM_STUDIO_BASE_URL", &normalized);
+        self.lm_studio_base_url = normalized;
+        Ok(())
+    }
+
+    /// Persists the API key (Bearer token). Use [`DEFAULT_LM_STUDIO_API_KEY`] when the server has auth disabled.
+    pub fn set_lm_studio_api_key(&mut self, key: String) -> Result<()> {
+        self.persist_env_key("LM_STUDIO_API_KEY", &key)?;
+        std::env::set_var("LM_STUDIO_API_KEY", &key);
+        self.lm_studio_api_key = Some(key);
+        Ok(())
+    }
+
+    pub fn set_lm_studio_model(&mut self, model: String) -> Result<()> {
+        let trimmed = model.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("LM Studio model id was empty.");
+        }
+        self.persist_env_key("LM_STUDIO_MODEL", &trimmed)?;
+        std::env::set_var("LM_STUDIO_MODEL", &trimmed);
+        self.lm_studio_model = Some(trimmed);
+        Ok(())
+    }
+
+    /// Writes LM Studio settings and selects the LM Studio provider.
+    pub fn apply_lm_studio_profile(
+        &mut self,
+        base_url: String,
+        api_key: String,
+        model: String,
+    ) -> Result<()> {
+        let base = normalize_openai_base_url(&base_url);
+        if base.is_empty() {
+            anyhow::bail!("LM Studio base URL was empty.");
+        }
+        let model_trim = model.trim().to_string();
+        if model_trim.is_empty() {
+            anyhow::bail!("LM Studio model id was empty.");
+        }
+        let key = if api_key.trim().is_empty() {
+            DEFAULT_LM_STUDIO_API_KEY.to_string()
+        } else {
+            api_key.trim().to_string()
+        };
+
+        self.persist_env_key("LM_STUDIO_BASE_URL", &base)?;
+        self.persist_env_key("LM_STUDIO_API_KEY", &key)?;
+        self.persist_env_key("LM_STUDIO_MODEL", &model_trim)?;
+        std::env::set_var("LM_STUDIO_BASE_URL", &base);
+        std::env::set_var("LM_STUDIO_API_KEY", &key);
+        std::env::set_var("LM_STUDIO_MODEL", &model_trim);
+
+        self.lm_studio_base_url = base;
+        self.lm_studio_api_key = Some(key);
+        self.lm_studio_model = Some(model_trim);
+
+        self.set_llm_provider(LlmProvider::LmStudio)?;
         Ok(())
     }
 

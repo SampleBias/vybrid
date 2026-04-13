@@ -23,8 +23,10 @@ impl ProjectDocs {
             return Ok(None);
         }
 
-        let content = fs::read_to_string(&self.docs_path)
-            .context(format!("Failed to read project docs from {:?}", self.docs_path))?;
+        let content = fs::read_to_string(&self.docs_path).context(format!(
+            "Failed to read project docs from {:?}",
+            self.docs_path
+        ))?;
 
         if content.trim().is_empty() {
             Ok(None)
@@ -42,8 +44,7 @@ impl ProjectDocs {
         }
 
         let existing_content = if self.docs_path.exists() {
-            fs::read_to_string(&self.docs_path)
-                .context("Failed to read existing project docs")?
+            fs::read_to_string(&self.docs_path).context("Failed to read existing project docs")?
         } else {
             String::new()
         };
@@ -54,8 +55,10 @@ impl ProjectDocs {
             format!("{}\n\n---\n\n{}", existing_content.trim(), content)
         };
 
-        fs::write(&self.docs_path, new_content)
-            .context(format!("Failed to write project docs to {:?}", self.docs_path))?;
+        fs::write(&self.docs_path, new_content).context(format!(
+            "Failed to write project docs to {:?}",
+            self.docs_path
+        ))?;
 
         Ok(())
     }
@@ -63,8 +66,10 @@ impl ProjectDocs {
     /// Clear all project documentation
     pub fn clear(&self) -> Result<()> {
         if self.docs_path.exists() {
-            fs::remove_file(&self.docs_path)
-                .context(format!("Failed to remove project docs at {:?}", self.docs_path))?;
+            fs::remove_file(&self.docs_path).context(format!(
+                "Failed to remove project docs at {:?}",
+                self.docs_path
+            ))?;
         }
         Ok(())
     }

@@ -30,7 +30,9 @@ pub async fn execute_bash(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("Failed to spawn command: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn command: {}", e))?;
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");

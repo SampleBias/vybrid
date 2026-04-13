@@ -113,7 +113,10 @@ pub fn display_banner() {
 "#;
 
     println!("{}", style(banner).magenta());
-    println!("{}", style("AI Coding Assistant from the Trenches built in Rust").dim());
+    println!(
+        "{}",
+        style("AI Coding Assistant from the Trenches built in Rust").dim()
+    );
     println!("{}", style("─".repeat(50)).dim());
 }
 

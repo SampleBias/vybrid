@@ -18,9 +18,7 @@ pub struct PersistentShell {
 impl PersistentShell {
     /// Start a new persistent shell
     pub fn new() -> Result<Self> {
-        let initial_cwd = std::env::current_dir()?
-            .to_string_lossy()
-            .to_string();
+        let initial_cwd = std::env::current_dir()?.to_string_lossy().to_string();
 
         let process = Command::new("bash")
             .arg("--norc")
@@ -39,30 +37,30 @@ impl PersistentShell {
 
     /// Execute a command and return the output
     pub fn execute(&mut self, command: &str) -> Result<String> {
-        let stdin = self.process.stdin.as_mut()
+        let stdin = self
+            .process
+            .stdin
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to get stdin"))?;
 
         // Create a unique marker for command completion
         let marker = format!("__VYBRID_END_{}__", std::process::id());
-        
+
         // Send command with marker and pwd for directory tracking
         let full_command = if command.trim().starts_with("cd ") {
-            format!(
-                "{}; echo '{}'; pwd\n",
-                command, marker
-            )
+            format!("{}; echo '{}'; pwd\n", command, marker)
         } else {
-            format!(
-                "{}; echo '{}'\n",
-                command, marker
-            )
+            format!("{}; echo '{}'\n", command, marker)
         };
 
         stdin.write_all(full_command.as_bytes())?;
         stdin.flush()?;
 
         // Read output until we see the marker
-        let stdout = self.process.stdout.as_mut()
+        let stdout = self
+            .process
+            .stdout
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Failed to get stdout"))?;
 
         let mut reader = BufReader::new(stdout);
@@ -111,7 +109,7 @@ impl Drop for PersistentShell {
         if let Some(stdin) = self.process.stdin.as_mut() {
             let _ = stdin.write_all(b"exit\n");
         }
-        
+
         // Wait briefly, then kill if needed
         thread::sleep(Duration::from_millis(100));
         let _ = self.process.kill();
@@ -122,7 +120,10 @@ impl Drop for PersistentShell {
 pub fn enter_shell_mode() -> Result<()> {
     println!("{}", style("Entering Persistent Shell Mode").cyan().bold());
     println!("{}", style("Directory changes and state persist!").dim());
-    println!("{}", style("Type 'exit' or press Enter on empty line to return to Vybrid").dim());
+    println!(
+        "{}",
+        style("Type 'exit' or press Enter on empty line to return to Vybrid").dim()
+    );
     println!();
 
     // Display current directory
@@ -136,7 +137,8 @@ pub fn enter_shell_mode() -> Result<()> {
     // Handle Ctrl+C gracefully
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    }).ok();
+    })
+    .ok();
 
     // Simple shell loop using standard process execution
     while running.load(Ordering::SeqCst) {
@@ -194,7 +196,10 @@ pub fn enter_shell_mode() -> Result<()> {
 
             match std::env::set_current_dir(&new_path) {
                 Ok(_) => {
-                    println!("{}", style(format!("Changed to: {}", new_path.display())).dim());
+                    println!(
+                        "{}",
+                        style(format!("Changed to: {}", new_path.display())).dim()
+                    );
                 }
                 Err(e) => {
                     println!("{}: {}", style("Error").red(), e);

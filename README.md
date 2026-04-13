@@ -19,7 +19,9 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 - Linux (Ubuntu 20.04+ recommended)
 - Rust 1.70+ (for building from source)
-- [Groq](https://console.groq.com/) API key ([`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b))
+- One of:
+  - **[Groq](https://console.groq.com/)** API key ([`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b)), or
+  - **[LM Studio](https://lmstudio.ai/)** with the [local server](https://lmstudio.ai/docs/developer/core/server) running and a model loaded (OpenAI-compatible API — see below)
 
 ## Installation
 
@@ -50,11 +52,18 @@ sudo cp target/release/vybrid /usr/local/bin/
 Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (project wins if both define the same variable). When you save via **`/menu`**, both files are updated so you only configure once and can run Vybrid from **any directory**. Use **`/menu`** or create the files manually:
 
 ```bash
-# Required: Groq API key
-GROQ_API_KEY=your_api_key_here
+# LLM backend: groq (default) or lmstudio
+# VYBRID_LLM_PROVIDER=groq
 
+# --- Groq (cloud) ---
+GROQ_API_KEY=your_api_key_here
 # Optional: override model (default is openai/gpt-oss-120b)
 # GROQ_MODEL=openai/gpt-oss-120b
+
+# --- LM Studio (local) — set VYBRID_LLM_PROVIDER=lmstudio and fill these ---
+# LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
+# LM_STUDIO_API_KEY=lm-studio
+# LM_STUDIO_MODEL=your-loaded-model-id
 
 # Optional: SerpAPI for Google Search
 SERPAPI_KEY=your_serpapi_key_here
@@ -62,7 +71,19 @@ SERPAPI_KEY=your_serpapi_key_here
 
 If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 
-Create a key in the [Groq Console](https://console.groq.com/keys).
+Create a Groq key in the [Groq Console](https://console.groq.com/keys). For LM Studio, use **`/menu`** → “Configure LM Studio” or set the variables above; see [LM Studio (local, offline)](#lm-studio-local-offline).
+
+### LM Studio (local, offline)
+
+Vybrid talks to LM Studio’s **OpenAI-compatible** HTTP API ([docs](https://lmstudio.ai/docs/developer/openai-compat)): same `POST /v1/chat/completions` flow as Groq, with base URL typically `http://127.0.0.1:1234/v1` (port is configurable in LM Studio under **Developer → Local Server**).
+
+1. In LM Studio, load a model and start the local server ([server overview](https://lmstudio.ai/docs/developer/core/server)).
+2. Set **`VYBRID_LLM_PROVIDER=lmstudio`**.
+3. Set **`LM_STUDIO_MODEL`** to the **exact model identifier** of the loaded model (must match what LM Studio exposes for chat).
+4. Set **`LM_STUDIO_BASE_URL`** if you are not using the default host/port (default in Vybrid is `http://127.0.0.1:1234/v1`).
+5. **API key**: If the server has **Require authentication** off, you can use a placeholder (Vybrid defaults to `lm-studio`). If authentication is on (LM Studio 0.4.0+), create a token under **Developer → Server Settings → Manage Tokens** and set **`LM_STUDIO_API_KEY`**; requests use `Authorization: Bearer` as in the [authentication docs](https://lmstudio.ai/docs/developer/core/authentication).
+
+Use **`/menu`** to save these to `~/.vybrid/.env` and `vybrid-rust/.env`. Use **`/menu`** → “Switch to Groq (cloud)” when you want to return to Groq.
 
 Keep real keys out of version control: `.env` and `.env.*` are listed in the repo `.gitignore` (only `.env.example` is meant to be committed as a template).
 
@@ -95,7 +116,7 @@ On startup, choose between:
 | `/tools` | List available AI tools |
 | `/new` | Start new conversation |
 | `/help` | Show help |
-| `/menu` | Menu (add keys; saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
+| `/menu` | Menu (Groq, LM Studio, SerpAPI; saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
 | `clear` | Clear screen |
 
 ### Available Tools
@@ -151,4 +172,4 @@ MIT License
 
 ## Credits
 
-Inference via [Groq](https://groq.com/) using the [`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b) model ([OpenAI-compatible API](https://console.groq.com/docs/openai)).
+Default inference uses [Groq](https://groq.com/) with [`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b) ([OpenAI-compatible API](https://console.groq.com/docs/openai)). You can instead use a local model via [LM Studio](https://lmstudio.ai/) ([OpenAI compatibility](https://lmstudio.ai/docs/developer/openai-compat)).

@@ -8,7 +8,8 @@ use super::{cargo, file_ops, grep, project, search, shell};
 /// Execute a tool by name with given arguments
 pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
     // Parse arguments JSON
-    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Object(serde_json::Map::new()));
+    let args: Value =
+        serde_json::from_str(arguments).unwrap_or(Value::Object(serde_json::Map::new()));
 
     match name {
         // File reading

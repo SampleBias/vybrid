@@ -231,7 +231,9 @@ pub fn get_current_todo_items() -> Result<String> {
     let todo_path = "tasks/todo.md";
 
     if !file_exists(todo_path) {
-        return Ok("No todo.md file found. Use create_project_structure to initialize.".to_string());
+        return Ok(
+            "No todo.md file found. Use create_project_structure to initialize.".to_string(),
+        );
     }
 
     let content = read_file(todo_path)?;

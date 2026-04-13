@@ -34,10 +34,7 @@ pub async fn google_search(query: &str, num_results: usize) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("Search request failed: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Search API error: {}",
-            response.status()
-        ));
+        return Err(anyhow::anyhow!("Search API error: {}", response.status()));
     }
 
     let search_response: SerpApiResponse = response

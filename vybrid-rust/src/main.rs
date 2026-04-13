@@ -14,7 +14,7 @@ use futures::StreamExt;
 use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, ToolCall};
-use crate::config::Config;
+use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::get_all_tools;
@@ -52,22 +52,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     ui::display_mode_header();
     ui::display_cwd();
 
-    let mut client = config.api_key.as_ref().map(|key| {
-        GroqClient::new(
-            key.clone(),
-            config.api_base_url.clone(),
-            config.model.clone(),
-        )
-    });
+    let mut client = rebuild_llm_client(&config);
 
     if client.is_none() {
-        println!(
-            "{}",
-            style(
-                "No Groq API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory."
-            )
-            .dim()
-        );
+        let tip = match config.llm_provider {
+            LlmProvider::Groq => "No Groq API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory.",
+            LlmProvider::LmStudio => "LM Studio is selected but chat is not configured (set LM_STUDIO_MODEL to your loaded model id, start the local server, and use /menu). Keys are saved to ~/.vybrid/.env and vybrid-rust/.env.",
+        };
+        println!("{}", style(tip).dim());
         println!();
         match Confirm::new()
             .with_prompt("Open setup menu to add API keys now?")
@@ -186,8 +178,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             let path = &input[5..];
             match tools::file_ops::read_file(path) {
                 Ok(content) => {
-                    conversation.add_user_message(&format!("I'm adding this file to our conversation:\n\n{}", content));
-                    println!("{}", style(format!("Added '{}' to conversation", path)).green());
+                    conversation.add_user_message(&format!(
+                        "I'm adding this file to our conversation:\n\n{}",
+                        content
+                    ));
+                    println!(
+                        "{}",
+                        style(format!("Added '{}' to conversation", path)).green()
+                    );
                 }
                 Err(e) => ui::print_error(&format!("Failed to read '{}': {}", path, e)),
             }
@@ -195,11 +193,19 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         }
 
         let Some(ref c) = client else {
-            ui::print_error(&format!(
-                "No Groq API key. Use /menu — keys are saved to {} and {}.",
-                config.global_env_file_path.display(),
-                config.env_file_path.display()
-            ));
+            let msg = match config.llm_provider {
+                LlmProvider::Groq => format!(
+                    "No Groq API key. Use /menu — keys are saved to {} and {}.",
+                    config.global_env_file_path.display(),
+                    config.env_file_path.display()
+                ),
+                LlmProvider::LmStudio => format!(
+                    "LM Studio is not ready (model id, server, or API token). Use /menu — settings: {} and {}.",
+                    config.global_env_file_path.display(),
+                    config.env_file_path.display()
+                ),
+            };
+            ui::print_error(&msg);
             continue;
         };
 
@@ -333,7 +339,10 @@ async fn process_ai_response(
                                         tool_calls[tc_delta.index].function.name.push_str(name);
                                     }
                                     if let Some(args) = &func.arguments {
-                                        tool_calls[tc_delta.index].function.arguments.push_str(args);
+                                        tool_calls[tc_delta.index]
+                                            .function
+                                            .arguments
+                                            .push_str(args);
                                     }
                                 }
                             }
@@ -405,7 +414,8 @@ async fn process_ai_response(
 
             ui::print_tool_call(&tool_call.function.name);
 
-            let result = execute_tool(&tool_call.function.name, &tool_call.function.arguments).await;
+            let result =
+                execute_tool(&tool_call.function.name, &tool_call.function.arguments).await;
 
             match &result {
                 Ok(output) => {
@@ -433,13 +443,7 @@ async fn process_ai_response(
 
         // Get follow-up response (next round shows its own spinner)
         println!();
-        Box::pin(process_ai_response(
-            client,
-            conversation,
-            tools,
-            depth + 1,
-        ))
-        .await?;
+        Box::pin(process_ai_response(client, conversation, tools, depth + 1)).await?;
     }
 
     Ok(())
@@ -449,10 +453,7 @@ async fn process_ai_response(
 fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String {
     match project_docs.read() {
         Ok(Some(docs)) => {
-            format!(
-                "{}\n\n---\n\nPROJECT CONTEXT:\n{}",
-                user_message, docs
-            )
+            format!("{}\n\n---\n\nPROJECT CONTEXT:\n{}", user_message, docs)
         }
         Ok(None) | Err(_) => user_message.to_string(),
     }
@@ -544,7 +545,13 @@ fn show_available_tools() {
     let tools = get_all_tools();
     for tool in tools {
         // Truncate description for display
-        let desc: String = tool.function.description.lines().next().unwrap_or("").to_string();
+        let desc: String = tool
+            .function
+            .description
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
         println!(
             "  {} - {}",
             style(&tool.function.name).yellow(),
@@ -561,25 +568,55 @@ fn show_help() {
     println!("{}", style("Vybrid Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
     println!("  {}  - Exit Vybrid", style("exit, quit").yellow());
-    println!("  {}       - Enter persistent shell mode", style("!").yellow());
-    println!("  {}    - Execute single shell command", style("!<cmd>").yellow());
-    println!("  {} - Add file to conversation", style("/add <path>").yellow());
-    println!("  {}       - Show current directory", style("/pwd").yellow());
-    println!("  {}     - List available AI tools", style("/tools").yellow());
-    println!("  {}       - Start new conversation", style("/new").yellow());
+    println!(
+        "  {}       - Enter persistent shell mode",
+        style("!").yellow()
+    );
+    println!(
+        "  {}    - Execute single shell command",
+        style("!<cmd>").yellow()
+    );
+    println!(
+        "  {} - Add file to conversation",
+        style("/add <path>").yellow()
+    );
+    println!(
+        "  {}       - Show current directory",
+        style("/pwd").yellow()
+    );
+    println!(
+        "  {}     - List available AI tools",
+        style("/tools").yellow()
+    );
+    println!(
+        "  {}       - Start new conversation",
+        style("/new").yellow()
+    );
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Groq & SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
+        "  {}     - Menu (Groq / LM Studio / SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
         style("/menu").yellow()
     );
     println!();
     println!("{}", style("Project Docs Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
-    println!("  {}           - Show current project docs", style("/docs").yellow());
-    println!("  {}  - Add docs from a file", style("/docs add <file>").yellow());
-    println!("  {}          - Read docs interactively", style("/docs read").yellow());
-    println!("  {}         - Clear project docs", style("/docs clear").yellow());
+    println!(
+        "  {}           - Show current project docs",
+        style("/docs").yellow()
+    );
+    println!(
+        "  {}  - Add docs from a file",
+        style("/docs add <file>").yellow()
+    );
+    println!(
+        "  {}          - Read docs interactively",
+        style("/docs read").yellow()
+    );
+    println!(
+        "  {}         - Clear project docs",
+        style("/docs clear").yellow()
+    );
     println!();
 }
 
@@ -600,14 +637,8 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
                 }
                 Ok(None) => {
                     println!("{}", style("No project documentation found.").dim());
-                    println!(
-                        "Create one with: {}",
-                        style("/docs read").yellow()
-                    );
-                    println!(
-                        "Or add from file: {}",
-                        style("/docs add <file>").yellow()
-                    );
+                    println!("Create one with: {}", style("/docs read").yellow());
+                    println!("Or add from file: {}", style("/docs add <file>").yellow());
                 }
                 Err(e) => {
                     ui::print_error(&format!("Failed to read project docs: {}", e));
@@ -618,38 +649,38 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
             // Add docs from a file
             if let Some(path) = parts.get(2) {
                 match tools::file_ops::read_file(path) {
-                    Ok(content) => {
-                        match project_docs.add(&content) {
-                            Ok(_) => {
-                                println!(
-                                    "{}",
-                                    style(format!(
-                                        "Added documentation from '{}' to project docs",
-                                        path
-                                    ))
-                                    .green()
-                                );
-                            }
-                            Err(e) => {
-                                ui::print_error(&format!("Failed to add docs: {}", e));
-                            }
+                    Ok(content) => match project_docs.add(&content) {
+                        Ok(_) => {
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "Added documentation from '{}' to project docs",
+                                    path
+                                ))
+                                .green()
+                            );
                         }
-                    }
+                        Err(e) => {
+                            ui::print_error(&format!("Failed to add docs: {}", e));
+                        }
+                    },
                     Err(e) => {
                         ui::print_error(&format!("Failed to read '{}': {}", path, e));
                     }
                 }
             } else {
-                println!(
-                    "{}",
-                    style("Usage: /docs add <file>").dim()
-                );
+                println!("{}", style("Usage: /docs add <file>").dim());
             }
         }
         Some("read") => {
             // Read docs interactively
             println!();
-            println!("{}", style("Enter project documentation (empty line to finish):").cyan().bold());
+            println!(
+                "{}",
+                style("Enter project documentation (empty line to finish):")
+                    .cyan()
+                    .bold()
+            );
             println!("{}", style("─".repeat(40)).dim());
 
             let mut lines = Vec::new();
@@ -681,10 +712,7 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
             let content = lines.join("\n");
             match project_docs.add(&content) {
                 Ok(_) => {
-                    println!(
-                        "{}",
-                        style("Project documentation saved.").green()
-                    );
+                    println!("{}", style("Project documentation saved.").green());
                 }
                 Err(e) => {
                     ui::print_error(&format!("Failed to save docs: {}", e));
@@ -703,7 +731,10 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
             }
         }
         Some(unknown) => {
-            println!("{}", style(format!("Unknown /docs subcommand: '{}'", unknown)).red());
+            println!(
+                "{}",
+                style(format!("Unknown /docs subcommand: '{}'", unknown)).red()
+            );
             println!("Available subcommands: show, add, read, clear");
         }
     }
@@ -717,12 +748,21 @@ fn saved_env_locations(config: &Config) -> String {
     )
 }
 
+/// Build the OpenAI-compatible chat client for the active LLM provider.
+fn rebuild_llm_client(config: &Config) -> Option<GroqClient> {
+    config
+        .effective_chat_client_params()
+        .map(|(api_key, base_url, model)| GroqClient::new(api_key, base_url, model))
+}
+
 /// Interactive menu — keys written to `~/.vybrid/.env` and `vybrid-rust/.env`
 fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
     let items = vec![
-        "Add both Groq + SerpAPI keys (SerpAPI optional — then save & use chat)",
+        "Add Groq + optional SerpAPI keys (then save & use chat)",
         "Add or update Groq API key only",
+        "Configure LM Studio (local server — OpenAI-compatible)",
         "Add or update SerpAPI key only (Google search)",
+        "Switch to Groq (cloud)",
         "Back",
     ];
     let sel = Select::new()
@@ -744,15 +784,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<(
                 return Ok(());
             }
             config.set_groq_api_key(key)?;
-            let api_key = config
-                .api_key
-                .clone()
-                .context("API key missing after save")?;
-            *client = Some(GroqClient::new(
-                api_key,
-                config.api_base_url.clone(),
-                config.model.clone(),
-            ));
+            *client = rebuild_llm_client(config);
 
             let serp: String = Input::new()
                 .with_prompt("SerpAPI key (optional — Enter to skip)")
@@ -784,15 +816,7 @@ fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<(
                 return Ok(());
             }
             config.set_groq_api_key(key)?;
-            let api_key = config
-                .api_key
-                .clone()
-                .context("API key missing after save")?;
-            *client = Some(GroqClient::new(
-                api_key,
-                config.api_base_url.clone(),
-                config.model.clone(),
-            ));
+            *client = rebuild_llm_client(config);
             println!(
                 "{}",
                 style(format!(
@@ -803,6 +827,46 @@ fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<(
             );
         }
         2 => {
+            let default_base = crate::config::DEFAULT_LM_STUDIO_BASE_URL;
+            let base_raw: String = Input::new()
+                .with_prompt(format!(
+                    "LM Studio OpenAI base URL (Enter for {})",
+                    default_base
+                ))
+                .allow_empty(true)
+                .interact_text()
+                .context("Base URL prompt failed")?;
+            let base = if base_raw.trim().is_empty() {
+                default_base.to_string()
+            } else {
+                base_raw.trim().to_string()
+            };
+            let api_key: String = Input::new()
+                .with_prompt("LM Studio API key (empty = placeholder when auth is off)")
+                .allow_empty(true)
+                .interact_text()
+                .context("API key prompt failed")?;
+            let model: String = Input::new()
+                .with_prompt("Model id (must match the model loaded in LM Studio)")
+                .interact_text()
+                .context("Model id required")?;
+            let model = model.trim().to_string();
+            if model.is_empty() {
+                ui::print_error("Model id was empty.");
+                return Ok(());
+            }
+            config.apply_lm_studio_profile(base, api_key, model)?;
+            *client = rebuild_llm_client(config);
+            println!(
+                "{}",
+                style(format!(
+                    "Saved LM Studio profile (VYBRID_LLM_PROVIDER=lmstudio) to:\n  {}",
+                    saved_env_locations(config)
+                ))
+                .green()
+            );
+        }
+        3 => {
             let key: String = Input::new()
                 .with_prompt("SerpAPI key")
                 .interact_text()
@@ -821,6 +885,24 @@ fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<(
                 ))
                 .green()
             );
+        }
+        4 => {
+            config.set_llm_provider(LlmProvider::Groq)?;
+            *client = rebuild_llm_client(config);
+            if client.is_some() {
+                println!(
+                    "{}",
+                    style(format!(
+                        "Switched to Groq. VYBRID_LLM_PROVIDER=groq — settings:\n  {}",
+                        saved_env_locations(config)
+                    ))
+                    .green()
+                );
+            } else {
+                ui::print_error(
+                    "VYBRID_LLM_PROVIDER is now groq, but GROQ_API_KEY is missing. Use \"Add or update Groq API key only\".",
+                );
+            }
         }
         _ => {}
     }

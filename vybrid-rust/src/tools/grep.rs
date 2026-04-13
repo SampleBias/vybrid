@@ -27,7 +27,7 @@ pub fn enhanced_grep(
 
     for path in expanded_paths {
         let path_str = path.to_string_lossy();
-        
+
         // Skip non-files
         if !path.is_file() {
             continue;
@@ -50,11 +50,11 @@ pub fn enhanced_grep(
         for (line_num, line) in lines.iter().enumerate() {
             if regex.is_match(line) {
                 matched_lines.insert(line_num);
-                
+
                 // Add context lines
                 let start = line_num.saturating_sub(context_lines);
                 let end = (line_num + context_lines + 1).min(lines.len());
-                
+
                 for ctx_num in start..end {
                     matched_lines.insert(ctx_num);
                 }
@@ -79,13 +79,8 @@ pub fn enhanced_grep(
                 let line = lines[line_num];
                 let is_match = regex.is_match(line);
                 let prefix = if is_match { ">" } else { " " };
-                
-                file_result.push_str(&format!(
-                    "{} {:4}: {}\n",
-                    prefix,
-                    line_num + 1,
-                    line
-                ));
+
+                file_result.push_str(&format!("{} {:4}: {}\n", prefix, line_num + 1, line));
 
                 if is_match {
                     total_matches += 1;
@@ -121,7 +116,7 @@ fn expand_paths(paths: &[&str]) -> Result<Vec<PathBuf>> {
 
     for path in paths {
         let normalized = super::file_ops::normalize_path(path);
-        
+
         // Check if it contains glob characters
         if normalized.contains('*') || normalized.contains('?') || normalized.contains('[') {
             for entry in glob(&normalized)
@@ -141,7 +136,11 @@ fn expand_paths(paths: &[&str]) -> Result<Vec<PathBuf>> {
 }
 
 /// Simple grep for quick searches (no context)
-pub fn simple_grep(pattern: &str, file_path: &str, case_sensitive: bool) -> Result<Vec<(usize, String)>> {
+pub fn simple_grep(
+    pattern: &str,
+    file_path: &str,
+    case_sensitive: bool,
+) -> Result<Vec<(usize, String)>> {
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(!case_sensitive)
         .build()

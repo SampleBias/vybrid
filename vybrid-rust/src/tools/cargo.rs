@@ -84,7 +84,9 @@ pub async fn run_cargo(
     working_directory: Option<&str>,
 ) -> Result<String> {
     if subcommand.trim().is_empty() {
-        return Err(anyhow!("run_cargo: subcommand is required (e.g. check, build, test)"));
+        return Err(anyhow!(
+            "run_cargo: subcommand is required (e.g. check, build, test)"
+        ));
     }
 
     let argv = cargo_executable_args(subcommand, release, package, manifest_path, extra_args);
@@ -211,30 +213,17 @@ mod tests {
         let a = cargo_executable_args("test", true, Some("my-crate"), None, &[]);
         assert_eq!(
             a,
-            vec![
-                "--color",
-                "never",
-                "test",
-                "--release",
-                "-p",
-                "my-crate",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect::<Vec<_>>()
+            vec!["--color", "never", "test", "--release", "-p", "my-crate",]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
     fn cargo_argv_manifest_and_extra() {
         let extra = vec!["--no-run".into(), "--".into(), "nocapture".into()];
-        let a = cargo_executable_args(
-            "test",
-            false,
-            None,
-            Some("/tmp/proj/Cargo.toml"),
-            &extra,
-        );
+        let a = cargo_executable_args("test", false, None, Some("/tmp/proj/Cargo.toml"), &extra);
         assert!(a.iter().any(|s| s == "--manifest-path"));
         assert!(a.iter().any(|s| s == "/tmp/proj/Cargo.toml"));
         let n = a.len();
