@@ -1,6 +1,6 @@
 [package]
 name = "vybrid"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "AI powered coding assistant built from the trenches with Rust to save humanity from bloat."
 authors = ["Vybrid Team"]

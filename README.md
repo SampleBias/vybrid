@@ -69,6 +69,11 @@ GROQ_API_KEY=your_api_key_here
 SERPAPI_KEY=your_serpapi_key_here
 ```
 
+### Active provider (`VYBRID_LLM_PROVIDER`) and coexisting credentials
+
+- **`VYBRID_LLM_PROVIDER`** is `groq` (default) or `lmstudio`. It selects **which backend handles chat**; only one runs at a time.
+- You can keep **both** Groq settings (`GROQ_API_KEY`, optional `GROQ_MODEL`) **and** LM Studio settings (`LM_STUDIO_*`) in the same `~/.vybrid/.env` and `vybrid-rust/.env`. They do not overwrite each other. Switching the active provider (via **`/menu`** — e.g. “Configure LM Studio” or “Switch to Groq (cloud)”) or editing **`VYBRID_LLM_PROVIDER`** only changes **which** profile is used, not the stored keys for the other backend.
+
 If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 
 Create a Groq key in the [Groq Console](https://console.groq.com/keys). For LM Studio, use **`/menu`** → “Configure LM Studio” or set the variables above; see [LM Studio (local, offline)](#lm-studio-local-offline).
@@ -165,6 +170,13 @@ Vybrid also stores runtime data in `~/.vybrid/`:
 - `messages/` - Inter-process communication for daemon mode
 - `daemon_pool/` - Daemon lock files
 - `progress/` - Request progress tracking
+
+## Changelog
+
+### 1.1.0
+
+- README: documented **`VYBRID_LLM_PROVIDER`** and keeping Groq + LM Studio credentials in the same env files.
+- CLI: while waiting for the model, the spinner label is **`local`** when LM Studio is the active provider (still **`groq`** for Groq).
 
 ## License
 

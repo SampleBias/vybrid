@@ -8,8 +8,8 @@ use std::sync::Arc;
 /// Approximate `openai/gpt-oss-120b` context window (tokens). Used only for the CLI meter.
 pub const CONTEXT_WINDOW_TOKENS: u32 = 131_072;
 
-/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while Groq
-/// connects and before the first streamed chunk (thinking / TTFB).
+/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while the LLM
+/// connects and before the first streamed chunk (thinking / TTFB). Label is e.g. `groq` or `local`.
 pub struct SpinnerGuard {
     stop: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,

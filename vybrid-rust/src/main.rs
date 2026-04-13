@@ -216,7 +216,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         let tools = get_all_tools();
 
         // Process with AI
-        if let Err(e) = process_ai_response(c, &mut conversation, &tools, 0).await {
+        let spinner_label = llm_spinner_label(config.llm_provider);
+        if let Err(e) = process_ai_response(c, &mut conversation, &tools, 0, spinner_label).await {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -226,7 +227,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     Ok(())
 }
 
-/// Groq may reject a tool call before streaming any assistant text; these errors are worth one automatic retry.
+fn llm_spinner_label(provider: LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::Groq => "groq",
+        LlmProvider::LmStudio => "local",
+    }
+}
+
+/// The API may reject a tool call before streaming any assistant text; these errors are worth one automatic retry.
 fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("tool_use_failed")
@@ -240,6 +248,7 @@ async fn process_ai_response(
     conversation: &mut Conversation,
     tools: &[crate::client::groq::Tool],
     depth: u32,
+    spinner_label: &'static str,
 ) -> Result<()> {
     /// Prevents runaway tool loops when the model chains many rounds.
     const MAX_TOOL_ROUNDS: u32 = 48;
@@ -269,7 +278,7 @@ async fn process_ai_response(
         tool_calls.clear();
         first_chunk = true;
 
-        let mut spinner = ui::SpinnerGuard::new("groq");
+        let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let stream = client
             .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
             .await;
@@ -362,7 +371,7 @@ async fn process_ai_response(
                         println!(
                             "{}",
                             style(
-                                "Groq tool validation failed — retrying once with a corrective prompt…"
+                                "Tool call validation failed — retrying once with a corrective prompt…"
                             )
                             .yellow()
                         );
@@ -443,7 +452,14 @@ async fn process_ai_response(
 
         // Get follow-up response (next round shows its own spinner)
         println!();
-        Box::pin(process_ai_response(client, conversation, tools, depth + 1)).await?;
+        Box::pin(process_ai_response(
+            client,
+            conversation,
+            tools,
+            depth + 1,
+            spinner_label,
+        ))
+        .await?;
     }
 
     Ok(())
