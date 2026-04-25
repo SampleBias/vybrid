@@ -2,6 +2,13 @@
 
 use anyhow::Result;
 use console::style;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Context, Editor, Helper};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +17,39 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const INTERACTIVE_COMMAND_TIMEOUT_SECS: u64 = 300;
+
+struct ShellLineHelper {
+    completer: FilenameCompleter,
+}
+
+impl ShellLineHelper {
+    fn new() -> Self {
+        Self {
+            completer: FilenameCompleter::new(),
+        }
+    }
+}
+
+impl Helper for ShellLineHelper {}
+impl Validator for ShellLineHelper {}
+impl Highlighter for ShellLineHelper {}
+
+impl Hinter for ShellLineHelper {
+    type Hint = String;
+}
+
+impl Completer for ShellLineHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        self.completer.complete(line, pos, ctx)
+    }
+}
 
 /// Persistent shell session that maintains state
 pub struct PersistentShell {
@@ -142,6 +182,9 @@ pub fn enter_shell_mode() -> Result<()> {
     })
     .ok();
 
+    let mut editor = Editor::<ShellLineHelper, DefaultHistory>::new()?;
+    editor.set_helper(Some(ShellLineHelper::new()));
+
     // Simple shell loop using standard process execution
     'shell: while running.load(Ordering::SeqCst) {
         // Get current directory for prompt
@@ -164,15 +207,15 @@ pub fn enter_shell_mode() -> Result<()> {
             .unwrap_or(cwd.clone());
 
         // Read input
-        print!("{} {} ", style("shell").green(), style(dir_name).cyan());
-        std::io::stdout().flush()?;
-
-        let mut input = String::new();
-        match std::io::stdin().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        let prompt = format!("{} {} ", style("shell").green(), style(dir_name).cyan());
+        let input = match editor.readline(&prompt) {
+            Ok(input) => input,
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(e) => {
+                println!("{}: {}", style("Error").red(), e);
+                break;
+            }
+        };
 
         let input = input.trim();
 

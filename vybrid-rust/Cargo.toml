@@ -27,6 +27,7 @@ dotenvy = "0.15"
 # CLI
 dialoguer = "0.11"
 console = "0.15"
+rustyline = "18.0.0"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }
