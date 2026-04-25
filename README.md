@@ -12,7 +12,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
 - **Rust-Aware Diagnostics**: Structured Cargo/rustc summaries for ownership, traits, enums, lifetimes, async, and clippy feedback
-- **Persistent Shell**: Interactive shell mode with state persistence
+- **Persistent Shell**: Interactive shell mode with state persistence and filesystem path autocomplete
 - **Function Calling**: Tools for file operations, code search, Cargo, rustc explanations, and Rust project snapshots
 
 ## Requirements
@@ -120,6 +120,10 @@ Vybrid starts directly in **Agent Mode** with all tools available.
 | `/help` | Show help |
 | `/menu` | Menu (Groq, LM Studio, SerpAPI; saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
 | `clear` | Clear screen |
+
+### Persistent Shell Mode
+
+Type `!` to enter persistent shell mode. Directory changes persist while you are in shell mode, regular Bash commands like `ls`, `pwd`, and `cargo test` continue to work, and pressing <kbd>Tab</kbd> autocompletes filesystem paths.
 
 ### Available Tools
 
