@@ -7,9 +7,9 @@ pub fn normalize_path(path: &str) -> String {
     let path = path.trim();
 
     // Expand home directory
-    if path.starts_with("~/") {
+    if let Some(stripped) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]).to_string_lossy().to_string();
+            return home.join(stripped).to_string_lossy().to_string();
         }
     }
 
@@ -89,7 +89,7 @@ pub fn create_multiple_files(files: &[(String, String)]) -> Result<String> {
 
     if !errors.is_empty() {
         if !result.is_empty() {
-            result.push_str("\n");
+            result.push('\n');
         }
         result.push_str(&format!("Errors: {}", errors.join("; ")));
     }
@@ -98,7 +98,18 @@ pub fn create_multiple_files(files: &[(String, String)]) -> Result<String> {
 }
 
 /// Edit a file by replacing a snippet
+#[allow(dead_code)]
 pub fn edit_file(path: &str, original_snippet: &str, new_snippet: &str) -> Result<String> {
+    edit_file_with_options(path, original_snippet, new_snippet, false)
+}
+
+/// Edit a file by replacing a snippet, optionally returning a preview without writing.
+pub fn edit_file_with_options(
+    path: &str,
+    original_snippet: &str,
+    new_snippet: &str,
+    dry_run: bool,
+) -> Result<String> {
     let normalized = normalize_path(path);
 
     // Read the file
@@ -122,14 +133,21 @@ pub fn edit_file(path: &str, original_snippet: &str, new_snippet: &str) -> Resul
         ));
     }
 
-    // Replace the snippet
-    let updated_content = content.replacen(original_snippet, new_snippet, 1);
+    let preview = format!(
+        "Edit preview for '{}':\n--- before\n{}\n--- after\n{}",
+        path, original_snippet, new_snippet
+    );
+
+    if dry_run {
+        return Ok(format!("Dry run: no file written.\n{}", preview));
+    }
 
     // Write the updated content
+    let updated_content = content.replacen(original_snippet, new_snippet, 1);
     fs::write(&normalized, &updated_content)
         .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", path, e))?;
 
-    Ok(format!("Successfully edited '{}'", path))
+    Ok(format!("Successfully edited '{}'\n{}", path, preview))
 }
 
 /// Check if a file exists
@@ -163,4 +181,38 @@ pub fn append_to_file(path: &str, content: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to append to '{}': {}", path, e))?;
 
     Ok(format!("Appended content to '{}'", path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_file_dry_run_does_not_write() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-edit-dry-run-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "hello world").unwrap();
+
+        let result = edit_file_with_options(path.to_str().unwrap(), "hello", "goodbye", true)
+            .expect("dry-run edit should validate");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.contains("Dry run"));
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn edit_file_rejects_ambiguous_snippet() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-edit-ambiguous-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "same\nsame\n").unwrap();
+
+        let err = edit_file(path.to_str().unwrap(), "same", "new").unwrap_err();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(err.to_string().contains("occurrences"));
+    }
 }

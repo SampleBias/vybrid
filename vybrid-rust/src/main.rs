@@ -61,17 +61,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         };
         println!("{}", style(tip).dim());
         println!();
-        match Confirm::new()
+        if let Ok(true) = Confirm::new()
             .with_prompt("Open setup menu to add API keys now?")
             .default(true)
             .interact()
         {
-            Ok(true) => {
-                if let Err(e) = handle_menu(&mut config, &mut client) {
-                    ui::print_error(&format!("{}", e));
-                }
+            if let Err(e) = handle_menu(&mut config, &mut client) {
+                ui::print_error(&format!("{}", e));
             }
-            Ok(false) | Err(_) => {}
         }
         if client.is_none() {
             println!(
@@ -159,13 +156,12 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         // Handle /docs command
         if input.starts_with("/docs") {
-            handle_docs_command(&input, &project_docs);
+            handle_docs_command(input, &project_docs);
             continue;
         }
 
         // Handle single shell commands (!command)
-        if input.starts_with('!') {
-            let cmd = &input[1..];
+        if let Some(cmd) = input.strip_prefix('!') {
             match tools::shell::execute_bash(cmd, None, None).await {
                 Ok(output) => println!("{}", output),
                 Err(e) => ui::print_error(&format!("Command failed: {}", e)),
@@ -174,8 +170,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         }
 
         // Handle /add command
-        if input.starts_with("/add ") {
-            let path = &input[5..];
+        if let Some(path) = input.strip_prefix("/add ") {
             match tools::file_ops::read_file(path) {
                 Ok(content) => {
                     conversation.add_user_message(&format!(
@@ -210,7 +205,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         };
 
         // Add user message to conversation with project docs context
-        let user_message_with_context = inject_project_docs(&input, &project_docs);
+        let user_message_with_context = inject_project_docs(input, &project_docs);
         conversation.add_user_message(&user_message_with_context);
 
         let tools = get_all_tools();
@@ -280,7 +275,7 @@ async fn process_ai_response(
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let stream = client
-            .chat_stream(conversation.get_messages(), Some(tools.to_vec()))
+            .chat_stream(conversation.messages_for_request(), Some(tools.to_vec()))
             .await;
         let stream = match stream {
             Ok(s) => s,
@@ -467,8 +462,17 @@ async fn process_ai_response(
 
 /// Inject project documentation context into user message
 fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String {
+    const MAX_PROJECT_DOC_CHARS: usize = 24_000;
     match project_docs.read() {
         Ok(Some(docs)) => {
+            let docs = if docs.chars().count() > MAX_PROJECT_DOC_CHARS {
+                let excerpt: String = docs.chars().take(MAX_PROJECT_DOC_CHARS).collect();
+                format!(
+                    "{excerpt}\n\n[Project docs truncated: showing first {MAX_PROJECT_DOC_CHARS} chars. Add narrower docs or relevant files when needed.]"
+                )
+            } else {
+                docs
+            };
             format!("{}\n\n---\n\nPROJECT CONTEXT:\n{}", user_message, docs)
         }
         Ok(None) | Err(_) => user_message.to_string(),
@@ -478,43 +482,17 @@ fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String
 /// Get the system prompt for agent mode
 fn get_system_prompt() -> String {
     format!(
-        r#"You are Vybrid, an elite software engineer with decades of experience across all programming domains and EXPERT-LEVEL MASTERY OF RUST PROGRAMMING.
-Your Rust expertise includes ownership/borrowing, lifetimes, async/await patterns, trait systems, error handling with anyhow/thiserror, and idiomatic Rust code design.
-You provide thoughtful, well-structured solutions while explaining your reasoning, with particular strength in Rust-specific best practices.
+        r#"You are Vybrid, an elite Rust coding agent. Your job is to solve software engineering tasks with compiler-aware Rust judgment, careful file inspection, and verified edits.
 
-RUST EXPERTISE HIGHLIGHT:
-- Deep knowledge of Rust ownership model, borrowing rules, and lifetime annotations
-- Proficiency with async Rust using tokio, futures, and async-stream
-- Mastery of Rust trait system, generics, and type-level programming
-- Expert in error handling: Result<T>, anyhow::Context, thiserror for custom errors
-- Familiarity with Rust ecosystem: serde, reqwest, tokio, clap, and common crates
-- Experience with performance optimization, zero-cost abstractions, and unsafe code when needed
-- Understanding of Rust project structure, Cargo.toml configuration, and workspace patterns
-- Knowledge of Rust idioms: iterators, Option/Result combinators, pattern matching
-
-CRITICAL WORKFLOW REQUIREMENTS:
-You MUST follow these development rules for every project:
-
-1. PROJECT STRUCTURE SETUP (Always create these files first):
-   - `tasks/todo.md` - Structured task tracking with checkboxes
-   - `docs/activity.md` - Activity logging with timestamps
-   - `docs/PROJECT_README.md` - Project context for AI agents (MANDATORY)
-   - Create these files IMMEDIATELY when starting any project work
-
-2. CONTINUOUS DEVELOPMENT WORKFLOW:
-   - Step 1: Read and understand the problem/codebase
-   - Step 2: Create all three mandatory files (todo.md, activity.md, PROJECT_README.md)
-   - Step 3: Create structured plan in `tasks/todo.md` using checkboxes
-   - Step 4: IMMEDIATELY begin executing tasks - DO NOT wait for approval
-   - Step 5: Execute tasks sequentially, marking complete with [x]
-   - Step 6: Log all actions in `docs/activity.md` with timestamps
-   - Step 7: Continue until all tasks are complete or user stops you
-
-3. MANDATORY FILE FORMATS:
-   - Todo items must use checkboxes: `- [ ] Task description`
-   - Activity log must include timestamps: `## YYYY-MM-DD HH:MM - Action taken`
-   - Keep todo items granular and testable
-   - Log every significant action
+RUST OPERATING POLICY:
+1. For unfamiliar Rust projects, inspect crate shape first with `rust_project_snapshot`, `cargo_metadata`, `Cargo.toml`, and nearby modules.
+2. Understand ownership, borrowing, lifetimes, trait bounds, enums, async constraints, and error boundaries before editing.
+3. Prefer small, reversible edits that address the root cause; avoid speculative rewrites.
+4. Use `run_cargo` for Rust build/test/lint loops. Use `diagnostic_format: "json"` when compiler diagnostics are important or output is noisy.
+5. Fix primary compiler errors before warnings; rustc ordering and spans are authoritative.
+6. After changes, verify with `cargo check`, then `cargo test` or `cargo clippy` when appropriate.
+7. Explain Rust trade-offs at the user's requested depth; be concrete about ownership, trait, enum, lifetime, and async reasoning.
+8. Only create task/docs scaffolding when the user asks for project scaffolding or the target repository already follows that workflow.
 
 RUST CARGO QUICK REFERENCE:
 {}
@@ -525,11 +503,16 @@ COMPILE / FIX LOOP:
 COMMON RUST DIAGNOSTICS:
 {}
 
+RUST REVIEW HEURISTICS:
+{}
+
 Available tools:
 - read_file, read_multiple_files: Read file contents
 - create_file, create_multiple_files: Create or overwrite files
 - edit_file: Make precise edits using snippet replacement
-- run_cargo: Run Cargo (check, build, test, clippy, fmt, doc, …) with structured argv — **preferred for Rust projects** over raw shell when invoking cargo
+- run_cargo: Run Cargo (check, build, test, clippy, fmt, doc, …) with structured argv — preferred for Rust projects over raw shell when invoking cargo
+- rust_project_snapshot, cargo_metadata: Inspect Rust workspace/package layout before editing
+- explain_rust_diagnostic: Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async Send
 - execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online
@@ -538,17 +521,17 @@ Available tools:
 - mark_todo_complete: Mark a task as done
 
 Guidelines:
-1. ALWAYS start any project work by creating project structure files
-2. Read files before editing to understand context
-3. Use precise snippet matching for edits
-4. On Rust projects, use run_cargo for compile/test/lint iteration; read full compiler output before fixing
-5. Explain what you're doing and why
-6. Be thorough in analysis and recommendations
+1. Read project files before editing to understand context
+2. Use precise snippet matching for edits
+3. On Rust projects, use run_cargo for compile/test/lint iteration; read compiler diagnostics before fixing
+4. Explain what you're doing and why
+5. Be thorough in analysis and recommendations
 
-IMPORTANT: Execute tasks immediately - don't wait for approval. Be efficient and thorough."#,
+IMPORTANT: Be efficient and thorough. If the user asks for implementation, proceed with the smallest verified changes that satisfy the request."#,
         crate::rust_agent_reference::RUST_CARGO_QUICKREF,
         crate::rust_agent_reference::RUST_COMPILE_FIX_LOOP,
         crate::rust_agent_reference::RUST_DIAGNOSTICS_HINTS,
+        crate::rust_agent_reference::RUST_REVIEW_HEURISTICS,
     )
 }
 

@@ -105,7 +105,8 @@ pub fn get_all_tools() -> Vec<Tool> {
                         "original_snippet": { "type": "string", "description": "Exact text to find" },
                         "new_snippet": { "type": "string", "description": "Replacement text" },
                         "old_string": { "type": "string", "description": "Exact text to find (alias of original_snippet)" },
-                        "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" }
+                        "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" },
+                        "dry_run": { "type": "boolean", "description": "If true, validate and preview the edit without writing the file." }
                     },
                     "description": "Provide a file (`path` or `file_path`) and the before/after text using either naming style. (Single object so API validation accepts alias mixes; missing or invalid combos fail with a clear error when the tool runs.)"
                 }),
@@ -167,12 +168,74 @@ pub fn get_all_tools() -> Vec<Tool> {
                             "items": { "type": "string" },
                             "description": "Additional argv tokens after fixed flags (e.g. test filter, \"--\", \"--nocapture\"). Literal strings only—no shell."
                         },
+                        "diagnostic_format": {
+                            "type": "string",
+                            "enum": ["human", "json"],
+                            "description": "Use \"json\" for compiler-aware rustc/clippy summaries on check/build/test/clippy/doc; default \"human\" preserves normal Cargo output."
+                        },
                         "working_directory": {
                             "type": "string",
                             "description": "Directory to run cargo in (optional; defaults to current directory)"
                         }
                     },
                     "required": ["subcommand"]
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "explain_rust_diagnostic".to_string(),
+                description: "Explain a Rust compiler error code (for example E0382, E0499, E0502) or a Rust topic such as traits, enums, lifetimes, or async Send. Uses built-in guidance and `rustc --explain` when available.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "code_or_topic": {
+                            "type": "string",
+                            "description": "Rust error code or topic to explain."
+                        }
+                    },
+                    "required": ["code_or_topic"]
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "cargo_metadata".to_string(),
+                description: "Return `cargo metadata --format-version=1 --no-deps` JSON for workspace/package discovery before editing Rust projects.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "manifest_path": {
+                            "type": "string",
+                            "description": "Optional path to Cargo.toml."
+                        },
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Optional directory to run cargo metadata in."
+                        }
+                    }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "rust_project_snapshot".to_string(),
+                description: "Summarize Rust workspace/package shape: edition, targets, features, dependencies, and workspace member count.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "manifest_path": {
+                            "type": "string",
+                            "description": "Optional path to Cargo.toml."
+                        },
+                        "working_directory": {
+                            "type": "string",
+                            "description": "Optional directory to run cargo metadata in."
+                        }
+                    }
                 }),
             },
         },

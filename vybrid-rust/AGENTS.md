@@ -73,9 +73,9 @@ cargo test -- --nocapture  # Show test output
 
 ### Agent tool: `run_cargo` (AI function calling)
 
-Vybrid exposes a **`run_cargo`** tool for structured Cargo invocations (argv only; no shell injection). Prefer it over ad-hoc `execute_bash_command` when running `cargo check`, `build`, `test`, `clippy`, `fmt`, etc., on user projects.
+Vybrid exposes a **`run_cargo`** tool for structured Cargo invocations (argv only; no shell injection). Prefer it over ad-hoc `execute_bash_command` when running `cargo check`, `build`, `test`, `clippy`, `fmt`, etc., on user projects. Use `diagnostic_format: "json"` when compiler-aware rustc/clippy summaries are more useful than raw Cargo output.
 
-Canonical **Cargo quick reference**, **compile/fix loop**, and **common diagnostics** text for the system prompt lives in **[`src/rust_agent_reference.rs`](src/rust_agent_reference.rs)**. Implementation: **[`src/tools/cargo.rs`](src/tools/cargo.rs)** (timeouts, output cap, `--color never`).
+Canonical **Cargo quick reference**, **compile/fix loop**, **common diagnostics**, and **review heuristics** text for the system prompt lives in **[`src/rust_agent_reference.rs`](src/rust_agent_reference.rs)**. Implementation: **[`src/tools/cargo.rs`](src/tools/cargo.rs)** (timeouts, output cap, `--color never`, optional JSON diagnostic summaries).
 
 ## Project Structure
 
@@ -96,6 +96,7 @@ vybrid-rust/
 │   │   ├── definitions.rs   # Tool definitions for AI
 │   │   ├── executor.rs      # Tool execution dispatch
 │   │   ├── cargo.rs         # Structured `cargo` subprocess (run_cargo tool)
+│   │   ├── rust.rs          # Rust diagnostics, cargo metadata, project snapshot tools
 │   │   ├── file_ops.rs      # File operations (read, write, edit)
 │   │   ├── grep.rs          # Code search with regex
 │   │   ├── search.rs         # Google search via SerpAPI
@@ -286,7 +287,10 @@ The system provides these tools to the AI:
 
 ### Shell/Execution
 - `execute_bash_command` - Run shell command (supports working_directory)
-- `run_cargo` - Run Cargo via argv (`check`, `build`, `test`, `clippy`, etc.); preferred for Rust builds/tests (see `src/tools/cargo.rs`)
+- `run_cargo` - Run Cargo via argv (`check`, `build`, `test`, `clippy`, etc.); preferred for Rust builds/tests; supports `diagnostic_format: "json"` for structured rustc/clippy summaries (see `src/tools/cargo.rs`)
+- `cargo_metadata` - Return Cargo metadata JSON for workspace/package discovery
+- `rust_project_snapshot` - Summarize edition, targets, features, dependencies, and workspace shape
+- `explain_rust_diagnostic` - Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async `Send`
 
 ### Search
 - `enhanced_grep` - Search files with regex, context lines, case sensitivity
@@ -383,7 +387,8 @@ data: [DONE]
 - Use `RUST_LOG=debug` if logging is added (no logging currently configured)
 
 ### Testing Strategy
-- **Note**: No test files currently exist in the project
+- Unit and integration tests exist for Cargo diagnostics, config env merging, context behavior, file edits, grep limits, and Rust helper tools.
+- Rust-agent eval scenarios live in `evals/rust_agent_scenarios.md`.
 - When adding tests:
   - Put unit tests in same module with `#[cfg(test)]`
   - Put integration tests in `tests/` directory
@@ -573,9 +578,9 @@ tools::executor::execute_tool(&tool_name, &arguments).await
 ## Known Limitations
 
 1. No built-in logging system (uses println!/eprintln!)
-2. No test suite currently exists
+2. Test coverage is focused on Rust tooling and core helpers; expand eval coverage as new agent behaviors are added
 3. No CI/CD configuration
-4. Shell commands run synchronously (no timeout handling)
+4. Shell commands have wall-clock timeouts and output caps; long-running interactive workflows should still be monitored by the user
 5. No rate limiting for API calls
 6. No conversation persistence across sessions (in-memory only)
 7. No syntax highlighting for code output

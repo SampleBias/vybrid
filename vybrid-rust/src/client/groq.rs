@@ -247,9 +247,7 @@ impl GroqClient {
                             buffer = buffer[pos + 2..].to_string();
 
                             for line in event.lines() {
-                                if line.starts_with("data: ") {
-                                    let data = &line[6..];
-
+                                if let Some(data) = line.strip_prefix("data: ") {
                                     let data_trim = data.trim();
                                     if data_trim == "[DONE]" {
                                         return;

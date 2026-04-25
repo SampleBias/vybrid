@@ -7,7 +7,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const INTERACTIVE_COMMAND_TIMEOUT_SECS: u64 = 300;
 
 /// Persistent shell session that maintains state
 pub struct PersistentShell {
@@ -141,7 +143,7 @@ pub fn enter_shell_mode() -> Result<()> {
     .ok();
 
     // Simple shell loop using standard process execution
-    while running.load(Ordering::SeqCst) {
+    'shell: while running.load(Ordering::SeqCst) {
         // Get current directory for prompt
         let cwd = std::env::current_dir()
             .map(|p| {
@@ -180,11 +182,11 @@ pub fn enter_shell_mode() -> Result<()> {
         }
 
         // Handle cd specially to update Vybrid's cwd
-        if input.starts_with("cd ") {
-            let path = input[3..].trim();
-            let new_path = if path.starts_with("~/") {
+        if let Some(path) = input.strip_prefix("cd ") {
+            let path = path.trim();
+            let new_path = if let Some(stripped) = path.strip_prefix("~/") {
                 if let Some(home) = dirs::home_dir() {
-                    home.join(&path[2..])
+                    home.join(stripped)
                 } else {
                     std::path::PathBuf::from(path)
                 }
@@ -224,14 +226,48 @@ pub fn enter_shell_mode() -> Result<()> {
             continue;
         }
 
-        // Execute other commands
-        let output = Command::new("bash")
+        // Execute other commands with a wall-clock timeout so shell mode cannot hang forever.
+        let mut child = match Command::new("bash")
             .arg("-c")
             .arg(input)
             .current_dir(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")))
-            .output();
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                println!("{}: {}", style("Error").red(), e);
+                continue;
+            }
+        };
 
-        match output {
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None)
+                    if started.elapsed()
+                        > Duration::from_secs(INTERACTIVE_COMMAND_TIMEOUT_SECS) =>
+                {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    println!(
+                        "{}: command timed out after {}s",
+                        style("Error").red(),
+                        INTERACTIVE_COMMAND_TIMEOUT_SECS
+                    );
+                    continue 'shell;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    println!("{}: {}", style("Error").red(), e);
+                    continue 'shell;
+                }
+            }
+        }
+
+        match child.wait_with_output() {
             Ok(output) => {
                 if !output.stdout.is_empty() {
                     print!("{}", String::from_utf8_lossy(&output.stdout));

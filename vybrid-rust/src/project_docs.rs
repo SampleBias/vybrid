@@ -8,7 +8,6 @@ pub struct ProjectDocs {
 }
 
 #[allow(dead_code)]
-
 impl ProjectDocs {
     /// Create a new ProjectDocs instance for the current directory
     pub fn new() -> Self {
@@ -85,13 +84,34 @@ impl ProjectDocs {
     }
 }
 
+impl Default for ProjectDocs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_project_docs_operations() {
-        // This test would require temp directory setup
-        // Skipping for now as tests are not currently set up
+        let original_dir = std::env::current_dir().unwrap();
+        let root = std::env::temp_dir().join(format!("vybrid-project-docs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::env::set_current_dir(&root).unwrap();
+
+        let docs = ProjectDocs::new();
+        assert!(!docs.exists());
+        docs.add("Rust project uses explicit lifetimes at public boundaries.")
+            .unwrap();
+        assert!(docs.exists());
+        assert!(docs.read().unwrap().unwrap().contains("explicit lifetimes"));
+        docs.clear().unwrap();
+        assert!(!docs.exists());
+
+        std::env::set_current_dir(original_dir).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

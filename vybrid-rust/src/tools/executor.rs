@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
-use super::{cargo, file_ops, grep, project, search, shell};
+use super::{cargo, file_ops, grep, project, rust, search, shell};
 
 /// Execute a tool by name with given arguments
 pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
@@ -76,7 +76,8 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
                     "edit_file: missing original_snippet or old_string — exact text to find in the file"
                 ));
             }
-            file_ops::edit_file(path, original, new)
+            let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+            file_ops::edit_file_with_options(path, original, new, dry_run)
         }
 
         // Shell execution
@@ -92,6 +93,11 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
             let release = args["release"].as_bool().unwrap_or(false);
             let package = args["package"].as_str();
             let manifest_path = args["manifest_path"].as_str();
+            let diagnostic_format = cargo::DiagnosticFormat::parse(
+                args["diagnostic_format"]
+                    .as_str()
+                    .or_else(|| args["message_format"].as_str()),
+            );
             let extra: Vec<String> = args["extra_args"]
                 .as_array()
                 .map(|arr| {
@@ -108,8 +114,26 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
                 manifest_path,
                 &extra,
                 working_dir,
+                diagnostic_format,
             )
             .await
+        }
+
+        "explain_rust_diagnostic" => {
+            let code_or_topic = args["code_or_topic"].as_str().unwrap_or("");
+            rust::explain_rust_diagnostic(code_or_topic).await
+        }
+
+        "cargo_metadata" => {
+            let manifest_path = args["manifest_path"].as_str();
+            let working_dir = args["working_directory"].as_str();
+            rust::cargo_metadata(manifest_path, working_dir).await
+        }
+
+        "rust_project_snapshot" => {
+            let manifest_path = args["manifest_path"].as_str();
+            let working_dir = args["working_directory"].as_str();
+            rust::rust_project_snapshot(manifest_path, working_dir).await
         }
 
         // Enhanced grep
@@ -143,7 +167,8 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
             }
             let context = args["context_lines"].as_u64().unwrap_or(3) as usize;
             let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
-            grep::enhanced_grep(pattern, &paths, context, case_sensitive)
+            let max_matches = args["max_matches"].as_u64().unwrap_or(20) as usize;
+            grep::enhanced_grep(pattern, &paths, context, case_sensitive, max_matches)
         }
 
         // Google search

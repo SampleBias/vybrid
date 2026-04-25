@@ -15,7 +15,7 @@ pub async fn google_search(query: &str, num_results: usize) -> Result<String> {
         }
     };
 
-    let num_results = num_results.min(20).max(1);
+    let num_results = num_results.clamp(1, 20);
 
     // Build the search URL
     let url = format!(

@@ -11,9 +11,9 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 ## Features
 
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
-- **Daemon Mode**: Background service for processing execution requests
+- **Rust-Aware Diagnostics**: Structured Cargo/rustc summaries for ownership, traits, enums, lifetimes, async, and clippy feedback
 - **Persistent Shell**: Interactive shell mode with state persistence
-- **Function Calling**: 10+ tools for file operations, code search, and more
+- **Function Calling**: Tools for file operations, code search, Cargo, rustc explanations, and Rust project snapshots
 
 ## Requirements
 
@@ -102,12 +102,9 @@ Keep real keys out of version control: `.env` and `.env.*` are listed in the rep
 vybrid
 ```
 
-### Mode Selection
+### Startup
 
-On startup, choose between:
-
-1. **Agent Mode** - Full AI Engineer with all tools
-2. **Daemon Mode** - Background service for processing requests
+Vybrid starts directly in **Agent Mode** with all tools available.
 
 ### Agent Mode Commands
 
@@ -130,6 +127,7 @@ The AI can use these tools automatically:
 
 - **File Operations**: `read_file`, `read_multiple_files`, `create_file`, `create_multiple_files`, `edit_file`
 - **Shell**: `execute_bash_command`
+- **Rust**: `run_cargo`, `cargo_metadata`, `rust_project_snapshot`, `explain_rust_diagnostic`
 - **Search**: `enhanced_grep`, `google_search`
 - **Project**: `create_project_structure`, `get_current_todo_items`, `mark_todo_complete`
 
@@ -141,24 +139,37 @@ vybrid-rust/
 ├── src/
 │   ├── main.rs         # Entry point
 │   ├── config.rs       # Configuration management
-│   ├── conversation.rs # Conversation history
+│   ├── conversation.rs # Conversation history and context pruning
+│   ├── project_docs.rs # Project-specific docs context
+│   ├── rust_agent_reference.rs # Rust workflow and diagnostic guidance
 │   ├── ui.rs           # Terminal UI helpers
 │   ├── client/
 │   │   └── groq.rs     # Groq OpenAI-compatible chat client
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas
 │   │   ├── executor.rs     # Tool dispatcher
+│   │   ├── cargo.rs        # Structured Cargo and diagnostics
+│   │   ├── rust.rs         # rustc explanations and project snapshots
 │   │   ├── file_ops.rs     # File operations
 │   │   ├── shell.rs        # Shell execution
 │   │   ├── grep.rs         # Code search
 │   │   ├── search.rs       # Google search
 │   │   └── project.rs      # Project structure
-│   ├── daemon/
-│   │   ├── pool.rs     # Worker pool
-│   │   ├── queue.rs    # Message queue
-│   │   └── worker.rs   # Request processor
 │   └── shell/
 │       └── persistent.rs   # Persistent shell
+```
+
+## Rust Diagnostic Workflow
+
+For Rust projects, Vybrid is expected to inspect crate shape with `rust_project_snapshot` or `cargo_metadata`, run `run_cargo` for `check`, `test`, `clippy`, and `fmt`, and use `diagnostic_format=json` when compiler output needs structured summaries. `explain_rust_diagnostic` can expand rustc codes such as `E0382`, `E0499`, and `E0502`.
+
+## Verification
+
+```bash
+cd vybrid-rust
+cargo fmt --check
+cargo test
+cargo clippy -- -D warnings
 ```
 
 ## Data Directory

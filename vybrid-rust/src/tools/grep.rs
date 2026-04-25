@@ -6,12 +6,29 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::PathBuf;
 
+const MAX_GREP_OUTPUT_BYTES: usize = 256 * 1024;
+
+fn truncate_output(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    let half = max_bytes / 2;
+    let head = &output[..half.min(output.len())];
+    let tail_start = output.len().saturating_sub(half);
+    let tail = &output[tail_start..];
+    format!(
+        "{head}\n\n[Grep output truncated: {} bytes omitted]\n\n{tail}",
+        output.len().saturating_sub(head.len() + tail.len())
+    )
+}
+
 /// Enhanced grep functionality with context and formatting
 pub fn enhanced_grep(
     pattern: &str,
     file_paths: &[&str],
     context_lines: usize,
     case_sensitive: bool,
+    max_matches: usize,
 ) -> Result<String> {
     // Build the regex
     let regex = RegexBuilder::new(pattern)
@@ -25,7 +42,11 @@ pub fn enhanced_grep(
     // Expand all file paths (including globs)
     let expanded_paths = expand_paths(file_paths)?;
 
+    let max_matches = max_matches.max(1);
     for path in expanded_paths {
+        if total_matches >= max_matches {
+            break;
+        }
         let path_str = path.to_string_lossy();
 
         // Skip non-files
@@ -49,6 +70,9 @@ pub fn enhanced_grep(
         // Find all matching lines
         for (line_num, line) in lines.iter().enumerate() {
             if regex.is_match(line) {
+                if total_matches + matched_lines.len() >= max_matches {
+                    break;
+                }
                 matched_lines.insert(line_num);
 
                 // Add context lines
@@ -106,7 +130,10 @@ pub fn enhanced_grep(
             pattern,
             "-".repeat(50)
         );
-        Ok(header + &results.join("\n"))
+        Ok(truncate_output(
+            &(header + &results.join("\n")),
+            MAX_GREP_OUTPUT_BYTES,
+        ))
     }
 }
 
@@ -158,4 +185,22 @@ pub fn simple_grep(
         .collect();
 
     Ok(matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhanced_grep_respects_max_matches() {
+        let path = std::env::temp_dir().join(format!("vybrid-grep-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "needle one\nneedle two\nneedle three\n").unwrap();
+
+        let result = enhanced_grep("needle", &[path.to_str().unwrap()], 0, true, 2).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.contains("Found 2 match"));
+        assert!(!result.contains("needle three"));
+    }
 }

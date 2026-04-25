@@ -324,3 +324,34 @@ fn merge_env_file(path: &Path, key: &str, value: &str) -> Result<()> {
     fs::write(path, out).with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_env_value_quotes_spaces_and_hashes() {
+        assert_eq!(format_env_value("plain-token"), "plain-token");
+        assert_eq!(format_env_value("has space"), "\"has space\"");
+        assert_eq!(format_env_value("has#hash"), "\"has#hash\"");
+    }
+
+    #[test]
+    fn merge_env_file_replaces_existing_key() {
+        let path = std::env::temp_dir().join(format!(
+            "vybrid-env-{}-{}.env",
+            std::process::id(),
+            "replace"
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "A=1\nTARGET=old\n# comment\n").unwrap();
+
+        merge_env_file(&path, "TARGET", "new value").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(content.contains("TARGET=\"new value\""));
+        assert!(!content.contains("TARGET=old"));
+        assert!(content.contains("# comment"));
+    }
+}
