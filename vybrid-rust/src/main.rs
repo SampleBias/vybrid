@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod conversation;
+mod lsp;
 mod project_docs;
 mod rust_agent_reference;
 mod shell;
@@ -16,9 +17,10 @@ use std::io::{self, Write};
 use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
+use crate::lsp::RustLspManager;
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::get_all_tools;
-use crate::tools::executor::execute_tool;
+use crate::tools::executor::{execute_tool_with_context, ToolRuntime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,6 +55,17 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     ui::display_cwd();
 
     let mut client = rebuild_llm_client(&config);
+    let rust_lsp = RustLspManager::new(
+        config.rust_lsp_command.clone(),
+        config.rust_lsp_root.clone(),
+    );
+
+    if config.rust_lsp_enabled {
+        let root = resolve_rust_lsp_root(&config)?;
+        if let Err(e) = rust_lsp.connect(&config.rust_lsp_command, root).await {
+            ui::print_error(&format!("Rust LSP auto-connect failed: {}", e));
+        }
+    }
 
     if client.is_none() {
         let tip = match config.llm_provider {
@@ -66,7 +79,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             .default(true)
             .interact()
         {
-            if let Err(e) = handle_menu(&mut config, &mut client) {
+            if let Err(e) = handle_menu(&mut config, &mut client, &rust_lsp).await {
                 ui::print_error(&format!("{}", e));
             }
         }
@@ -86,9 +99,13 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
     let project_docs = ProjectDocs::new();
     let mut conversation = Conversation::new(&get_system_prompt());
+    let tool_runtime = ToolRuntime {
+        rust_lsp: Some(rust_lsp.clone()),
+    };
 
     loop {
-        ui::print_context_status_line(conversation.estimate_context_tokens());
+        let rust_lsp_status = rust_lsp.status().await;
+        ui::print_context_status_line(conversation.estimate_context_tokens(), &rust_lsp_status);
         print!("{} ", style("You>").magenta().bold());
         io::stdout().flush()?;
 
@@ -134,7 +151,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
                 continue;
             }
             "/menu" => {
-                if let Err(e) = handle_menu(&mut config, &mut client) {
+                if let Err(e) = handle_menu(&mut config, &mut client, &rust_lsp).await {
                     ui::print_error(&format!("{}", e));
                 }
                 continue;
@@ -212,7 +229,16 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         // Process with AI
         let spinner_label = llm_spinner_label(config.llm_provider);
-        if let Err(e) = process_ai_response(c, &mut conversation, &tools, 0, spinner_label).await {
+        if let Err(e) = process_ai_response(
+            c,
+            &mut conversation,
+            &tools,
+            &tool_runtime,
+            0,
+            spinner_label,
+        )
+        .await
+        {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -242,6 +268,7 @@ async fn process_ai_response(
     client: &GroqClient,
     conversation: &mut Conversation,
     tools: &[crate::client::groq::Tool],
+    tool_runtime: &ToolRuntime,
     depth: u32,
     spinner_label: &'static str,
 ) -> Result<()> {
@@ -418,8 +445,12 @@ async fn process_ai_response(
 
             ui::print_tool_call(&tool_call.function.name);
 
-            let result =
-                execute_tool(&tool_call.function.name, &tool_call.function.arguments).await;
+            let result = execute_tool_with_context(
+                &tool_call.function.name,
+                &tool_call.function.arguments,
+                tool_runtime,
+            )
+            .await;
 
             match &result {
                 Ok(output) => {
@@ -451,6 +482,7 @@ async fn process_ai_response(
             client,
             conversation,
             tools,
+            tool_runtime,
             depth + 1,
             spinner_label,
         ))
@@ -513,6 +545,7 @@ Available tools:
 - run_cargo: Run Cargo (check, build, test, clippy, fmt, doc, …) with structured argv — preferred for Rust projects over raw shell when invoking cargo
 - rust_project_snapshot, cargo_metadata: Inspect Rust workspace/package layout before editing
 - explain_rust_diagnostic: Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async Send
+- rust_lsp_query: Use connected rust-analyzer LSP for status, diagnostics, hover, definition, references, symbols, completions, code actions, and formatting edits
 - execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online
@@ -594,7 +627,7 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Groq / LM Studio / SerpAPI → ~/.vybrid/.env + vybrid-rust/.env)",
+        "  {}     - Menu (Groq / LM Studio / SerpAPI / Rust LSP)",
         style("/menu").yellow()
     );
     println!();
@@ -754,14 +787,33 @@ fn rebuild_llm_client(config: &Config) -> Option<GroqClient> {
         .map(|(api_key, base_url, model)| GroqClient::new(api_key, base_url, model))
 }
 
+fn resolve_rust_lsp_root(config: &Config) -> Result<std::path::PathBuf> {
+    let root = config
+        .rust_lsp_root
+        .clone()
+        .unwrap_or(std::env::current_dir().context("Could not resolve current directory")?);
+    if root.is_absolute() {
+        Ok(root)
+    } else {
+        Ok(std::env::current_dir()
+            .context("Could not resolve current directory")?
+            .join(root))
+    }
+}
+
 /// Interactive menu — keys written to `~/.vybrid/.env` and `vybrid-rust/.env`
-fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
+async fn handle_menu(
+    config: &mut Config,
+    client: &mut Option<GroqClient>,
+    rust_lsp: &RustLspManager,
+) -> Result<()> {
     let items = vec![
         "Add Groq + optional SerpAPI keys (then save & use chat)",
         "Add or update Groq API key only",
         "Configure LM Studio (local server — OpenAI-compatible)",
         "Add or update SerpAPI key only (Google search)",
         "Switch to Groq (cloud)",
+        "Rust LSP (rust-analyzer)",
         "Back",
     ];
     let sel = Select::new()
@@ -903,7 +955,121 @@ fn handle_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<(
                 );
             }
         }
+        5 => {
+            handle_rust_lsp_menu(config, rust_lsp).await?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_rust_lsp_menu(config: &mut Config, rust_lsp: &RustLspManager) -> Result<()> {
+    loop {
+        let status = rust_lsp.status().await;
+        let items = vec![
+            "Connect now",
+            "Disconnect",
+            "Restart",
+            "Show status",
+            if config.rust_lsp_enabled {
+                "Disable auto-connect"
+            } else {
+                "Enable auto-connect"
+            },
+            "Configure rust-analyzer command",
+            "Configure workspace root",
+            "Back",
+        ];
+        let sel = Select::new()
+            .with_prompt(format!(
+                "Rust LSP menu ({})",
+                status.summary().lines().next().unwrap_or("Rust LSP")
+            ))
+            .items(&items)
+            .default(0)
+            .interact()
+            .context("Rust LSP menu cancelled")?;
+
+        match sel {
+            0 => {
+                let root = resolve_rust_lsp_root(config)?;
+                rust_lsp.connect(&config.rust_lsp_command, root).await?;
+                println!("{}", style("Rust LSP connected.").green());
+            }
+            1 => {
+                rust_lsp.disconnect().await?;
+                println!("{}", style("Rust LSP disconnected.").green());
+            }
+            2 => {
+                let root = resolve_rust_lsp_root(config)?;
+                rust_lsp.restart(&config.rust_lsp_command, root).await?;
+                println!("{}", style("Rust LSP restarted.").green());
+            }
+            3 => {
+                println!("{}", style(rust_lsp.status().await.summary()).dim());
+            }
+            4 => {
+                let enabled = !config.rust_lsp_enabled;
+                config.set_rust_lsp_enabled(enabled)?;
+                if enabled {
+                    let root = resolve_rust_lsp_root(config)?;
+                    match rust_lsp.connect(&config.rust_lsp_command, root).await {
+                        Ok(()) => println!("{}", style("Rust LSP auto-connect enabled.").green()),
+                        Err(e) => ui::print_error(&format!(
+                            "Auto-connect enabled, but connection failed: {}",
+                            e
+                        )),
+                    }
+                } else {
+                    rust_lsp.disconnect().await?;
+                    println!("{}", style("Rust LSP auto-connect disabled.").green());
+                }
+            }
+            5 => {
+                let command: String = Input::new()
+                    .with_prompt("Rust LSP command")
+                    .default(config.rust_lsp_command.clone())
+                    .interact_text()
+                    .context("Rust LSP command prompt failed")?;
+                config.set_rust_lsp_command(command)?;
+                println!(
+                    "{}",
+                    style(format!(
+                        "Saved VYBRID_RUST_LSP_COMMAND to:\n  {}",
+                        saved_env_locations(config)
+                    ))
+                    .green()
+                );
+            }
+            6 => {
+                let current = config
+                    .rust_lsp_root
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let root: String = Input::new()
+                    .with_prompt("Workspace root (empty = current directory at runtime)")
+                    .default(current)
+                    .allow_empty(true)
+                    .interact_text()
+                    .context("Rust LSP root prompt failed")?;
+                let root = root.trim();
+                if root.is_empty() {
+                    config.set_rust_lsp_root(None)?;
+                } else {
+                    config.set_rust_lsp_root(Some(std::path::PathBuf::from(root)))?;
+                }
+                println!(
+                    "{}",
+                    style(format!(
+                        "Saved VYBRID_RUST_LSP_ROOT to:\n  {}",
+                        saved_env_locations(config)
+                    ))
+                    .green()
+                );
+            }
+            _ => break,
+        }
     }
     Ok(())
 }

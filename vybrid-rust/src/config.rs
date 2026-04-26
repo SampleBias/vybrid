@@ -9,6 +9,7 @@ pub const DEFAULT_LM_STUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
 /// Placeholder Bearer token when LM Studio has authentication disabled.
 pub const DEFAULT_LM_STUDIO_API_KEY: &str = "lm-studio";
+pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 
@@ -67,6 +68,9 @@ pub struct Config {
     pub messages_dir: PathBuf,
     pub progress_dir: PathBuf,
     pub serpapi_key: Option<String>,
+    pub rust_lsp_enabled: bool,
+    pub rust_lsp_command: String,
+    pub rust_lsp_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -118,6 +122,21 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let rust_lsp_enabled = std::env::var("VYBRID_RUST_LSP_ENABLED")
+            .ok()
+            .map(|s| parse_bool_env(&s))
+            .unwrap_or(false);
+        let rust_lsp_command = std::env::var("VYBRID_RUST_LSP_COMMAND")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_RUST_LSP_COMMAND.to_string());
+        let rust_lsp_root = std::env::var("VYBRID_RUST_LSP_ROOT")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+
         Ok(Self {
             llm_provider,
             groq_api_key,
@@ -131,6 +150,9 @@ impl Config {
             messages_dir,
             progress_dir,
             serpapi_key,
+            rust_lsp_enabled,
+            rust_lsp_command,
+            rust_lsp_root,
         })
     }
 
@@ -258,6 +280,47 @@ impl Config {
         self.serpapi_key = Some(key);
         Ok(())
     }
+
+    pub fn set_rust_lsp_enabled(&mut self, enabled: bool) -> Result<()> {
+        let value = if enabled { "true" } else { "false" };
+        self.persist_env_key("VYBRID_RUST_LSP_ENABLED", value)?;
+        std::env::set_var("VYBRID_RUST_LSP_ENABLED", value);
+        self.rust_lsp_enabled = enabled;
+        Ok(())
+    }
+
+    pub fn set_rust_lsp_command(&mut self, command: String) -> Result<()> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            anyhow::bail!("Rust LSP command was empty.");
+        }
+        self.persist_env_key("VYBRID_RUST_LSP_COMMAND", &command)?;
+        std::env::set_var("VYBRID_RUST_LSP_COMMAND", &command);
+        self.rust_lsp_command = command;
+        Ok(())
+    }
+
+    pub fn set_rust_lsp_root(&mut self, root: Option<PathBuf>) -> Result<()> {
+        let value = root
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.persist_env_key("VYBRID_RUST_LSP_ROOT", &value)?;
+        if value.is_empty() {
+            std::env::remove_var("VYBRID_RUST_LSP_ROOT");
+        } else {
+            std::env::set_var("VYBRID_RUST_LSP_ROOT", &value);
+        }
+        self.rust_lsp_root = root;
+        Ok(())
+    }
+}
+
+fn parse_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn format_env_value(value: &str) -> String {

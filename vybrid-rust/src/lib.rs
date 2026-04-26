@@ -1,6 +1,7 @@
 pub mod client;
 pub mod config;
 pub mod conversation;
+pub mod lsp;
 pub mod project_docs;
 pub mod rust_agent_reference;
 pub mod shell;

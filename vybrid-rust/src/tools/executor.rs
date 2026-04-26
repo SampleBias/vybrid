@@ -3,10 +3,26 @@
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
+use crate::lsp::{RustLspManager, RustLspOperation, RustLspQuery};
+
 use super::{cargo, file_ops, grep, project, rust, search, shell};
+
+#[derive(Clone, Default)]
+pub struct ToolRuntime {
+    pub rust_lsp: Option<RustLspManager>,
+}
 
 /// Execute a tool by name with given arguments
 pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
+    let runtime = ToolRuntime::default();
+    execute_tool_with_context(name, arguments, &runtime).await
+}
+
+pub async fn execute_tool_with_context(
+    name: &str,
+    arguments: &str,
+    runtime: &ToolRuntime,
+) -> Result<String> {
     // Parse arguments JSON
     let args: Value =
         serde_json::from_str(arguments).unwrap_or(Value::Object(serde_json::Map::new()));
@@ -134,6 +150,34 @@ pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
             let manifest_path = args["manifest_path"].as_str();
             let working_dir = args["working_directory"].as_str();
             rust::rust_project_snapshot(manifest_path, working_dir).await
+        }
+
+        "rust_lsp_query" => {
+            let operation = args["operation"]
+                .as_str()
+                .and_then(RustLspOperation::parse)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "rust_lsp_query: operation must be one of status, diagnostics, hover, definition, references, document_symbols, completion, code_actions, formatting"
+                    )
+                })?;
+            let line = args["line"].as_u64().map(|n| n as u32);
+            let character = args["character"].as_u64().map(|n| n as u32);
+            let file_path = args["file_path"]
+                .as_str()
+                .or_else(|| args["path"].as_str())
+                .map(str::to_string);
+            let Some(rust_lsp) = runtime.rust_lsp.as_ref() else {
+                return Ok("Rust LSP is not available in this session.".to_string());
+            };
+            rust_lsp
+                .query(RustLspQuery {
+                    operation,
+                    file_path,
+                    line,
+                    character,
+                })
+                .await
         }
 
         // Enhanced grep

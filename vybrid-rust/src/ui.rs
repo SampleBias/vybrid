@@ -5,6 +5,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::lsp::{RustLspState, RustLspStatus};
+
 /// Approximate `openai/gpt-oss-120b` context window (tokens). Used only for the CLI meter.
 pub const CONTEXT_WINDOW_TOKENS: u32 = 131_072;
 
@@ -89,8 +91,12 @@ fn format_tokens_short(n: u32) -> String {
 }
 
 /// One dim line: context fill vs model window (heuristic; see `Conversation::estimate_context_tokens`).
-pub fn print_context_status_line(estimated_tokens: u32) {
-    let line = format_context_ring(estimated_tokens, CONTEXT_WINDOW_TOKENS);
+pub fn print_context_status_line(estimated_tokens: u32, rust_lsp: &RustLspStatus) {
+    let line = format!(
+        "{}  {}",
+        format_context_ring(estimated_tokens, CONTEXT_WINDOW_TOKENS),
+        format_rust_lsp_indicator(rust_lsp)
+    );
     let pct = estimated_tokens as f64 / CONTEXT_WINDOW_TOKENS as f64;
     if pct >= 0.85 {
         println!("{}", style(line).yellow().dim());
@@ -98,6 +104,18 @@ pub fn print_context_status_line(estimated_tokens: u32) {
         println!("{}", style(line).cyan().dim());
     } else {
         println!("{}", style(line).dim());
+    }
+}
+
+fn format_rust_lsp_indicator(status: &RustLspStatus) -> String {
+    match status.state {
+        RustLspState::Off => "○ rust-lsp off".to_string(),
+        RustLspState::Connecting => "◌ rust-lsp connecting".to_string(),
+        RustLspState::Connected => "● rust-lsp connected".to_string(),
+        RustLspState::Error => {
+            let message = status.message.as_deref().unwrap_or("error");
+            format!("× rust-lsp {message}")
+        }
     }
 }
 

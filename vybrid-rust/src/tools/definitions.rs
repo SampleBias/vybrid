@@ -208,11 +208,11 @@ pub fn get_all_tools() -> Vec<Tool> {
                     "type": "object",
                     "properties": {
                         "manifest_path": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Optional path to Cargo.toml."
                         },
                         "working_directory": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Optional directory to run cargo metadata in."
                         }
                     }
@@ -228,14 +228,58 @@ pub fn get_all_tools() -> Vec<Tool> {
                     "type": "object",
                     "properties": {
                         "manifest_path": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Optional path to Cargo.toml."
                         },
                         "working_directory": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": "Optional directory to run cargo metadata in."
                         }
                     }
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "rust_lsp_query".to_string(),
+                description: "Query the optional connected Rust LSP (rust-analyzer) for editor-grade Rust intelligence: status, diagnostics, hover, definition, references, document symbols, completion, code actions, or formatting edits. Use 0-based line and character positions for position-based operations.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": [
+                                "status",
+                                "diagnostics",
+                                "hover",
+                                "definition",
+                                "references",
+                                "document_symbols",
+                                "completion",
+                                "code_actions",
+                                "formatting"
+                            ],
+                            "description": "The Rust LSP operation to run."
+                        },
+                        "file_path": {
+                            "type": ["string", "null"],
+                            "description": "Rust source file path. Required for all operations except status; optional for diagnostics."
+                        },
+                        "path": {
+                            "type": ["string", "null"],
+                            "description": "Alias for file_path."
+                        },
+                        "line": {
+                            "type": ["integer", "null"],
+                            "description": "0-based line number. Required for hover, definition, references, completion, and code_actions."
+                        },
+                        "character": {
+                            "type": ["integer", "null"],
+                            "description": "0-based UTF-16-ish character offset for the LSP position. Required for hover, definition, references, completion, and code_actions."
+                        }
+                    },
+                    "required": ["operation"]
                 }),
             },
         },
