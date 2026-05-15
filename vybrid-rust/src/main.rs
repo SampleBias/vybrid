@@ -16,7 +16,7 @@ use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::{Config, LlmProvider};
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, REQUEST_CONTEXT_TOKEN_BUDGET};
 use crate::lsp::RustLspManager;
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::get_all_tools;
@@ -272,6 +272,12 @@ fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
         || s.contains("tool/API error payload may be truncated")
 }
 
+fn is_context_length_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("context_length_exceeded")
+        || s.contains("Please reduce the length of the messages or completion")
+}
+
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
     if is_tool_argument_json_error(e) {
         format!(
@@ -322,14 +328,39 @@ async fn process_ai_response(
         tool_calls.clear();
         first_chunk = true;
 
+        let request_budget = match attempt {
+            1 => REQUEST_CONTEXT_TOKEN_BUDGET,
+            2 => 40_000,
+            _ => 18_000,
+        };
+        let request_messages = if attempt == 1 {
+            conversation.messages_for_request()
+        } else {
+            conversation.messages_for_request_with_budget(request_budget)
+        };
+
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let stream = client
-            .chat_stream(conversation.messages_for_request(), Some(tools.to_vec()))
+            .chat_stream(request_messages, Some(tools.to_vec()))
             .await;
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 spinner.finish().await;
+                if attempt < MAX_STREAM_ATTEMPTS && is_context_length_error(&e) {
+                    println!(
+                        "{}",
+                        style(format!(
+                            "Context was too large for the provider — retrying with a compacted {}k-token request...",
+                            match attempt {
+                                1 => 40,
+                                _ => 18,
+                            }
+                        ))
+                        .yellow()
+                    );
+                    continue 'stream;
+                }
                 return Err(e);
             }
         };

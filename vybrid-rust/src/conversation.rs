@@ -1,8 +1,8 @@
 use crate::client::groq::Message;
 
 const MAX_TOOL_RESULT_CHARS: usize = 96 * 1024;
-const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 110_000;
-const RECENT_MESSAGE_FLOOR: usize = 40;
+pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 72_000;
+const MIN_COMPACTED_MESSAGE_CHARS: usize = 2_048;
 
 fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
     if content.chars().count() <= max_chars {
@@ -19,6 +19,47 @@ fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
         .rev()
         .collect();
     format!("{head}\n\n[{label} truncated: showing head and tail]\n\n{tail}",)
+}
+
+fn estimate_message_tokens(message: &Message) -> u32 {
+    let mut chars: usize = 0;
+    if let Some(c) = &message.content {
+        chars += c.len();
+    }
+    if let Some(tcs) = &message.tool_calls {
+        for tc in tcs {
+            chars += tc.id.len();
+            chars += tc.function.name.len();
+            chars += tc.function.arguments.len();
+        }
+    }
+    if let Some(id) = &message.tool_call_id {
+        chars += id.len();
+    }
+    chars.div_ceil(4).min(u32::MAX as usize) as u32
+}
+
+fn compact_message_for_request(message: &Message, max_chars: usize) -> Message {
+    let mut compacted = message.clone();
+    if let Some(content) = &message.content {
+        compacted.content = Some(truncate_middle(content, max_chars, "message"));
+    }
+
+    if let Some(tool_calls) = &message.tool_calls {
+        compacted.tool_calls = Some(
+            tool_calls
+                .iter()
+                .map(|tc| {
+                    let mut tc = tc.clone();
+                    tc.function.arguments =
+                        truncate_middle(&tc.function.arguments, max_chars, "tool arguments");
+                    tc
+                })
+                .collect(),
+        );
+    }
+
+    compacted
 }
 
 #[cfg(test)]
@@ -54,7 +95,7 @@ mod tests {
         assert!(request.len() < conversation.messages.len());
         assert!(request
             .iter()
-            .any(|m| m.content.as_deref().unwrap_or("").contains("omitted")));
+            .any(|m| m.content.as_deref().unwrap_or("").contains("compacted")));
     }
 }
 
@@ -103,31 +144,70 @@ impl Conversation {
         self.messages.clone()
     }
 
-    /// Request payload with a simple rolling window when history grows large.
+    /// Request payload with adaptive compaction when history grows large.
     pub fn messages_for_request(&self) -> Vec<Message> {
-        if self.estimate_context_tokens() <= REQUEST_CONTEXT_TOKEN_BUDGET
-            || self.messages.len() <= RECENT_MESSAGE_FLOOR + 1
-        {
+        self.messages_for_request_with_budget(REQUEST_CONTEXT_TOKEN_BUDGET)
+    }
+
+    /// Request payload that keeps the system prompt and the newest complete messages within budget.
+    pub fn messages_for_request_with_budget(&self, token_budget: u32) -> Vec<Message> {
+        if self.estimate_context_tokens() <= token_budget {
             return self.get_messages();
         }
 
         let mut messages = Vec::new();
+        let mut used_tokens = 0u32;
         if let Some(system_msg) = self.messages.first().cloned() {
+            used_tokens = used_tokens.saturating_add(estimate_message_tokens(&system_msg));
             messages.push(system_msg);
         }
 
-        let omitted = self.messages.len().saturating_sub(RECENT_MESSAGE_FLOOR + 1);
-        messages.push(Message {
+        let summary = Message {
             role: "user".to_string(),
             content: Some(format!(
-                "[Vybrid context summary] {omitted} earlier message(s) were omitted to stay within the model context window. Keep using the visible recent tool results, compiler spans, and file contents as authoritative context."
+                "[Vybrid context summary] Earlier messages were compacted to stay within the model context window. Keep using the visible recent tool results, compiler spans, and file contents as authoritative context."
             )),
             tool_calls: None,
             tool_call_id: None,
-        });
+        };
+        used_tokens = used_tokens.saturating_add(estimate_message_tokens(&summary));
+        messages.push(summary);
 
-        let start = self.messages.len().saturating_sub(RECENT_MESSAGE_FLOOR);
-        messages.extend(self.messages[start..].iter().cloned());
+        let mut selected = Vec::new();
+        let mut remaining_tokens = token_budget.saturating_sub(used_tokens);
+
+        for message in self.messages.iter().skip(1).rev() {
+            if remaining_tokens == 0 {
+                break;
+            }
+
+            let message_tokens = estimate_message_tokens(message);
+            if message_tokens <= remaining_tokens {
+                selected.push(message.clone());
+                remaining_tokens = remaining_tokens.saturating_sub(message_tokens);
+                continue;
+            }
+
+            let remaining_chars = (remaining_tokens as usize).saturating_mul(4);
+            if remaining_chars >= MIN_COMPACTED_MESSAGE_CHARS {
+                let compacted = compact_message_for_request(message, remaining_chars);
+                let compacted_tokens = estimate_message_tokens(&compacted);
+                if compacted_tokens <= remaining_tokens {
+                    selected.push(compacted);
+                }
+            }
+            break;
+        }
+
+        selected.reverse();
+
+        // OpenAI-compatible APIs reject orphan tool messages whose matching assistant call was
+        // outside the window. Drop any such leading tool messages after compaction.
+        while selected.first().map(|m| m.role.as_str()) == Some("tool") {
+            selected.remove(0);
+        }
+
+        messages.extend(selected);
         messages
     }
 
@@ -145,19 +225,7 @@ impl Conversation {
     pub fn estimate_context_tokens(&self) -> u32 {
         let mut chars: usize = 0;
         for m in &self.messages {
-            if let Some(c) = &m.content {
-                chars += c.len();
-            }
-            if let Some(tcs) = &m.tool_calls {
-                for tc in tcs {
-                    chars += tc.id.len();
-                    chars += tc.function.name.len();
-                    chars += tc.function.arguments.len();
-                }
-            }
-            if let Some(id) = &m.tool_call_id {
-                chars += id.len();
-            }
+            chars += estimate_message_tokens(m) as usize * 4;
         }
         chars.div_ceil(4).min(u32::MAX as usize) as u32
     }
