@@ -261,6 +261,27 @@ fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
     s.contains("tool_use_failed")
         || s.contains("did not match schema")
         || s.contains("Tool call validation")
+        || s.contains("Failed to parse tool call arguments as JSON")
+        || s.contains("Invalid JSON in API stream")
+}
+
+fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("Failed to parse tool call arguments as JSON")
+        || s.contains("Invalid JSON in API stream")
+        || s.contains("tool/API error payload may be truncated")
+}
+
+fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
+    if is_tool_argument_json_error(e) {
+        format!(
+            "[Vybrid] The API rejected your tool call because its arguments were not valid JSON: {e}. This was attempt {attempt} of {max_attempts}. Retry the task now. If you need to edit or create large/multiline content, split it into smaller tool calls. Do not place raw unescaped multiline text in tool arguments; escape JSON strings correctly, or explain the patch as text instead of calling a tool."
+        )
+    } else {
+        format!(
+            "[Vybrid] The API rejected a tool call before the reply could complete: {e}. This was attempt {attempt} of {max_attempts}. Please respond again; use tools only with arguments that match each tool's schema (see descriptions). For enhanced_grep, include `pattern` plus `path`, `file_path`, or `file_paths`."
+        )
+    }
 }
 
 /// Process AI response with streaming and tool calls
@@ -281,8 +302,9 @@ async fn process_ai_response(
         );
     }
 
-    /// If the API rejects a tool call before any tokens arrive, retry once with a corrective user note.
-    const MAX_STREAM_ATTEMPTS: u32 = 2;
+    /// If the API rejects a tool call, retry with a corrective user note. Some providers stream
+    /// reasoning before reporting malformed tool JSON, so retry after thinking but before content.
+    const MAX_STREAM_ATTEMPTS: u32 = 3;
 
     let mut reasoning_started: bool;
     let mut content_started: bool;
@@ -385,15 +407,16 @@ async fn process_ai_response(
                     if attempt < MAX_STREAM_ATTEMPTS
                         && is_retryable_groq_stream_error(&e)
                         && !content_started
-                        && !reasoning_started
                     {
-                        conversation.add_user_message(&format!(
-                            "[Vybrid] The API rejected a tool call before the reply could start: {e}. This was attempt {attempt} of {MAX_STREAM_ATTEMPTS}. Please respond again; use tools only with arguments that match each tool's schema (see descriptions). For enhanced_grep, include `pattern` plus `path`, `file_path`, or `file_paths`."
+                        conversation.add_user_message(&corrective_tool_prompt(
+                            &e,
+                            attempt,
+                            MAX_STREAM_ATTEMPTS,
                         ));
                         println!(
                             "{}",
                             style(
-                                "Tool call validation failed — retrying once with a corrective prompt…"
+                                "Tool call validation failed — retrying with a corrective prompt..."
                             )
                             .yellow()
                         );
@@ -552,6 +575,12 @@ Available tools:
 - create_project_structure: Initialize project files
 - get_current_todo_items: List incomplete tasks
 - mark_todo_complete: Mark a task as done
+
+TOOL CALL SAFETY:
+1. Every tool call argument payload must be valid JSON. Escape quotes, backslashes, and newlines inside strings.
+2. Keep edit/create tool payloads small. For large files, large patches, or many replacements, split the change into several tool calls or describe the patch as text first.
+3. Prefer read_file/enhanced_grep before editing, then use the smallest exact snippet replacement that proves the intended change.
+4. If a tool call is rejected for invalid JSON or schema mismatch, retry with simpler arguments instead of repeating the same payload.
 
 Guidelines:
 1. Read project files before editing to understand context

@@ -39,14 +39,31 @@ cargo build --release
 # Binary will be at target/release/vybrid
 ```
 
-### Copy Binary (Optional)
+### Install on PATH (recommended)
+
+From `vybrid-rust/`, use the install script so the `vybrid` command stays in sync with your checkout (avoids an old `~/.local/bin/vybrid` from a previous build):
 
 ```bash
-# Copy to user bin
-cp target/release/vybrid ~/.local/bin/
+chmod +x install.sh   # once
+./install.sh
+```
 
-# Or system-wide
-sudo cp target/release/vybrid /usr/local/bin/
+This builds `--release` and copies to `~/.local/bin/vybrid`. Override the destination with `INSTALL_DEST=/path/to/vybrid ./install.sh` if needed.
+
+Ensure `~/.local/bin` comes **before** any other directory that might contain another `vybrid`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+After `git pull`, run `./install.sh` again.
+
+### Copy Binary (manual)
+
+```bash
+cp target/release/vybrid ~/.local/bin/
+# Or system-wide:
+# sudo cp target/release/vybrid /usr/local/bin/
 ```
 
 ## Configuration

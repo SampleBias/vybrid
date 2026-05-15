@@ -135,6 +135,10 @@ pub fn display_banner() {
         "{}",
         style("AI Coding Assistant from the Trenches built in Rust").dim()
     );
+    println!(
+        "{}",
+        style(format!("version {}", env!("CARGO_PKG_VERSION"))).dim()
+    );
     println!("{}", style("─".repeat(50)).dim());
 }
 

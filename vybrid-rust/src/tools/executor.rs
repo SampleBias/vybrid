@@ -23,9 +23,15 @@ pub async fn execute_tool_with_context(
     arguments: &str,
     runtime: &ToolRuntime,
 ) -> Result<String> {
-    // Parse arguments JSON
-    let args: Value =
-        serde_json::from_str(arguments).unwrap_or(Value::Object(serde_json::Map::new()));
+    // Tool arguments arrive as a JSON string from the model. Treat malformed
+    // JSON as recoverable feedback instead of silently executing with `{}`.
+    let args: Value = serde_json::from_str(arguments).map_err(|e| {
+        anyhow!(
+            "tool `{}` received invalid JSON arguments: {}. Use a smaller tool call, split large edits into steps, or provide the patch as text.",
+            name,
+            e
+        )
+    })?;
 
     match name {
         // File reading
