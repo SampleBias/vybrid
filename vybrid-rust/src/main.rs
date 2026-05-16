@@ -417,6 +417,11 @@ fn is_preflight_route_error(e: &anyhow::Error) -> bool {
     e.to_string().contains("preflight_route_required")
 }
 
+fn is_missing_requested_tool_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("attempted to call tool") && s.contains("not in request.tools")
+}
+
 fn parse_retry_after_seconds(message: &str) -> Option<f64> {
     let marker = "Please try again in ";
     let start = message.find(marker)? + marker.len();
@@ -499,6 +504,15 @@ mod retry_tests {
         assert!(!should_retry_tool_generation_error(&err, true));
         assert!(should_retry_tool_generation_error(&err, false));
     }
+
+    #[test]
+    fn recognizes_missing_requested_tool_errors() {
+        let err = anyhow::anyhow!(
+            "Tool call validation failed: attempted to call tool 'run_cargo' which was not in request.tools"
+        );
+
+        assert!(is_missing_requested_tool_error(&err));
+    }
 }
 
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
@@ -555,6 +569,7 @@ async fn process_ai_response(
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut first_chunk: bool;
     let mut rate_limit_note_added = false;
+    let mut force_full_tools = false;
 
     let mut attempt: u32 = 0;
     'stream: loop {
@@ -574,7 +589,11 @@ async fn process_ai_response(
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = route_state.client_for_request(client);
-        let tool_profile = tool_profile_for_round(depth);
+        let tool_profile = if force_full_tools {
+            ToolProfile::Full
+        } else {
+            tool_profile_for_round(depth)
+        };
         let request_tools = route_state.tools_for_request(tool_profile);
         let stream = request_client
             .chat_stream(request_messages, request_tools)
@@ -583,6 +602,18 @@ async fn process_ai_response(
             Ok(s) => s,
             Err(e) => {
                 spinner.finish().await;
+                if attempt < MAX_STREAM_ATTEMPTS && is_missing_requested_tool_error(&e) {
+                    force_full_tools = true;
+                    conversation.add_user_message(
+                        "[Vybrid] The previous request used a reduced tool profile, but the model selected a tool outside that profile. Retry now with the full local tool set.",
+                    );
+                    println!(
+                        "{}",
+                        style("Tool was missing from the reduced profile — retrying with full tools...")
+                            .yellow()
+                    );
+                    continue 'stream;
+                }
                 if is_preflight_route_error(&e) {
                     if route_state.route_preflight_wait() {
                         println!(
@@ -723,6 +754,21 @@ async fn process_ai_response(
                 }
                 Err(e) => {
                     println!();
+                    if attempt < MAX_STREAM_ATTEMPTS && is_missing_requested_tool_error(&e) {
+                        force_full_tools = true;
+                        conversation.add_user_message(
+                            "[Vybrid] The previous request used a reduced tool profile, but the model selected a tool outside that profile. Retry now with the full local tool set.",
+                        );
+                        println!(
+                            "{}",
+                            style(
+                                "Tool was missing from the reduced profile — retrying with full tools...",
+                            )
+                            .yellow()
+                        );
+                        spinner.finish().await;
+                        continue 'stream;
+                    }
                     if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) && !content_started
                     {
                         spinner.finish().await;
