@@ -194,6 +194,15 @@ impl GroqClient {
         }
     }
 
+    pub fn with_model(&self, model: impl Into<String>) -> Self {
+        Self {
+            client: self.client.clone(),
+            api_key: self.api_key.clone(),
+            base_url: self.base_url.clone(),
+            model: model.into(),
+        }
+    }
+
     /// Stream chat completion response
     pub async fn chat_stream(
         &self,

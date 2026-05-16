@@ -12,6 +12,7 @@ pub const DEFAULT_LM_STUDIO_API_KEY: &str = "lm-studio";
 pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
 
 /// Which LLM backend Vybrid uses (`VYBRID_LLM_PROVIDER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub struct Config {
     pub llm_provider: LlmProvider,
     pub groq_api_key: Option<String>,
     pub groq_model: String,
+    pub groq_rate_limit_fallback_model: String,
     pub lm_studio_base_url: String,
     pub lm_studio_api_key: Option<String>,
     pub lm_studio_model: Option<String>,
@@ -105,6 +107,11 @@ impl Config {
 
         let groq_model =
             std::env::var("GROQ_MODEL").unwrap_or_else(|_| "openai/gpt-oss-120b".to_string());
+        let groq_rate_limit_fallback_model = std::env::var("GROQ_RATE_LIMIT_FALLBACK_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL.to_string());
 
         let lm_studio_base_url = std::env::var("LM_STUDIO_BASE_URL")
             .ok()
@@ -141,6 +148,7 @@ impl Config {
             llm_provider,
             groq_api_key,
             groq_model,
+            groq_rate_limit_fallback_model,
             lm_studio_base_url,
             lm_studio_api_key,
             lm_studio_model,

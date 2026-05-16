@@ -78,6 +78,8 @@ Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (pr
 GROQ_API_KEY=your_api_key_here
 # Optional: override model (default is openai/gpt-oss-120b)
 # GROQ_MODEL=openai/gpt-oss-120b
+# Optional: current-response fallback after two OSS120B rate-limit waits
+# GROQ_RATE_LIMIT_FALLBACK_MODEL=qwen/qwen3-32b
 
 # --- LM Studio (local) — set VYBRID_LLM_PROVIDER=lmstudio and fill these ---
 # LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
@@ -96,7 +98,7 @@ SERPAPI_KEY=your_serpapi_key_here
 ### Active provider (`VYBRID_LLM_PROVIDER`) and coexisting credentials
 
 - **`VYBRID_LLM_PROVIDER`** is `groq` (default) or `lmstudio`. It selects **which backend handles chat**; only one runs at a time.
-- You can keep **both** Groq settings (`GROQ_API_KEY`, optional `GROQ_MODEL`) **and** LM Studio settings (`LM_STUDIO_*`) in the same `~/.vybrid/.env` and `vybrid-rust/.env`. They do not overwrite each other. Switching the active provider (via **`/menu`** — e.g. “Configure LM Studio” or “Switch to Groq (cloud)”) or editing **`VYBRID_LLM_PROVIDER`** only changes **which** profile is used, not the stored keys for the other backend.
+- You can keep **both** Groq settings (`GROQ_API_KEY`, optional `GROQ_MODEL`, optional `GROQ_RATE_LIMIT_FALLBACK_MODEL`) **and** LM Studio settings (`LM_STUDIO_*`) in the same `~/.vybrid/.env` and `vybrid-rust/.env`. They do not overwrite each other. Switching the active provider (via **`/menu`** — e.g. “Configure LM Studio” or “Switch to Groq (cloud)”) or editing **`VYBRID_LLM_PROVIDER`** only changes **which** profile is used, not the stored keys for the other backend.
 
 If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 

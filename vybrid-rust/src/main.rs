@@ -229,6 +229,10 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         // Process with AI
         let spinner_label = llm_spinner_label(config.llm_provider);
+        let mut rate_limit_fallback = RateLimitFallbackState::new(
+            matches!(config.llm_provider, LlmProvider::Groq),
+            config.groq_rate_limit_fallback_model.clone(),
+        );
         if let Err(e) = process_ai_response(
             c,
             &mut conversation,
@@ -236,6 +240,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             &tool_runtime,
             0,
             spinner_label,
+            &mut rate_limit_fallback,
         )
         .await
         {
@@ -252,6 +257,46 @@ fn llm_spinner_label(provider: LlmProvider) -> &'static str {
     match provider {
         LlmProvider::Groq => "groq",
         LlmProvider::LmStudio => "local",
+    }
+}
+
+struct RateLimitFallbackState {
+    enabled: bool,
+    waits: u32,
+    fallback_model: String,
+    using_fallback: bool,
+}
+
+impl RateLimitFallbackState {
+    fn new(enabled: bool, fallback_model: String) -> Self {
+        Self {
+            enabled,
+            waits: 0,
+            fallback_model,
+            using_fallback: false,
+        }
+    }
+
+    fn client_for_request(&self, primary: &GroqClient) -> GroqClient {
+        if self.enabled && self.using_fallback {
+            primary.with_model(self.fallback_model.clone())
+        } else {
+            primary.clone()
+        }
+    }
+
+    fn record_rate_limit_wait(&mut self) -> bool {
+        self.waits += 1;
+        if self.enabled && !self.using_fallback && self.waits >= 2 {
+            self.using_fallback = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn fallback_model(&self) -> &str {
+        &self.fallback_model
     }
 }
 
@@ -347,6 +392,7 @@ async fn process_ai_response(
     tool_runtime: &ToolRuntime,
     depth: u32,
     spinner_label: &'static str,
+    rate_limit_fallback: &mut RateLimitFallbackState,
 ) -> Result<()> {
     /// Prevents runaway tool loops when the model chains many rounds.
     const MAX_TOOL_ROUNDS: u32 = 48;
@@ -390,7 +436,8 @@ async fn process_ai_response(
         };
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
-        let stream = client
+        let request_client = rate_limit_fallback.client_for_request(client);
+        let stream = request_client
             .chat_stream(request_messages, Some(tools.to_vec()))
             .await;
         let stream = match stream {
@@ -399,6 +446,7 @@ async fn process_ai_response(
                 spinner.finish().await;
                 if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) {
                     let delay = rate_limit_retry_delay(&e);
+                    let switching_to_fallback = rate_limit_fallback.record_rate_limit_wait();
                     if !rate_limit_note_added {
                         conversation.add_user_message(&rate_limit_resume_prompt(
                             attempt,
@@ -418,6 +466,16 @@ async fn process_ai_response(
                         ))
                         .yellow()
                     );
+                    if switching_to_fallback {
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Primary Groq model is still rate limited; using {} for this response.",
+                                rate_limit_fallback.fallback_model()
+                            ))
+                            .yellow()
+                        );
+                    }
                     let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
                     tokio::time::sleep(delay).await;
                     wait_spinner.finish().await;
@@ -515,6 +573,7 @@ async fn process_ai_response(
                     {
                         spinner.finish().await;
                         let delay = rate_limit_retry_delay(&e);
+                        let switching_to_fallback = rate_limit_fallback.record_rate_limit_wait();
                         if !rate_limit_note_added {
                             conversation.add_user_message(&rate_limit_resume_prompt(
                                 attempt,
@@ -530,6 +589,16 @@ async fn process_ai_response(
                             ))
                             .yellow()
                         );
+                        if switching_to_fallback {
+                            println!(
+                                "{}",
+                                style(format!(
+                                    "Primary Groq model is still rate limited; using {} for this response.",
+                                    rate_limit_fallback.fallback_model()
+                                ))
+                                .yellow()
+                            );
+                        }
                         let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
                         tokio::time::sleep(delay).await;
                         wait_spinner.finish().await;
@@ -639,6 +708,7 @@ async fn process_ai_response(
             tool_runtime,
             depth + 1,
             spinner_label,
+            rate_limit_fallback,
         ))
         .await?;
     }
