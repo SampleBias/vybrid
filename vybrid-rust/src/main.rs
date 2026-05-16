@@ -513,6 +513,18 @@ mod retry_tests {
 
         assert!(is_missing_requested_tool_error(&err));
     }
+
+    #[test]
+    fn compound_messages_end_with_user_and_drop_tool_roles() {
+        let mut conversation = Conversation::new("system");
+        conversation.add_user_message("please inspect");
+        conversation.add_tool_result("call-1", "tool output");
+
+        let messages = compound_messages_for_request(&conversation, 8_000);
+
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert!(!messages.iter().any(|m| m.role == "tool"));
+    }
 }
 
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
@@ -585,7 +597,8 @@ async fn process_ai_response(
             1 if route_state.mode == RouteMode::Primary => context_token_budget,
             _ => retry_context_token_budget,
         };
-        let request_messages = conversation.messages_for_request_with_budget(request_budget);
+        let request_messages =
+            request_messages_for_route(conversation, request_budget, route_state);
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = route_state.client_for_request(client);
@@ -970,6 +983,87 @@ fn compact_tool_result_for_history(tool_name: &str, result: &str, depth: u32) ->
         result.chars().count(),
         max_chars
     )
+}
+
+fn request_messages_for_route(
+    conversation: &Conversation,
+    request_budget: u32,
+    route_state: &RouteState,
+) -> Vec<Message> {
+    if route_state.is_compound() {
+        return compound_messages_for_request(conversation, request_budget);
+    }
+    conversation.messages_for_request_with_budget(request_budget)
+}
+
+fn compound_messages_for_request(conversation: &Conversation, request_budget: u32) -> Vec<Message> {
+    let source = conversation.messages_for_request_with_budget(request_budget);
+    let system = source
+        .first()
+        .filter(|m| m.role == "system")
+        .cloned()
+        .unwrap_or_else(|| Message {
+            role: "system".to_string(),
+            content: Some("You are a concise planning assistant.".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+    let mut transcript = String::new();
+    for message in source
+        .iter()
+        .skip(1)
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        let role = message.role.as_str();
+        let content = message.content.as_deref().unwrap_or("");
+        if content.trim().is_empty() && message.tool_calls.is_none() {
+            continue;
+        }
+        transcript.push_str(&format!("\n\n[{role}]\n"));
+        if !content.trim().is_empty() {
+            transcript.push_str(content);
+        }
+        if let Some(tool_calls) = &message.tool_calls {
+            let names = tool_calls
+                .iter()
+                .map(|tc| tc.function.name.as_str())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>();
+            if !names.is_empty() {
+                transcript.push_str(&format!("\nTool calls requested: {}", names.join(", ")));
+            }
+        }
+    }
+
+    let max_chars = (request_budget as usize).saturating_mul(4).min(24_000);
+    if transcript.chars().count() > max_chars {
+        transcript = transcript
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        transcript.insert_str(0, "[Older transcript omitted for Compound route]\n");
+    }
+
+    vec![
+        system,
+        Message {
+            role: "user".to_string(),
+            content: Some(format!(
+                "Vybrid routed this turn to Compound because local tool-calling models were near TPM limits. You do not have access to Vybrid's local filesystem tools in this route.\n\nUse the transcript below to provide a concise planning/summarization response or the next local-tool action Vybrid should take. Do not claim files were edited or commands were run.\n{transcript}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ]
 }
 
 /// Inject project documentation context into user message
