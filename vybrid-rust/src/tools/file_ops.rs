@@ -1,10 +1,62 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 const DEFAULT_READ_FILE_BYTES: usize = 64 * 1024;
 const MIN_READ_FILE_BYTES: usize = 4 * 1024;
 const MAX_READ_FILE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Default)]
+pub struct FileReadCache {
+    entries: Arc<Mutex<HashMap<PathBuf, CachedFile>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFile {
+    modified: Option<SystemTime>,
+    len: u64,
+    content: String,
+}
+
+impl FileReadCache {
+    fn read_or_load(
+        &self,
+        path: &Path,
+        modified: Option<SystemTime>,
+        len: u64,
+    ) -> Result<(String, String)> {
+        let cached = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?
+            .get(path)
+            .cloned();
+
+        if let Some(cached) = cached {
+            if cached.modified == modified && cached.len == len {
+                return Ok((cached.content, "hit".to_string()));
+            }
+        }
+
+        let content = fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", path.display(), e))?;
+        self.entries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?
+            .insert(
+                path.to_path_buf(),
+                CachedFile {
+                    modified,
+                    len,
+                    content: content.clone(),
+                },
+            );
+        Ok((content, "miss".to_string()))
+    }
+}
 
 /// Normalize a file path (expand ~ and make absolute if needed)
 pub fn normalize_path(path: &str) -> String {
@@ -25,6 +77,17 @@ pub fn read_file_with_options(
     line_count: Option<usize>,
     max_bytes: Option<usize>,
 ) -> Result<String> {
+    read_file_with_options_cached(path, start_line, line_count, max_bytes, None)
+}
+
+/// Read a single file using a metadata-aware session cache when available.
+pub fn read_file_with_options_cached(
+    path: &str,
+    start_line: Option<usize>,
+    line_count: Option<usize>,
+    max_bytes: Option<usize>,
+    cache: Option<&FileReadCache>,
+) -> Result<String> {
     let normalized = normalize_path(path);
     let file_path = Path::new(&normalized);
     if !file_path.exists() {
@@ -34,8 +97,19 @@ pub fn read_file_with_options(
         ));
     }
 
-    let content = fs::read_to_string(&normalized)
-        .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", normalized, e))?;
+    let metadata = fs::metadata(file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to stat '{}': {}", normalized, e))?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+    let (content, cache_status) = if let Some(cache) = cache {
+        cache.read_or_load(file_path, modified, len)?
+    } else {
+        (
+            fs::read_to_string(&normalized)
+                .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", normalized, e))?,
+            "uncached".to_string(),
+        )
+    };
 
     let total_lines = content.lines().count();
     let total_bytes = content.len();
@@ -58,12 +132,13 @@ pub fn read_file_with_options(
     let display_path = crate::project_context::root_relative(file_path);
 
     let mut header = format!(
-        "Content of '{}' (resolved: '{}', total_lines: {}, total_bytes: {}, returned_bytes: {}",
+        "Content of '{}' (resolved: '{}', total_lines: {}, total_bytes: {}, returned_bytes: {}, cache: {}",
         path,
         display_path,
         total_lines,
         total_bytes,
-        body.len()
+        body.len(),
+        cache_status
     );
     if start_line.is_some() || line_count.is_some() {
         let end = start
@@ -81,11 +156,23 @@ pub fn read_file_with_options(
 }
 
 /// Read multiple files
+#[allow(dead_code)]
 pub fn read_multiple_files(paths: &[&str]) -> Result<String> {
+    read_multiple_files_cached(paths, None)
+}
+
+/// Read multiple files through the same metadata-aware cache.
+pub fn read_multiple_files_cached(paths: &[&str], cache: Option<&FileReadCache>) -> Result<String> {
     let mut results = Vec::new();
 
     for path in paths {
-        match read_file_with_options(path, None, None, Some(DEFAULT_READ_FILE_BYTES / 2)) {
+        match read_file_with_options_cached(
+            path,
+            None,
+            None,
+            Some(DEFAULT_READ_FILE_BYTES / 2),
+            cache,
+        ) {
             Ok(content) => results.push(content),
             Err(e) => results.push(format!("Error reading '{}': {}", path, e)),
         }
@@ -439,5 +526,53 @@ mod tests {
         assert!(result.contains("two"));
         assert!(result.contains("three"));
         assert!(!result.contains("four"));
+    }
+
+    #[test]
+    fn read_file_cache_hits_when_metadata_is_unchanged() {
+        let path = std::env::temp_dir().join(format!(
+            "vybrid-read-cache-hit-{}-{}.txt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "cached body\n").unwrap();
+        let cache = FileReadCache::default();
+
+        let first =
+            read_file_with_options_cached(path.to_str().unwrap(), None, None, None, Some(&cache))
+                .unwrap();
+        let second =
+            read_file_with_options_cached(path.to_str().unwrap(), None, None, None, Some(&cache))
+                .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(first.contains("cache: miss"));
+        assert!(second.contains("cache: hit"));
+        assert!(second.contains("cached body"));
+    }
+
+    #[test]
+    fn read_file_cache_misses_after_file_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "vybrid-read-cache-change-{}-{}.txt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "first\n").unwrap();
+        let cache = FileReadCache::default();
+
+        read_file_with_options_cached(path.to_str().unwrap(), None, None, None, Some(&cache))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::fs::write(&path, "second and longer\n").unwrap();
+        let changed =
+            read_file_with_options_cached(path.to_str().unwrap(), None, None, None, Some(&cache))
+                .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(changed.contains("cache: miss"));
+        assert!(changed.contains("second and longer"));
     }
 }

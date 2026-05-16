@@ -6,12 +6,14 @@ use serde_json::Value;
 use crate::lsp::{RustLspManager, RustLspOperation, RustLspQuery};
 use crate::memory::MemoryStore;
 
-use super::{cargo, file_ops, grep, memory, project, rust, search, shell};
+use super::{cargo, file_ops, grep, memory, output, project, rust, search, shell};
 
 #[derive(Clone, Default)]
 pub struct ToolRuntime {
     pub rust_lsp: Option<RustLspManager>,
     pub memory: Option<MemoryStore>,
+    pub file_read_cache: file_ops::FileReadCache,
+    pub output_store: output::ToolOutputStore,
 }
 
 /// Execute a tool by name with given arguments
@@ -35,14 +37,20 @@ pub async fn execute_tool_with_context(
         )
     })?;
 
-    match name {
+    let result = match name {
         // File reading
         "read_file" => {
             let path = args["file_path"].as_str().unwrap_or("");
             let start_line = args["start_line"].as_u64().map(|n| n as usize);
             let line_count = args["line_count"].as_u64().map(|n| n as usize);
             let max_bytes = args["max_bytes"].as_u64().map(|n| n as usize);
-            file_ops::read_file_with_options(path, start_line, line_count, max_bytes)
+            file_ops::read_file_with_options_cached(
+                path,
+                start_line,
+                line_count,
+                max_bytes,
+                Some(&runtime.file_read_cache),
+            )
         }
 
         "read_multiple_files" => {
@@ -50,7 +58,7 @@ pub async fn execute_tool_with_context(
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            file_ops::read_multiple_files(&paths)
+            file_ops::read_multiple_files_cached(&paths, Some(&runtime.file_read_cache))
         }
 
         // File creation
@@ -302,7 +310,9 @@ pub async fn execute_tool_with_context(
 
         // Unknown tool
         _ => Ok(format!("Unknown tool: {}", name)),
-    }
+    };
+
+    result.and_then(|output| runtime.output_store.maybe_offload(name, output))
 }
 
 /// Execute a tool synchronously

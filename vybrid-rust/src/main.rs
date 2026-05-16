@@ -107,6 +107,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     let tool_runtime = ToolRuntime {
         rust_lsp: Some(rust_lsp.clone()),
         memory: Some(memory_store.clone()),
+        file_read_cache: Default::default(),
+        output_store: tools::output::ToolOutputStore::new(config.progress_dir.clone()),
     };
 
     loop {
@@ -1246,6 +1248,8 @@ TOOL CALL SAFETY:
 2. Keep edit/create tool payloads small. For large files, large patches, or many replacements, split the change into several tool calls or describe the patch as text first.
 3. Prefer read_file/enhanced_grep before editing, then use the smallest exact snippet replacement that proves the intended change.
 4. If a tool call is rejected for invalid JSON or schema mismatch, retry with simpler arguments instead of repeating the same payload.
+5. File reads are metadata-cached within a session. If a repeated read says `cache: hit`, treat it as the unchanged file content from the previous read.
+6. Large tool results may be offloaded to disk with a preview and `Full result` path. Use `read_file` on that path only when exact omitted content is needed.
 
 Guidelines:
 1. Read project files before editing to understand context

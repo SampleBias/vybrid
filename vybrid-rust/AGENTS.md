@@ -343,6 +343,10 @@ The system provides these tools to the AI:
 - Tool results added with `conversation.add_tool_result()`
 - `conversation.clear_keeping_system()` clears everything except system prompt
 
+### Tool Result Efficiency
+- `read_file` and `read_multiple_files` use a session metadata cache through `ToolRuntime`. If the file length and modification time match the previous read, the cached content is reused and the tool header reports `cache: hit`.
+- Oversized successful tool outputs are written to `~/.vybrid/progress/tool-results/` (or the configured progress dir). The model receives a preview plus a `Full result` path that can be read with `read_file` when exact omitted content is needed.
+
 ## API Integration
 
 ### Groq OpenAI-compatible Chat Completions (`openai/gpt-oss-120b`)
