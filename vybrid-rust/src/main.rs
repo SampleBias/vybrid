@@ -278,6 +278,55 @@ fn is_context_length_error(e: &anyhow::Error) -> bool {
         || s.contains("Please reduce the length of the messages or completion")
 }
 
+fn is_rate_limit_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("429 Too Many Requests")
+        || s.contains("rate_limit_exceeded")
+        || s.contains("Rate limit reached")
+}
+
+fn parse_retry_after_seconds(message: &str) -> Option<f64> {
+    let marker = "Please try again in ";
+    let start = message.find(marker)? + marker.len();
+    let suffix = &message[start..];
+    let end = suffix
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_ascii_digit() && ch != '.').then_some(idx))
+        .unwrap_or(suffix.len());
+    suffix[..end].parse::<f64>().ok()
+}
+
+fn rate_limit_retry_delay(e: &anyhow::Error) -> std::time::Duration {
+    let seconds = parse_retry_after_seconds(&e.to_string()).unwrap_or(15.0);
+    let seconds = seconds.ceil().clamp(1.0, 60.0) + 1.0;
+    std::time::Duration::from_secs(seconds as u64)
+}
+
+fn rate_limit_resume_prompt(attempt: u32, max_attempts: u32) -> String {
+    format!(
+        "[Vybrid] The previous API request hit the provider token-per-minute rate limit. This was attempt {attempt} of {max_attempts}. Continue the current task from the latest messages and tool results. Keep the next request concise, avoid re-reading context unless needed, and prefer small tool calls."
+    )
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn parses_groq_retry_after_seconds() {
+        let message = r#"API error (429 Too Many Requests): {"error":{"message":"Rate limit reached for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 250000, Used 224739, Requested 88828. Please try again in 15.256079999s. ","type":"tokens","code":"rate_limit_exceeded"}}"#;
+
+        assert_eq!(parse_retry_after_seconds(message), Some(15.256079999));
+    }
+
+    #[test]
+    fn recognizes_rate_limit_errors() {
+        let err = anyhow::anyhow!("API error (429 Too Many Requests): rate_limit_exceeded");
+
+        assert!(is_rate_limit_error(&err));
+    }
+}
+
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
     if is_tool_argument_json_error(e) {
         format!(
@@ -310,13 +359,14 @@ async fn process_ai_response(
 
     /// If the API rejects a tool call, retry with a corrective user note. Some providers stream
     /// reasoning before reporting malformed tool JSON, so retry after thinking but before content.
-    const MAX_STREAM_ATTEMPTS: u32 = 3;
+    const MAX_STREAM_ATTEMPTS: u32 = 5;
 
     let mut reasoning_started: bool;
     let mut content_started: bool;
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut first_chunk: bool;
+    let mut rate_limit_note_added = false;
 
     let mut attempt: u32 = 0;
     'stream: loop {
@@ -347,6 +397,32 @@ async fn process_ai_response(
             Ok(s) => s,
             Err(e) => {
                 spinner.finish().await;
+                if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) {
+                    let delay = rate_limit_retry_delay(&e);
+                    if !rate_limit_note_added {
+                        conversation.add_user_message(&rate_limit_resume_prompt(
+                            attempt,
+                            MAX_STREAM_ATTEMPTS,
+                        ));
+                        rate_limit_note_added = true;
+                    }
+                    println!(
+                        "{}",
+                        style(format!(
+                            "Rate limit reached — waiting {}s, then retrying with a compacted {}k-token request...",
+                            delay.as_secs(),
+                            match attempt {
+                                1 => 40,
+                                _ => 18,
+                            }
+                        ))
+                        .yellow()
+                    );
+                    let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
+                    tokio::time::sleep(delay).await;
+                    wait_spinner.finish().await;
+                    continue 'stream;
+                }
                 if attempt < MAX_STREAM_ATTEMPTS && is_context_length_error(&e) {
                     println!(
                         "{}",
@@ -435,6 +511,30 @@ async fn process_ai_response(
                 }
                 Err(e) => {
                     println!();
+                    if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) && !content_started
+                    {
+                        spinner.finish().await;
+                        let delay = rate_limit_retry_delay(&e);
+                        if !rate_limit_note_added {
+                            conversation.add_user_message(&rate_limit_resume_prompt(
+                                attempt,
+                                MAX_STREAM_ATTEMPTS,
+                            ));
+                            rate_limit_note_added = true;
+                        }
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Rate limit reached mid-stream — waiting {}s, then retrying compacted...",
+                                delay.as_secs()
+                            ))
+                            .yellow()
+                        );
+                        let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
+                        tokio::time::sleep(delay).await;
+                        wait_spinner.finish().await;
+                        continue 'stream;
+                    }
                     if attempt < MAX_STREAM_ATTEMPTS
                         && is_retryable_groq_stream_error(&e)
                         && !content_started
