@@ -160,7 +160,7 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "edit_file".to_string(),
-                description: "Replace an exact snippet in a file. File: `path` or `file_path`. Snippet to find: `original_snippet` or `old_string`. Replacement: `new_snippet` or `new_string`. You may mix these (e.g. `path` + `old_string` + `new_string`).".to_string(),
+                description: "Replace an exact snippet in a file. File: `path` or `file_path`. Snippet to find: `original_snippet` or `old_string`. Replacement: `new_snippet` or `new_string`. If the snippet appears more than once, add `context_before` and/or `context_after` with nearby exact text to identify the intended occurrence. You may mix naming styles (e.g. `path` + `old_string` + `new_string`).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -170,9 +170,11 @@ pub fn get_all_tools() -> Vec<Tool> {
                         "new_snippet": { "type": "string", "description": "Replacement text" },
                         "old_string": { "type": "string", "description": "Exact text to find (alias of original_snippet)" },
                         "new_string": { "type": "string", "description": "Replacement text (alias of new_snippet)" },
+                        "context_before": { "type": "string", "description": "Optional exact text near and before the intended occurrence, used only to disambiguate repeated snippets." },
+                        "context_after": { "type": "string", "description": "Optional exact text near and after the intended occurrence, used only to disambiguate repeated snippets." },
                         "dry_run": { "type": "boolean", "description": "If true, validate and preview the edit without writing the file." }
                     },
-                    "description": "Provide a file (`path` or `file_path`) and the before/after text using either naming style. (Single object so API validation accepts alias mixes; missing or invalid combos fail with a clear error when the tool runs.)"
+                    "description": "Provide a file (`path` or `file_path`) and the before/after text using either naming style. Use `context_before`/`context_after` when the exact snippet is duplicated. (Single object so API validation accepts alias mixes; missing or invalid combos fail with a clear error when the tool runs.)"
                 }),
             },
         },

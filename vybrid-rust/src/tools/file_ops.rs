@@ -158,6 +158,18 @@ pub fn edit_file_with_options(
     new_snippet: &str,
     dry_run: bool,
 ) -> Result<String> {
+    edit_file_with_context_options(path, original_snippet, new_snippet, dry_run, None, None)
+}
+
+/// Edit a file by replacing a snippet, optionally disambiguating repeated matches with context.
+pub fn edit_file_with_context_options(
+    path: &str,
+    original_snippet: &str,
+    new_snippet: &str,
+    dry_run: bool,
+    context_before: Option<&str>,
+    context_after: Option<&str>,
+) -> Result<String> {
     let normalized = normalize_path(path);
 
     // Read the file
@@ -165,7 +177,11 @@ pub fn edit_file_with_options(
         .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", path, e))?;
 
     // Check for the snippet
-    let count = content.matches(original_snippet).count();
+    let matches: Vec<usize> = content
+        .match_indices(original_snippet)
+        .map(|(idx, _)| idx)
+        .collect();
+    let count = matches.len();
 
     if count == 0 {
         return Err(anyhow::anyhow!(
@@ -174,12 +190,29 @@ pub fn edit_file_with_options(
         ));
     }
 
-    if count > 1 {
+    let candidate_matches = filter_matches_by_context(
+        &content,
+        original_snippet,
+        &matches,
+        context_before,
+        context_after,
+    );
+
+    if candidate_matches.len() != 1 {
+        let context_hint = if context_before.is_some() || context_after.is_some() {
+            " No occurrence matched the supplied context uniquely."
+        } else {
+            " Provide `context_before` and/or `context_after`, or include more surrounding lines in `original_snippet`."
+        };
         return Err(anyhow::anyhow!(
-            "Found {} occurrences of the snippet in '{}'. Please provide more context to make the match unique.",
-            count, path
+            "Found {} occurrences of the snippet in '{}'.{} Candidate locations:\n{}",
+            count,
+            path,
+            context_hint,
+            occurrence_previews(&content, &candidate_matches, 3)
         ));
     }
+    let match_start = candidate_matches[0];
 
     let preview = format!(
         "Edit preview for '{}':\n--- before\n{}\n--- after\n{}",
@@ -191,11 +224,89 @@ pub fn edit_file_with_options(
     }
 
     // Write the updated content
-    let updated_content = content.replacen(original_snippet, new_snippet, 1);
+    let mut updated_content = content;
+    updated_content.replace_range(
+        match_start..match_start + original_snippet.len(),
+        new_snippet,
+    );
     fs::write(&normalized, &updated_content)
         .map_err(|e| anyhow::anyhow!("Failed to write '{}': {}", path, e))?;
 
     Ok(format!("Successfully edited '{}'\n{}", path, preview))
+}
+
+fn filter_matches_by_context(
+    content: &str,
+    original_snippet: &str,
+    matches: &[usize],
+    context_before: Option<&str>,
+    context_after: Option<&str>,
+) -> Vec<usize> {
+    const CONTEXT_WINDOW_BYTES: usize = 8 * 1024;
+
+    matches
+        .iter()
+        .copied()
+        .filter(|match_start| {
+            let match_end = match_start + original_snippet.len();
+            let before_start = content[..*match_start]
+                .char_indices()
+                .rev()
+                .take_while(|(idx, _)| match_start.saturating_sub(*idx) <= CONTEXT_WINDOW_BYTES)
+                .last()
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            let after_end = content[match_end..]
+                .char_indices()
+                .take_while(|(idx, _)| *idx <= CONTEXT_WINDOW_BYTES)
+                .last()
+                .map(|(idx, ch)| match_end + idx + ch.len_utf8())
+                .unwrap_or(match_end);
+            let before_window = &content[before_start..*match_start];
+            let after_window = &content[match_end..after_end];
+
+            context_before
+                .map(|context| before_window.contains(context))
+                .unwrap_or(true)
+                && context_after
+                    .map(|context| after_window.contains(context))
+                    .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn occurrence_previews(content: &str, matches: &[usize], max_previews: usize) -> String {
+    if matches.is_empty() {
+        return "  (no candidate locations after applying context filters)".to_string();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut previews = Vec::new();
+    for (occurrence_idx, match_start) in matches.iter().take(max_previews).enumerate() {
+        let line_no = content[..*match_start]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+            + 1;
+        let start_line = line_no.saturating_sub(2).max(1);
+        let end_line = (line_no + 2).min(lines.len().max(1));
+        let mut preview = format!("  occurrence {} at line {}:", occurrence_idx + 1, line_no);
+        for current_line in start_line..=end_line {
+            if let Some(line) = lines.get(current_line - 1) {
+                preview.push_str(&format!("\n    {:>4}: {}", current_line, line));
+            }
+        }
+        previews.push(preview);
+    }
+
+    if matches.len() > max_previews {
+        previews.push(format!(
+            "  ... {} more occurrence(s) omitted",
+            matches.len() - max_previews
+        ));
+    }
+
+    previews.join("\n")
 }
 
 /// Check if a file exists
@@ -282,6 +393,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(err.to_string().contains("occurrences"));
+    }
+
+    #[test]
+    fn edit_file_context_disambiguates_repeated_snippet() {
+        let path = std::env::temp_dir().join(format!(
+            "vybrid-edit-context-disambiguates-{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "fn first() {\n    same\n}\n\nfn second() {\n    same\n}\n",
+        )
+        .unwrap();
+
+        edit_file_with_context_options(
+            path.to_str().unwrap(),
+            "    same",
+            "    changed",
+            false,
+            Some("fn second() {"),
+            Some("\n}"),
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(content.contains("fn first() {\n    same\n}"));
+        assert!(content.contains("fn second() {\n    changed\n}"));
     }
 
     #[test]

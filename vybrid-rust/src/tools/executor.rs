@@ -115,7 +115,16 @@ pub async fn execute_tool_with_context(
                 ));
             }
             let dry_run = args["dry_run"].as_bool().unwrap_or(false);
-            file_ops::edit_file_with_options(path, original, new, dry_run)
+            let context_before = args["context_before"].as_str();
+            let context_after = args["context_after"].as_str();
+            file_ops::edit_file_with_context_options(
+                path,
+                original,
+                new,
+                dry_run,
+                context_before,
+                context_after,
+            )
         }
 
         // Shell execution
