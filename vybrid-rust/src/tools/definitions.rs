@@ -243,7 +243,7 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "rust_lsp_query".to_string(),
-                description: "Query the optional connected Rust LSP (rust-analyzer) for editor-grade Rust intelligence: status, diagnostics, hover, definition, references, document symbols, completion, code actions, or formatting edits. Use 0-based line and character positions for position-based operations.".to_string(),
+                description: "Query the optional connected Rust LSP (rust-analyzer). Always include `operation`: one of status, diagnostics, hover, definition, references, document_symbols, completion, code_actions, formatting. Use 0-based line and character positions for position-based operations.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -279,7 +279,7 @@ pub fn get_all_tools() -> Vec<Tool> {
                             "description": "0-based UTF-16-ish character offset for the LSP position. Required for hover, definition, references, completion, and code_actions."
                         }
                     },
-                    "required": ["operation"]
+                    "description": "Provide `operation` for every call. The schema is intentionally loose so provider validation does not fail before Vybrid can return a recoverable tool error."
                 }),
             },
         },

@@ -769,7 +769,7 @@ Available tools:
 - run_cargo: Run Cargo (check, build, test, clippy, fmt, doc, …) with structured argv — preferred for Rust projects over raw shell when invoking cargo
 - rust_project_snapshot, cargo_metadata: Inspect Rust workspace/package layout before editing
 - explain_rust_diagnostic: Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async Send
-- rust_lsp_query: Use connected rust-analyzer LSP for status, diagnostics, hover, definition, references, symbols, completions, code actions, and formatting edits
+- rust_lsp_query: Use connected rust-analyzer LSP for status, diagnostics, hover, definition, references, symbols, completions, code actions, and formatting edits. Always pass an `operation` string, for example {{"operation":"status"}} or {{"operation":"diagnostics","file_path":"src/main.rs"}}
 - execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online
