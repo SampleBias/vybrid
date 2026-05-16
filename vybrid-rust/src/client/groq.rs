@@ -5,7 +5,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -77,7 +77,8 @@ pub struct GroqClient {
     model: String,
     max_tokens: u32,
     tpm_limit: u32,
-    rate_window: Arc<Mutex<VecDeque<(Instant, u32)>>>,
+    route_wait_threshold: Duration,
+    rate_window: Arc<Mutex<HashMap<String, VecDeque<(Instant, u32)>>>>,
 }
 
 /// Chat completion request (OpenAI-compatible subset).
@@ -214,7 +215,13 @@ impl GroqClient {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|n| *n > 0)
                 .unwrap_or(240_000),
-            rate_window: Arc::new(Mutex::new(VecDeque::new())),
+            route_wait_threshold: Duration::from_secs(
+                std::env::var("VYBRID_ROUTE_WAIT_THRESHOLD_SECS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(5),
+            ),
+            rate_window: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -226,17 +233,23 @@ impl GroqClient {
             model: model.into(),
             max_tokens: self.max_tokens,
             tpm_limit: self.tpm_limit,
+            route_wait_threshold: self.route_wait_threshold,
             rate_window: self.rate_window.clone(),
         }
     }
 
-    async fn throttle_if_needed(&self, request: &ChatRequest) {
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    async fn throttle_if_needed(&self, request: &ChatRequest) -> Result<()> {
         if !self.base_url.contains("groq.com") {
-            return;
+            return Ok(());
         }
         let requested = estimate_request_tokens(request);
         let now = Instant::now();
-        let mut window = self.rate_window.lock().await;
+        let mut windows = self.rate_window.lock().await;
+        let window = windows.entry(request.model.clone()).or_default();
         while let Some((instant, _)) = window.front() {
             if now.duration_since(*instant) > Duration::from_secs(60) {
                 window.pop_front();
@@ -249,14 +262,26 @@ impl GroqClient {
             if let Some((oldest, _)) = window.front() {
                 let wait = Duration::from_secs(60).saturating_sub(now.duration_since(*oldest));
                 if !wait.is_zero() {
-                    drop(window);
+                    if wait > self.route_wait_threshold {
+                        anyhow::bail!(
+                            "preflight_route_required: model `{}` would wait {}s before estimated {} token request (used {}, limit {})",
+                            request.model,
+                            wait.as_secs().max(1),
+                            requested,
+                            used,
+                            self.tpm_limit
+                        );
+                    }
+
+                    drop(windows);
                     eprintln!(
                         "Groq TPM preflight: waiting {}s before sending estimated {} token request",
                         wait.as_secs().max(1),
                         requested
                     );
                     tokio::time::sleep(wait).await;
-                    let mut refreshed = self.rate_window.lock().await;
+                    let mut refreshed_windows = self.rate_window.lock().await;
+                    let refreshed = refreshed_windows.entry(request.model.clone()).or_default();
                     let now = Instant::now();
                     while let Some((instant, _)) = refreshed.front() {
                         if now.duration_since(*instant) > Duration::from_secs(60) {
@@ -266,11 +291,12 @@ impl GroqClient {
                         }
                     }
                     refreshed.push_back((now, requested));
-                    return;
+                    return Ok(());
                 }
             }
         }
         window.push_back((now, requested));
+        Ok(())
     }
 
     /// Stream chat completion response
@@ -279,17 +305,18 @@ impl GroqClient {
         messages: Vec<Message>,
         tools: Option<Vec<Tool>>,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send>>> {
+        let has_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let request = ChatRequest {
             model: self.model.clone(),
             messages,
             tools,
-            tool_choice: Some("auto".to_string()),
+            tool_choice: has_tools.then(|| "auto".to_string()),
             stream: true,
             max_tokens: self.max_tokens,
             temperature: 1.0,
         };
 
-        self.throttle_if_needed(&request).await;
+        self.throttle_if_needed(&request).await?;
 
         let response = self
             .client
@@ -396,17 +423,18 @@ impl GroqClient {
 
     /// Non-streaming chat completion
     pub async fn chat(&self, messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Result<Message> {
+        let has_tools = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let request = ChatRequest {
             model: self.model.clone(),
             messages,
             tools,
-            tool_choice: Some("auto".to_string()),
+            tool_choice: has_tools.then(|| "auto".to_string()),
             stream: false,
             max_tokens: self.max_tokens,
             temperature: 1.0,
         };
 
-        self.throttle_if_needed(&request).await;
+        self.throttle_if_needed(&request).await?;
 
         let response = self
             .client

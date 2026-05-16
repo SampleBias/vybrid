@@ -1,6 +1,44 @@
 use crate::client::groq::{FunctionDef, Tool};
 use serde_json::json;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ToolProfile {
+    Full,
+    Navigate,
+    Edit,
+    Build,
+    None,
+}
+
+pub fn get_tools_for_profile(profile: ToolProfile) -> Vec<Tool> {
+    let names: &[&str] = match profile {
+        ToolProfile::Full => return get_all_tools(),
+        ToolProfile::Navigate => &[
+            "read_project_index",
+            "generate_project_index",
+            "read_file",
+            "enhanced_grep",
+            "rust_project_snapshot",
+            "cargo_metadata",
+        ],
+        ToolProfile::Edit => &["read_file", "edit_file", "create_file"],
+        ToolProfile::Build => &[
+            "run_cargo",
+            "cargo_metadata",
+            "rust_project_snapshot",
+            "rust_lsp_query",
+            "read_file",
+        ],
+        ToolProfile::None => &[],
+    };
+
+    get_all_tools()
+        .into_iter()
+        .filter(|tool| names.contains(&tool.function.name.as_str()))
+        .collect()
+}
+
 /// Get all available tools for function calling
 pub fn get_all_tools() -> Vec<Tool> {
     vec![

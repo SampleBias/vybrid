@@ -21,7 +21,7 @@ use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
 use crate::lsp::RustLspManager;
 use crate::project_docs::ProjectDocs;
-use crate::tools::definitions::get_all_tools;
+use crate::tools::definitions::{get_all_tools, get_tools_for_profile, ToolProfile};
 use crate::tools::executor::{execute_tool_with_context, ToolRuntime};
 
 #[tokio::main]
@@ -237,22 +237,22 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         let user_message_with_context = inject_project_docs(input, &project_docs);
         conversation.add_user_message(&user_message_with_context);
 
-        let tools = get_all_tools();
-
         // Process with AI
         let spinner_label = llm_spinner_label(config.llm_provider);
-        let mut rate_limit_fallback = RateLimitFallbackState::new(
+        let mut route_state = RouteState::new(
             matches!(config.llm_provider, LlmProvider::Groq),
             config.groq_rate_limit_fallback_model.clone(),
+            config.groq_compound_model.clone(),
+            config.groq_compound_mini_model.clone(),
+            config.compound_enabled,
         );
         if let Err(e) = process_ai_response(
             c,
             &mut conversation,
-            &tools,
             &tool_runtime,
             0,
             spinner_label,
-            &mut rate_limit_fallback,
+            &mut route_state,
             config.context_token_budget,
             config.retry_context_token_budget,
         )
@@ -274,43 +274,99 @@ fn llm_spinner_label(provider: LlmProvider) -> &'static str {
     }
 }
 
-struct RateLimitFallbackState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteMode {
+    Primary,
+    Fallback,
+    Compound,
+    CompoundMini,
+}
+
+struct RouteState {
     enabled: bool,
     waits: u32,
     fallback_model: String,
-    using_fallback: bool,
+    compound_model: String,
+    compound_mini_model: String,
+    compound_enabled: bool,
+    mode: RouteMode,
 }
 
-impl RateLimitFallbackState {
-    fn new(enabled: bool, fallback_model: String) -> Self {
+impl RouteState {
+    fn new(
+        enabled: bool,
+        fallback_model: String,
+        compound_model: String,
+        compound_mini_model: String,
+        compound_enabled: bool,
+    ) -> Self {
         Self {
             enabled,
             waits: 0,
             fallback_model,
-            using_fallback: false,
+            compound_model,
+            compound_mini_model,
+            compound_enabled,
+            mode: RouteMode::Primary,
         }
     }
 
     fn client_for_request(&self, primary: &GroqClient) -> GroqClient {
-        if self.enabled && self.using_fallback {
-            primary.with_model(self.fallback_model.clone())
-        } else {
-            primary.clone()
+        if !self.enabled {
+            return primary.clone();
+        }
+        match self.mode {
+            RouteMode::Primary => primary.clone(),
+            RouteMode::Fallback => primary.with_model(self.fallback_model.clone()),
+            RouteMode::Compound => primary.with_model(self.compound_model.clone()),
+            RouteMode::CompoundMini => primary.with_model(self.compound_mini_model.clone()),
+        }
+    }
+
+    fn tools_for_request(&self, profile: ToolProfile) -> Option<Vec<crate::client::groq::Tool>> {
+        match self.mode {
+            RouteMode::Compound | RouteMode::CompoundMini => None,
+            _ => Some(get_tools_for_profile(profile)),
         }
     }
 
     fn record_rate_limit_wait(&mut self) -> bool {
         self.waits += 1;
-        if self.enabled && !self.using_fallback && self.waits >= 2 {
-            self.using_fallback = true;
-            true
-        } else {
-            false
+        if !self.enabled {
+            return false;
+        }
+        self.advance_route()
+    }
+
+    fn route_preflight_wait(&mut self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.advance_route()
+    }
+
+    fn advance_route(&mut self) -> bool {
+        let next = match self.mode {
+            RouteMode::Primary => RouteMode::Fallback,
+            RouteMode::Fallback if self.compound_enabled => RouteMode::Compound,
+            RouteMode::Compound if self.compound_enabled => RouteMode::CompoundMini,
+            _ => return false,
+        };
+        self.mode = next;
+        true
+    }
+
+    fn route_label(&self, primary: &GroqClient) -> String {
+        match self.mode {
+            RouteMode::Primary => primary.model().to_string(),
+            RouteMode::Fallback => self.fallback_model.clone(),
+            RouteMode::Compound => self.compound_model.clone(),
+            RouteMode::CompoundMini => self.compound_mini_model.clone(),
         }
     }
 
-    fn fallback_model(&self) -> &str {
-        &self.fallback_model
+    fn is_compound(&self) -> bool {
+        matches!(self.mode, RouteMode::Compound | RouteMode::CompoundMini)
     }
 }
 
@@ -355,6 +411,10 @@ fn is_rate_limit_error(e: &anyhow::Error) -> bool {
     s.contains("429 Too Many Requests")
         || s.contains("rate_limit_exceeded")
         || s.contains("Rate limit reached")
+}
+
+fn is_preflight_route_error(e: &anyhow::Error) -> bool {
+    e.to_string().contains("preflight_route_required")
 }
 
 fn parse_retry_after_seconds(message: &str) -> Option<f64> {
@@ -457,15 +517,22 @@ fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) ->
     }
 }
 
+fn tool_profile_for_round(depth: u32) -> ToolProfile {
+    match depth {
+        0 => ToolProfile::Navigate,
+        1 | 2 => ToolProfile::Full,
+        _ => ToolProfile::Edit,
+    }
+}
+
 /// Process AI response with streaming and tool calls
 async fn process_ai_response(
     client: &GroqClient,
     conversation: &mut Conversation,
-    tools: &[crate::client::groq::Tool],
     tool_runtime: &ToolRuntime,
     depth: u32,
     spinner_label: &'static str,
-    rate_limit_fallback: &mut RateLimitFallbackState,
+    route_state: &mut RouteState,
     context_token_budget: u32,
     retry_context_token_budget: u32,
 ) -> Result<()> {
@@ -500,23 +567,39 @@ async fn process_ai_response(
         first_chunk = true;
 
         let request_budget = match attempt {
-            1 => context_token_budget,
+            1 if route_state.mode == RouteMode::Primary => context_token_budget,
             _ => retry_context_token_budget,
         };
         let request_messages = conversation.messages_for_request_with_budget(request_budget);
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
-        let request_client = rate_limit_fallback.client_for_request(client);
+        let request_client = route_state.client_for_request(client);
+        let tool_profile = tool_profile_for_round(depth);
+        let request_tools = route_state.tools_for_request(tool_profile);
         let stream = request_client
-            .chat_stream(request_messages, Some(tools.to_vec()))
+            .chat_stream(request_messages, request_tools)
             .await;
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 spinner.finish().await;
+                if is_preflight_route_error(&e) {
+                    if route_state.route_preflight_wait() {
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Groq preflight would wait; routing next request to {} with compacted context...",
+                                route_state.route_label(client)
+                            ))
+                            .yellow()
+                        );
+                        continue 'stream;
+                    }
+                    return Err(e);
+                }
                 if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) {
                     let delay = rate_limit_retry_delay(&e);
-                    let switching_to_fallback = rate_limit_fallback.record_rate_limit_wait();
+                    let switched_route = route_state.record_rate_limit_wait();
                     if !rate_limit_note_added {
                         conversation.add_user_message(&rate_limit_resume_prompt(
                             attempt,
@@ -536,15 +619,16 @@ async fn process_ai_response(
                         ))
                         .yellow()
                     );
-                    if switching_to_fallback {
+                    if switched_route {
                         println!(
                             "{}",
                             style(format!(
-                                "Primary Groq model is still rate limited; using {} for this response.",
-                                rate_limit_fallback.fallback_model()
+                                "Primary Groq route is rate limited; using {} for this response.",
+                                route_state.route_label(client)
                             ))
                             .yellow()
                         );
+                        continue 'stream;
                     }
                     let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
                     tokio::time::sleep(delay).await;
@@ -643,7 +727,7 @@ async fn process_ai_response(
                     {
                         spinner.finish().await;
                         let delay = rate_limit_retry_delay(&e);
-                        let switching_to_fallback = rate_limit_fallback.record_rate_limit_wait();
+                        let switched_route = route_state.record_rate_limit_wait();
                         if !rate_limit_note_added {
                             conversation.add_user_message(&rate_limit_resume_prompt(
                                 attempt,
@@ -659,15 +743,16 @@ async fn process_ai_response(
                             ))
                             .yellow()
                         );
-                        if switching_to_fallback {
+                        if switched_route {
                             println!(
                                 "{}",
                                 style(format!(
-                                    "Primary Groq model is still rate limited; using {} for this response.",
-                                    rate_limit_fallback.fallback_model()
+                                    "Primary Groq route is still rate limited; using {} for this response.",
+                                    route_state.route_label(client)
                                 ))
                                 .yellow()
                             );
+                            continue 'stream;
                         }
                         let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
                         tokio::time::sleep(delay).await;
@@ -727,6 +812,24 @@ async fn process_ai_response(
 
     // Execute tool calls if any
     if !tool_calls.is_empty() {
+        if route_state.is_compound() {
+            conversation.add_user_message(
+                "[Vybrid] Compound returned tool calls, but local tool execution is disabled for Compound routes. Continue by summarizing the intended next local action for OSS/Qwen.",
+            );
+            route_state.mode = RouteMode::Fallback;
+            Box::pin(process_ai_response(
+                client,
+                conversation,
+                tool_runtime,
+                depth + 1,
+                spinner_label,
+                route_state,
+                context_token_budget,
+                retry_context_token_budget,
+            ))
+            .await?;
+            return Ok(());
+        }
         ui::print_tool_execution(tool_calls.len());
 
         for tool_call in &tool_calls {
@@ -762,9 +865,12 @@ async fn process_ai_response(
                 }
             }
 
-            // Add tool result to conversation
+            // Add compacted tool result to conversation. The terminal still shows previews, but
+            // the model should not carry large repeated tool payloads across every follow-up turn.
             let result_str = result.unwrap_or_else(|e| format!("Error: {}", e));
-            conversation.add_tool_result(&tool_call.id, &result_str);
+            let history_result =
+                compact_tool_result_for_history(&tool_call.function.name, &result_str, depth);
+            conversation.add_tool_result(&tool_call.id, &history_result);
         }
 
         // Get follow-up response (next round shows its own spinner)
@@ -772,11 +878,10 @@ async fn process_ai_response(
         Box::pin(process_ai_response(
             client,
             conversation,
-            tools,
             tool_runtime,
             depth + 1,
             spinner_label,
-            rate_limit_fallback,
+            route_state,
             context_token_budget,
             retry_context_token_budget,
         ))
@@ -784,6 +889,41 @@ async fn process_ai_response(
     }
 
     Ok(())
+}
+
+fn compact_tool_result_for_history(tool_name: &str, result: &str, depth: u32) -> String {
+    let max_chars = match tool_name {
+        "read_file" => 12_000,
+        "read_multiple_files" => 10_000,
+        "enhanced_grep" => 8_000,
+        "run_cargo" => 16_000,
+        "execute_bash_command" => 10_000,
+        _ => 8_000,
+    };
+    let max_chars = if depth >= 2 {
+        (max_chars / 2).max(4_000)
+    } else {
+        max_chars
+    };
+
+    if result.chars().count() <= max_chars {
+        return result.to_string();
+    }
+
+    let head: String = result.chars().take(max_chars / 2).collect();
+    let tail: String = result
+        .chars()
+        .rev()
+        .take(max_chars / 2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!(
+        "[Vybrid compacted `{tool_name}` result for history: original {} chars, kept {} chars. Re-read a narrower range if exact omitted content is needed.]\n\n{head}\n\n[... omitted middle ...]\n\n{tail}",
+        result.chars().count(),
+        max_chars
+    )
 }
 
 /// Inject project documentation context into user message

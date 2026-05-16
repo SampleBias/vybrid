@@ -13,6 +13,8 @@ pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
+pub const DEFAULT_GROQ_COMPOUND_MODEL: &str = "groq/compound";
+pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
 pub const DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 pub const DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET: u32 = 18_000;
 pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4_096;
@@ -62,6 +64,9 @@ pub struct Config {
     pub groq_api_key: Option<String>,
     pub groq_model: String,
     pub groq_rate_limit_fallback_model: String,
+    pub groq_compound_model: String,
+    pub groq_compound_mini_model: String,
+    pub compound_enabled: bool,
     pub lm_studio_base_url: String,
     pub lm_studio_api_key: Option<String>,
     pub lm_studio_model: Option<String>,
@@ -118,6 +123,20 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL.to_string());
+        let groq_compound_model = std::env::var("GROQ_COMPOUND_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROQ_COMPOUND_MODEL.to_string());
+        let groq_compound_mini_model = std::env::var("GROQ_COMPOUND_MINI_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROQ_COMPOUND_MINI_MODEL.to_string());
+        let compound_enabled = std::env::var("VYBRID_ENABLE_COMPOUND")
+            .ok()
+            .map(|s| parse_bool_env(&s))
+            .unwrap_or(true);
 
         let lm_studio_base_url = std::env::var("LM_STUDIO_BASE_URL")
             .ok()
@@ -167,6 +186,9 @@ impl Config {
             groq_api_key,
             groq_model,
             groq_rate_limit_fallback_model,
+            groq_compound_model,
+            groq_compound_mini_model,
+            compound_enabled,
             lm_studio_base_url,
             lm_studio_api_key,
             lm_studio_model,
