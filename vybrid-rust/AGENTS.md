@@ -495,6 +495,19 @@ Vybrid uses a skeptical three-layer memory system to keep active context small:
 
 Memory is intentionally non-authoritative. Before relying on remembered paths, symbols, commands, dependencies, or behavior, verify against live project state with `read_file`, `enhanced_grep`, `rust_project_snapshot`, `cargo_metadata`, compiler output, or another direct tool.
 
+### autoDream Consolidation
+
+When a CLI session ends, Vybrid marks that session complete and may run autoDream consolidation. Three gates must pass before it writes anything: at least 24 hours since the previous run, at least 5 completed sessions since that run, and an exclusive `.vybrid/memory/autodream.lock` must be acquired.
+
+autoDream runs four bounded phases:
+
+1. **Orient**: scan `.vybrid/memory` for existing index/topic size.
+2. **Gather**: extract compact signals from raw transcripts for completed sessions.
+3. **Consolidate**: write `.vybrid/memory/topics/autodream.md` and add a pointer to `MEMORY.md`.
+4. **Prune**: keep generated memory within the 200-line and 25KB budget.
+
+The consolidation pass reads project memory and transcripts, and only writes memory artifacts. It does not resume old conversations or inject raw transcript content into active context.
+
 ### Example: Adding Bevy Framework Documentation
 
 ```bash

@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use regex::RegexBuilder;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -17,6 +18,63 @@ const MAX_TOPIC_CHARS: usize = 16_000;
 const MAX_TRANSCRIPT_MATCHES: usize = 20;
 const MAX_TRANSCRIPT_CONTEXT_LINES: usize = 2;
 const MAX_TRANSCRIPT_LINE_CHARS: usize = 2_000;
+const AUTODREAM_MIN_SESSIONS: usize = 5;
+const AUTODREAM_MIN_INTERVAL_HOURS: i64 = 24;
+const AUTODREAM_MAX_LINES: usize = 200;
+const AUTODREAM_MAX_BYTES: usize = 25 * 1024;
+const AUTODREAM_TOPIC: &str = "autodream";
+const AUTODREAM_TOPIC_FILE: &str = "autodream.md";
+const AUTODREAM_INDEX_POINTER: &str =
+    "- autoDream: topics/autodream.md — consolidated recent sessions; verify details before use.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoDreamOutcome {
+    Consolidated {
+        sessions: usize,
+        topics: usize,
+        transcript_matches: usize,
+    },
+    Skipped(AutoDreamSkipReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoDreamSkipReason {
+    RanRecently,
+    NotEnoughSessions,
+    Locked,
+    NoNewTranscriptData,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AutoDreamState {
+    last_run: Option<String>,
+    sessions_since_last_run: Vec<String>,
+}
+
+struct AutoDreamLock {
+    path: PathBuf,
+}
+
+impl Drop for AutoDreamLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug)]
+struct Orientation {
+    topic_count: usize,
+    total_lines: usize,
+    total_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct GatheredMemory {
+    user_requests: Vec<String>,
+    tool_names: Vec<String>,
+    paths: Vec<String>,
+    transcript_matches: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct MemoryStore {
@@ -65,6 +123,77 @@ impl MemoryStore {
     pub fn transcript_path(&self) -> PathBuf {
         self.transcript_dir()
             .join(format!("{}.jsonl", self.session_id))
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn auto_dream_state_path(&self) -> PathBuf {
+        self.memory_dir.join("autodream_state.json")
+    }
+
+    pub fn auto_dream_lock_path(&self) -> PathBuf {
+        self.memory_dir.join("autodream.lock")
+    }
+
+    pub fn complete_session_and_autodream(&self) -> Result<AutoDreamOutcome> {
+        self.record_session_completed()?;
+        self.run_autodream_if_due()
+    }
+
+    fn record_session_completed(&self) -> Result<()> {
+        let mut state = self.load_autodream_state()?;
+        if !state
+            .sessions_since_last_run
+            .iter()
+            .any(|id| id == &self.session_id)
+        {
+            state.sessions_since_last_run.push(self.session_id.clone());
+            self.save_autodream_state(&state)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_autodream_if_due(&self) -> Result<AutoDreamOutcome> {
+        let mut state = self.load_autodream_state()?;
+        if !autodream_interval_elapsed(&state) {
+            return Ok(AutoDreamOutcome::Skipped(AutoDreamSkipReason::RanRecently));
+        }
+        if state.sessions_since_last_run.len() < AUTODREAM_MIN_SESSIONS {
+            return Ok(AutoDreamOutcome::Skipped(
+                AutoDreamSkipReason::NotEnoughSessions,
+            ));
+        }
+
+        let Some(_lock) = self.try_acquire_autodream_lock()? else {
+            return Ok(AutoDreamOutcome::Skipped(AutoDreamSkipReason::Locked));
+        };
+
+        let orientation = self.orient_memory()?;
+        let gathered = self.gather_transcript_memory(&state.sessions_since_last_run)?;
+        if gathered.transcript_matches == 0 {
+            state.sessions_since_last_run.clear();
+            state.last_run = Some(Utc::now().to_rfc3339());
+            self.save_autodream_state(&state)?;
+            return Ok(AutoDreamOutcome::Skipped(
+                AutoDreamSkipReason::NoNewTranscriptData,
+            ));
+        }
+
+        self.consolidate_memory_topic(&orientation, &gathered)?;
+        self.prune_memory_budget()?;
+
+        let sessions = state.sessions_since_last_run.len();
+        state.sessions_since_last_run.clear();
+        state.last_run = Some(Utc::now().to_rfc3339());
+        self.save_autodream_state(&state)?;
+
+        Ok(AutoDreamOutcome::Consolidated {
+            sessions,
+            topics: orientation.topic_count,
+            transcript_matches: gathered.transcript_matches,
+        })
     }
 
     pub fn read_core_index(&self) -> Result<Option<String>> {
@@ -263,6 +392,224 @@ impl MemoryStore {
         }
     }
 
+    fn load_autodream_state(&self) -> Result<AutoDreamState> {
+        let path = self.auto_dream_state_path();
+        if !path.exists() {
+            return Ok(AutoDreamState::default());
+        }
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read autoDream state {}", path.display()))?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse autoDream state {}", path.display()))
+    }
+
+    fn save_autodream_state(&self, state: &AutoDreamState) -> Result<()> {
+        let path = self.auto_dream_state_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create memory dir {}", parent.display()))?;
+        }
+        let content = serde_json::to_string_pretty(state)?;
+        fs::write(&path, content + "\n")
+            .with_context(|| format!("Failed to write autoDream state {}", path.display()))?;
+        Ok(())
+    }
+
+    fn try_acquire_autodream_lock(&self) -> Result<Option<AutoDreamLock>> {
+        let path = self.auto_dream_lock_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create memory dir {}", parent.display()))?;
+        }
+
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match lock {
+            Ok(mut file) => {
+                use std::io::Write;
+                writeln!(file, "pid={}", std::process::id()).with_context(|| {
+                    format!("Failed to write autoDream lock {}", path.display())
+                })?;
+                Ok(Some(AutoDreamLock { path }))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e)
+                .with_context(|| format!("Failed to create autoDream lock {}", path.display())),
+        }
+    }
+
+    fn orient_memory(&self) -> Result<Orientation> {
+        let mut topic_count = 0usize;
+        let mut total_lines = 0usize;
+        let mut total_bytes = 0usize;
+
+        for path in self.memory_files()? {
+            if path
+                .strip_prefix(self.topics_dir())
+                .map(|_| true)
+                .unwrap_or(false)
+            {
+                topic_count += 1;
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to inspect memory file {}", path.display()))?;
+            total_lines += content.lines().count();
+            total_bytes += content.len();
+        }
+
+        Ok(Orientation {
+            topic_count,
+            total_lines,
+            total_bytes,
+        })
+    }
+
+    fn gather_transcript_memory(&self, session_ids: &[String]) -> Result<GatheredMemory> {
+        let mut gathered = GatheredMemory::default();
+        for session_id in session_ids {
+            let path = self.transcript_dir().join(format!("{session_id}.jsonl"));
+            if !path.exists() {
+                continue;
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to gather transcript {}", path.display()))?;
+            for line in content.lines() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let role = value["role"].as_str().unwrap_or("");
+                let content = value["content"].as_str().unwrap_or("").trim();
+                if role == "user" && !content.is_empty() {
+                    push_unique_capped(
+                        &mut gathered.user_requests,
+                        first_user_request_line(content),
+                        120,
+                        20,
+                    );
+                    for path in extract_path_mentions(content) {
+                        push_unique_capped(&mut gathered.paths, &path, 120, 30);
+                    }
+                    gathered.transcript_matches += 1;
+                }
+                if let Some(tool_calls) = value["tool_calls"].as_array() {
+                    for tool_call in tool_calls {
+                        if let Some(name) = tool_call["function"]["name"].as_str() {
+                            push_unique_capped(&mut gathered.tool_names, name, 80, 20);
+                            gathered.transcript_matches += 1;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(gathered)
+    }
+
+    fn consolidate_memory_topic(
+        &self,
+        orientation: &Orientation,
+        gathered: &GatheredMemory,
+    ) -> Result<()> {
+        fs::create_dir_all(self.topics_dir()).with_context(|| {
+            format!(
+                "Failed to create topics dir {}",
+                self.topics_dir().display()
+            )
+        })?;
+
+        let mut topic = String::new();
+        topic.push_str("# autoDream Consolidated Memory\n\n");
+        topic.push_str(&format!(
+            "Generated: {}\n\n",
+            Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+        ));
+        topic.push_str("Memory is skeptical: verify these observations against live files, tools, and compiler output before acting.\n\n");
+        topic.push_str(&format!(
+            "Orient: saw {} topic file(s), {} memory line(s), {} memory byte(s) before consolidation.\n\n",
+            orientation.topic_count, orientation.total_lines, orientation.total_bytes
+        ));
+        topic.push_str("## Recent User Requests\n");
+        append_bullets(&mut topic, &gathered.user_requests);
+        topic.push_str("\n## Tool Activity\n");
+        append_bullets(&mut topic, &gathered.tool_names);
+        topic.push_str("\n## Mentioned Paths\n");
+        append_bullets(&mut topic, &gathered.paths);
+
+        fs::write(self.topics_dir().join(AUTODREAM_TOPIC_FILE), topic)
+            .with_context(|| "Failed to write autoDream memory topic")?;
+        self.upsert_autodream_index_pointer()?;
+        Ok(())
+    }
+
+    fn upsert_autodream_index_pointer(&self) -> Result<()> {
+        let path = self.core_index_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create memory dir {}", parent.display()))?;
+        }
+
+        let existing = if path.exists() {
+            fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read memory index {}", path.display()))?
+        } else {
+            String::new()
+        };
+        let mut lines: Vec<String> = existing
+            .lines()
+            .filter(|line| !line.contains("topics/autodream.md"))
+            .map(str::to_string)
+            .collect();
+        lines.push(AUTODREAM_INDEX_POINTER.to_string());
+        fs::write(&path, lines.join("\n") + "\n")
+            .with_context(|| format!("Failed to write memory index {}", path.display()))?;
+        Ok(())
+    }
+
+    fn prune_memory_budget(&self) -> Result<()> {
+        prune_file_lines_and_bytes(
+            &self.core_index_path(),
+            AUTODREAM_MAX_LINES,
+            AUTODREAM_MAX_BYTES,
+        )?;
+
+        let autodream_path = self.topics_dir().join(AUTODREAM_TOPIC_FILE);
+        let other = self
+            .memory_files()?
+            .into_iter()
+            .filter(|path| path != &autodream_path)
+            .try_fold((0usize, 0usize), |(lines, bytes), path| -> Result<_> {
+                let content = fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to inspect memory file {}", path.display()))?;
+                Ok((lines + content.lines().count(), bytes + content.len()))
+            })?;
+
+        let remaining_lines = AUTODREAM_MAX_LINES.saturating_sub(other.0).max(1);
+        let remaining_bytes = AUTODREAM_MAX_BYTES.saturating_sub(other.1).max(256);
+        prune_file_lines_and_bytes(&autodream_path, remaining_lines, remaining_bytes)?;
+        Ok(())
+    }
+
+    fn memory_files(&self) -> Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        let index = self.core_index_path();
+        if index.exists() {
+            files.push(index);
+        }
+        let topics_dir = self.topics_dir();
+        if topics_dir.exists() {
+            for entry in fs::read_dir(&topics_dir)
+                .with_context(|| format!("Failed to read topics dir {}", topics_dir.display()))?
+            {
+                let path = entry?.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    files.push(path);
+                }
+            }
+        }
+        Ok(files)
+    }
+
     fn topic_path(&self, topic: &str) -> Result<PathBuf> {
         let topic = topic.trim().trim_end_matches(".md");
         if topic.is_empty() {
@@ -312,6 +659,106 @@ fn transcript_files(dir: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+fn autodream_interval_elapsed(state: &AutoDreamState) -> bool {
+    let Some(last_run) = state.last_run.as_deref() else {
+        return true;
+    };
+    let Ok(last_run) = DateTime::parse_from_rfc3339(last_run) else {
+        return true;
+    };
+    Utc::now().signed_duration_since(last_run.with_timezone(&Utc))
+        >= Duration::hours(AUTODREAM_MIN_INTERVAL_HOURS)
+}
+
+fn first_user_request_line(content: &str) -> &str {
+    content
+        .split("\n\n---\n\n")
+        .next()
+        .unwrap_or(content)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(content)
+        .trim()
+}
+
+fn extract_path_mentions(content: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for token in content.split_whitespace() {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '"' | '\'' | '`' | ',' | '.' | ':' | ';' | ')' | '(' | '[' | ']'
+            )
+        });
+        if token.contains('/')
+            || token.ends_with(".rs")
+            || token.ends_with(".toml")
+            || token.ends_with(".md")
+            || token.ends_with(".json")
+        {
+            push_unique_capped(&mut paths, token, 120, 30);
+        }
+    }
+    paths
+}
+
+fn push_unique_capped(items: &mut Vec<String>, value: &str, max_chars: usize, max_items: usize) {
+    let value = value.trim();
+    if value.is_empty() || items.len() >= max_items {
+        return;
+    }
+    let capped = cap_chars(value, max_chars);
+    if !items.iter().any(|item| item == &capped) {
+        items.push(capped);
+    }
+}
+
+fn append_bullets(out: &mut String, items: &[String]) {
+    if items.is_empty() {
+        out.push_str("- No durable observations gathered.\n");
+        return;
+    }
+    for item in items {
+        out.push_str("- ");
+        out.push_str(item);
+        out.push('\n');
+    }
+}
+
+fn prune_file_lines_and_bytes(path: &Path, max_lines: usize, max_bytes: usize) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read memory file {}", path.display()))?;
+    if content.lines().count() <= max_lines && content.len() <= max_bytes {
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    for line in content.lines().take(max_lines) {
+        let next = if out.is_empty() {
+            line.to_string()
+        } else {
+            format!("\n{line}")
+        };
+        if out.len() + next.len() > max_bytes {
+            break;
+        }
+        out.push_str(&next);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("[autoDream pruned older memory to stay under budget.]\n");
+    if out.len() > max_bytes {
+        out.truncate(max_bytes);
+    }
+    fs::write(path, out)
+        .with_context(|| format!("Failed to prune memory file {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -391,5 +838,122 @@ mod tests {
         assert!(result.contains("verify against the live codebase"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn autodream_waits_for_five_completed_sessions_then_consolidates() {
+        let root = temp_root("autodream");
+        let messages = root.join("messages");
+
+        for idx in 0..4 {
+            let store = MemoryStore::with_project_root(&root, &messages, format!("session-{idx}"));
+            append_user_transcript(&store, &format!("Inspect src/lib.rs for session {idx}"));
+            let outcome = store.complete_session_and_autodream().unwrap();
+            assert_eq!(
+                outcome,
+                AutoDreamOutcome::Skipped(AutoDreamSkipReason::NotEnoughSessions)
+            );
+        }
+
+        let store = MemoryStore::with_project_root(&root, &messages, "session-4");
+        append_user_transcript(&store, "Update Cargo.toml and run cargo test");
+        let outcome = store.complete_session_and_autodream().unwrap();
+
+        assert!(matches!(
+            outcome,
+            AutoDreamOutcome::Consolidated {
+                sessions: 5,
+                transcript_matches: 5,
+                ..
+            }
+        ));
+        assert!(store
+            .read_topic(AUTODREAM_TOPIC)
+            .unwrap()
+            .contains("Recent User Requests"));
+        assert!(store
+            .read_core_index()
+            .unwrap()
+            .unwrap()
+            .contains("topics/autodream.md"));
+        let state = store.load_autodream_state().unwrap();
+        assert!(state.sessions_since_last_run.is_empty());
+        assert!(state.last_run.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn autodream_respects_recent_run_gate() {
+        let root = temp_root("autodream-recent");
+        let store = MemoryStore::with_project_root(&root, root.join("messages"), "session");
+        store
+            .save_autodream_state(&AutoDreamState {
+                last_run: Some(Utc::now().to_rfc3339()),
+                sessions_since_last_run: (0..5).map(|idx| format!("session-{idx}")).collect(),
+            })
+            .unwrap();
+
+        let outcome = store.run_autodream_if_due().unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoDreamOutcome::Skipped(AutoDreamSkipReason::RanRecently)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn autodream_respects_lock_gate() {
+        let root = temp_root("autodream-lock");
+        let store = MemoryStore::with_project_root(&root, root.join("messages"), "session");
+        fs::create_dir_all(store.auto_dream_lock_path().parent().unwrap()).unwrap();
+        fs::write(store.auto_dream_lock_path(), "locked").unwrap();
+        store
+            .save_autodream_state(&AutoDreamState {
+                last_run: None,
+                sessions_since_last_run: (0..5).map(|idx| format!("session-{idx}")).collect(),
+            })
+            .unwrap();
+
+        let outcome = store.run_autodream_if_due().unwrap();
+
+        assert_eq!(
+            outcome,
+            AutoDreamOutcome::Skipped(AutoDreamSkipReason::Locked)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_file_keeps_lines_and_bytes_bounded() {
+        let root = temp_root("autodream-prune");
+        let path = root.join("memory.md");
+        fs::write(
+            &path,
+            (0..500).map(|i| format!("line {i}\n")).collect::<String>(),
+        )
+        .unwrap();
+
+        prune_file_lines_and_bytes(&path, 20, 200).unwrap();
+
+        let pruned = fs::read_to_string(&path).unwrap();
+        assert!(pruned.lines().count() <= 21);
+        assert!(pruned.len() <= 200);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn append_user_transcript(store: &MemoryStore, content: &str) {
+        store
+            .append_transcript_message(&Message {
+                role: "user".to_string(),
+                content: Some(content.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .unwrap();
     }
 }

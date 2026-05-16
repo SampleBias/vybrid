@@ -21,7 +21,7 @@ use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
 use crate::lsp::RustLspManager;
-use crate::memory::MemoryStore;
+use crate::memory::{AutoDreamOutcome, MemoryStore};
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::{get_all_tools, get_tools_for_profile, ToolProfile};
 use crate::tools::executor::{execute_tool_with_context, ToolRuntime};
@@ -269,6 +269,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         println!();
     }
 
+    run_autodream_idle_consolidation(&memory_store);
+
     Ok(())
 }
 
@@ -276,6 +278,26 @@ fn llm_spinner_label(provider: LlmProvider) -> &'static str {
     match provider {
         LlmProvider::Groq => "groq",
         LlmProvider::LmStudio => "local",
+    }
+}
+
+fn run_autodream_idle_consolidation(memory_store: &MemoryStore) {
+    match memory_store.complete_session_and_autodream() {
+        Ok(AutoDreamOutcome::Consolidated {
+            sessions,
+            transcript_matches,
+            ..
+        }) => {
+            println!(
+                "{}",
+                style(format!(
+                    "autoDream consolidated memory from {sessions} completed session(s), using {transcript_matches} transcript signal(s)."
+                ))
+                .dim()
+            );
+        }
+        Ok(AutoDreamOutcome::Skipped(_)) => {}
+        Err(e) => eprintln!("{}", style(format!("autoDream warning: {e}")).dim()),
     }
 }
 
@@ -1188,6 +1210,7 @@ SKEPTICAL MEMORY POLICY:
 2. Read memory topics only when the index suggests they are relevant to the current task.
 3. Search raw transcripts only for specific identifiers, file paths, symbols, or error codes; never load or summarize transcripts wholesale.
 4. Before acting on remembered paths, symbols, commands, dependencies, or behavior, verify them against live project tools such as `read_file`, `enhanced_grep`, `rust_project_snapshot`, `cargo_metadata`, or compiler output.
+5. autoDream may consolidate completed-session transcripts into `topics/autodream.md` after idle gates pass; treat that topic as a compressed hint layer and verify it like any other memory.
 
 RUST CARGO QUICK REFERENCE:
 {}
