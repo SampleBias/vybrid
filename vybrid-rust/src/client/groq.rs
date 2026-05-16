@@ -9,13 +9,20 @@ use std::pin::Pin;
 
 /// Shorten repetitive Groq tool-schema validation messages for the terminal.
 fn simplify_tool_validation_message(msg: &str) -> String {
-    if !msg.contains("did not match schema") && !msg.contains("tool call validation") {
+    if !msg.contains("did not match schema")
+        && !msg.contains("tool call validation")
+        && !msg.contains("failed_generation")
+        && !msg.contains("Failed to call a function")
+    {
         return msg.to_string();
     }
     // Groq sometimes echoes the same phrase twice and lists every failed schema branch.
     let one_line: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.len() <= 280 {
         return one_line;
+    }
+    if one_line.contains("failed_generation") || one_line.contains("Failed to call a function") {
+        return "Failed to call a function. See 'failed_generation' for more details.".to_string();
     }
     if let Some(idx) = one_line.find("parameters for tool") {
         let tail: String = one_line[idx..].chars().take(140).collect();
@@ -36,6 +43,9 @@ fn stream_api_error_user_message(body: &Value) -> String {
     let msg = simplify_tool_validation_message(raw_msg);
     let code = err.get("code").and_then(|c| c.as_str());
     let hint = match code {
+        Some("failed_generation") => {
+            " Retry with smaller tool calls: inspect first, split edits into smaller `edit_file`/`create_file` calls, or describe a large patch as text instead of emitting one huge function call."
+        }
         Some("tool_use_failed") => {
             if msg.contains("enhanced_grep") || raw_msg.contains("enhanced_grep") {
                 " For `enhanced_grep`, send `pattern` plus `file_paths` and/or `file_path` and/or `path`. For huge payloads, use a narrower scope or paste results as text."

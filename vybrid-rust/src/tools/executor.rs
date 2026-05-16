@@ -59,18 +59,31 @@ pub async fn execute_tool_with_context(
         }
 
         "create_multiple_files" => {
-            let files: Vec<(String, String)> = args["files"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|f| {
-                            let path = f["path"].as_str()?.to_string();
-                            let content = f["content"].as_str()?.to_string();
-                            Some((path, content))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let Some(files_array) = args["files"].as_array() else {
+                return Err(anyhow!(
+                    "create_multiple_files: missing files array — provide [{{\"path\":\"...\",\"content\":\"...\"}}]. For large or multiline content, use smaller create_file calls."
+                ));
+            };
+            if files_array.is_empty() {
+                return Err(anyhow!(
+                    "create_multiple_files: files array was empty — provide at least one file object"
+                ));
+            }
+            let mut files: Vec<(String, String)> = Vec::new();
+            for (idx, f) in files_array.iter().enumerate() {
+                let path = f["path"].as_str().unwrap_or("").trim();
+                if path.is_empty() {
+                    return Err(anyhow!(
+                        "create_multiple_files: files[{idx}] is missing path"
+                    ));
+                }
+                let Some(content) = f["content"].as_str() else {
+                    return Err(anyhow!(
+                        "create_multiple_files: files[{idx}] is missing content"
+                    ));
+                };
+                files.push((path.to_string(), content.to_string()));
+            }
             file_ops::create_multiple_files(&files)
         }
 
@@ -112,6 +125,11 @@ pub async fn execute_tool_with_context(
 
         "run_cargo" => {
             let subcommand = args["subcommand"].as_str().unwrap_or("");
+            if subcommand.trim().is_empty() {
+                return Err(anyhow!(
+                    "run_cargo: missing subcommand — provide check, build, test, clippy, fmt, doc, run, or another Cargo subcommand"
+                ));
+            }
             let release = args["release"].as_bool().unwrap_or(false);
             let package = args["package"].as_str();
             let manifest_path = args["manifest_path"].as_str();

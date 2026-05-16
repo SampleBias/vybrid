@@ -70,7 +70,7 @@ pub fn get_all_tools() -> Vec<Tool> {
             tool_type: "function".to_string(),
             function: FunctionDef {
                 name: "create_multiple_files".to_string(),
-                description: "Create multiple files at once".to_string(),
+                description: "Create multiple files at once. Provide `files` as an array of objects with `path` and `content`. For large or multiline content, prefer separate smaller `create_file` calls.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -82,12 +82,12 @@ pub fn get_all_tools() -> Vec<Tool> {
                                     "path": { "type": "string" },
                                     "content": { "type": "string" }
                                 },
-                                "required": ["path", "content"]
+                                "description": "One file to create. Provide both `path` and `content`; missing fields are rejected when the tool runs."
                             },
                             "description": "Array of files to create with their paths and content"
                         }
                     },
-                    "required": ["files"]
+                    "description": "Provide `files` with `path` and `content` for each item. The schema is intentionally loose so provider validation does not fail before Vybrid can return a recoverable tool error."
                 }),
             },
         },
@@ -178,7 +178,7 @@ pub fn get_all_tools() -> Vec<Tool> {
                             "description": "Directory to run cargo in (optional; defaults to current directory)"
                         }
                     },
-                    "required": ["subcommand"]
+                    "description": "Provide `subcommand`; missing values are rejected when the tool runs so the model can recover with a simpler call."
                 }),
             },
         },

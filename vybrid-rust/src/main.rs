@@ -303,11 +303,20 @@ impl RateLimitFallbackState {
 /// The API may reject a tool call before streaming any assistant text; these errors are worth one automatic retry.
 fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
-    s.contains("tool_use_failed")
-        || s.contains("did not match schema")
-        || s.contains("Tool call validation")
-        || s.contains("Failed to parse tool call arguments as JSON")
-        || s.contains("Invalid JSON in API stream")
+    let s_lower = s.to_ascii_lowercase();
+    s_lower.contains("tool_use_failed")
+        || s_lower.contains("did not match schema")
+        || s_lower.contains("tool call validation")
+        || s_lower.contains("failed to parse tool call arguments as json")
+        || s_lower.contains("invalid json in api stream")
+        || is_failed_generation_error(e)
+}
+
+fn is_failed_generation_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    s.contains("failed_generation")
+        || s.contains("failed to call a function")
+        || s.contains("please adjust your prompt")
 }
 
 fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
@@ -370,10 +379,37 @@ mod retry_tests {
 
         assert!(is_rate_limit_error(&err));
     }
+
+    #[test]
+    fn recognizes_failed_generation_errors() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+
+        assert!(is_failed_generation_error(&err));
+        assert!(is_retryable_groq_stream_error(&err));
+    }
+
+    #[test]
+    fn failed_generation_prompt_prefers_smaller_tool_calls() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+        let prompt = corrective_tool_prompt(&err, 2, 5);
+
+        assert!(prompt.contains("failed to generate a valid tool call"));
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("edit_file"));
+        assert!(prompt.contains("create_multiple_files"));
+    }
 }
 
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
-    if is_tool_argument_json_error(e) {
+    if is_failed_generation_error(e) {
+        format!(
+            "[Vybrid] The provider failed to generate a valid tool call: {e}. This was attempt {attempt} of {max_attempts}. Retry the task now using smaller, simpler tool calls. First inspect with read_file, read_multiple_files, enhanced_grep, cargo_metadata, or rust_project_snapshot as needed. For edits, prefer edit_file with a small exact snippet. Avoid create_multiple_files for large content; split file creation into separate small create_file calls. If the patch is large or multiline-heavy, explain the patch as text instead of calling a tool."
+        )
+    } else if is_tool_argument_json_error(e) {
         format!(
             "[Vybrid] The API rejected your tool call because its arguments were not valid JSON: {e}. This was attempt {attempt} of {max_attempts}. Retry the task now. If you need to edit or create large/multiline content, split it into smaller tool calls. Do not place raw unescaped multiline text in tool arguments; escape JSON strings correctly, or explain the patch as text instead of calling a tool."
         )
