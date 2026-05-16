@@ -319,6 +319,10 @@ fn is_failed_generation_error(e: &anyhow::Error) -> bool {
         || s.contains("please adjust your prompt")
 }
 
+fn should_retry_tool_generation_error(e: &anyhow::Error, content_started: bool) -> bool {
+    is_retryable_groq_stream_error(e) && (!content_started || is_failed_generation_error(e))
+}
+
 fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("Failed to parse tool call arguments as JSON")
@@ -401,6 +405,25 @@ mod retry_tests {
         assert!(prompt.contains("read_file"));
         assert!(prompt.contains("edit_file"));
         assert!(prompt.contains("create_multiple_files"));
+    }
+
+    #[test]
+    fn retries_failed_generation_after_content_started() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+
+        assert!(should_retry_tool_generation_error(&err, true));
+    }
+
+    #[test]
+    fn does_not_retry_schema_error_after_content_started() {
+        let err = anyhow::anyhow!(
+            "Tool call validation failed: parameters for tool read_file did not match schema"
+        );
+
+        assert!(!should_retry_tool_generation_error(&err, true));
+        assert!(should_retry_tool_generation_error(&err, false));
     }
 }
 
@@ -641,21 +664,19 @@ async fn process_ai_response(
                         continue 'stream;
                     }
                     if attempt < MAX_STREAM_ATTEMPTS
-                        && is_retryable_groq_stream_error(&e)
-                        && !content_started
+                        && should_retry_tool_generation_error(&e, content_started)
                     {
                         conversation.add_user_message(&corrective_tool_prompt(
                             &e,
                             attempt,
                             MAX_STREAM_ATTEMPTS,
                         ));
-                        println!(
-                            "{}",
-                            style(
-                                "Tool call validation failed — retrying with a corrective prompt..."
-                            )
-                            .yellow()
-                        );
+                        let retry_message = if content_started && is_failed_generation_error(&e) {
+                            "Tool generation failed after partial output — retrying with smaller tool calls..."
+                        } else {
+                            "Tool call validation failed — retrying with a corrective prompt..."
+                        };
+                        println!("{}", style(retry_message).yellow());
                         spinner.finish().await;
                         continue 'stream;
                     }
