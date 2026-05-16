@@ -4,12 +4,14 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use crate::lsp::{RustLspManager, RustLspOperation, RustLspQuery};
+use crate::memory::MemoryStore;
 
-use super::{cargo, file_ops, grep, project, rust, search, shell};
+use super::{cargo, file_ops, grep, memory, project, rust, search, shell};
 
 #[derive(Clone, Default)]
 pub struct ToolRuntime {
     pub rust_lsp: Option<RustLspManager>,
+    pub memory: Option<MemoryStore>,
 }
 
 /// Execute a tool by name with given arguments
@@ -221,6 +223,25 @@ pub async fn execute_tool_with_context(
         "generate_project_index" => {
             let force = args["force"].as_bool().unwrap_or(false);
             crate::project_index::generate_project_index(force)
+        }
+
+        "list_memory_topics" => memory::list_memory_topics(runtime.memory.as_ref()),
+
+        "read_memory_topic" => {
+            let topic = args["topic"].as_str().unwrap_or("");
+            memory::read_memory_topic(runtime.memory.as_ref(), topic)
+        }
+
+        "search_memory_transcripts" => {
+            let query = args["query"].as_str().unwrap_or("");
+            let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
+            let max_matches = args["max_matches"].as_u64().unwrap_or(10).min(20) as usize;
+            memory::search_memory_transcripts(
+                runtime.memory.as_ref(),
+                query,
+                case_sensitive,
+                max_matches,
+            )
         }
 
         // Enhanced grep

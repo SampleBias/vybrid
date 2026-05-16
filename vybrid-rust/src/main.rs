@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod conversation;
 mod lsp;
+mod memory;
 mod project_context;
 mod project_docs;
 mod project_index;
@@ -20,6 +21,7 @@ use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
 use crate::lsp::RustLspManager;
+use crate::memory::MemoryStore;
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::{get_all_tools, get_tools_for_profile, ToolProfile};
 use crate::tools::executor::{execute_tool_with_context, ToolRuntime};
@@ -100,9 +102,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     }
 
     let project_docs = ProjectDocs::new();
+    let memory_store = MemoryStore::new(config.messages_dir.clone());
     let mut conversation = Conversation::new(&get_system_prompt());
     let tool_runtime = ToolRuntime {
         rust_lsp: Some(rust_lsp.clone()),
+        memory: Some(memory_store.clone()),
     };
 
     loop {
@@ -233,9 +237,10 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             continue;
         };
 
-        // Add user message to conversation with project docs context
-        let user_message_with_context = inject_project_docs(input, &project_docs);
+        // Add user message with lightweight project context and the memory index only.
+        let user_message_with_context = inject_project_context(input, &project_docs, &memory_store);
         conversation.add_user_message(&user_message_with_context);
+        record_latest_memory_message(&memory_store, &conversation);
 
         // Process with AI
         let spinner_label = llm_spinner_label(config.llm_provider);
@@ -524,6 +529,44 @@ mod retry_tests {
 
         assert_eq!(messages.last().unwrap().role, "user");
         assert!(!messages.iter().any(|m| m.role == "tool"));
+    }
+
+    #[test]
+    fn project_context_injects_memory_index_without_topic_or_transcript_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "vybrid-main-memory-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let memory_dir = root.join(".vybrid").join("memory");
+        std::fs::create_dir_all(memory_dir.join("topics")).unwrap();
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "- routing => topics/routing.md\n",
+        )
+        .unwrap();
+        std::fs::write(memory_dir.join("topics").join("routing.md"), "topic secret").unwrap();
+
+        let memory_store =
+            MemoryStore::with_project_root(&root, root.join("messages"), "test-session");
+        memory_store
+            .append_transcript_message(&Message {
+                role: "assistant".to_string(),
+                content: Some("transcript secret".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .unwrap();
+
+        let context = inject_project_context("inspect routing", &ProjectDocs::new(), &memory_store);
+
+        assert!(context.contains("MEMORY INDEX"));
+        assert!(context.contains("topics/routing.md"));
+        assert!(!context.contains("topic secret"));
+        assert!(!context.contains("transcript secret"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -868,6 +911,9 @@ async fn process_ai_response(
         tool_call_id: None,
     };
     conversation.add_assistant_message(assistant_msg);
+    if let Some(memory) = tool_runtime.memory.as_ref() {
+        record_latest_memory_message(memory, conversation);
+    }
 
     // Execute tool calls if any
     if !tool_calls.is_empty() {
@@ -930,6 +976,9 @@ async fn process_ai_response(
             let history_result =
                 compact_tool_result_for_history(&tool_call.function.name, &result_str, depth);
             conversation.add_tool_result(&tool_call.id, &history_result);
+            if let Some(memory) = tool_runtime.memory.as_ref() {
+                record_latest_memory_message(memory, conversation);
+            }
         }
 
         // Get follow-up response (next round shows its own spinner)
@@ -1066,6 +1115,27 @@ fn compound_messages_for_request(conversation: &Conversation, request_budget: u3
     ]
 }
 
+fn record_latest_memory_message(memory_store: &MemoryStore, conversation: &Conversation) {
+    if let Some(message) = conversation.messages.last() {
+        if let Err(e) = memory_store.append_transcript_message(message) {
+            eprintln!("{}", style(format!("Memory transcript warning: {e}")).dim());
+        }
+    }
+}
+
+/// Inject project documentation and the compact memory index into a user message.
+fn inject_project_context(
+    user_message: &str,
+    project_docs: &ProjectDocs,
+    memory_store: &MemoryStore,
+) -> String {
+    let with_docs = inject_project_docs(user_message, project_docs);
+    match memory_store.context_block() {
+        Ok(Some(memory)) => format!("{with_docs}\n\n---\n\n{memory}"),
+        Ok(None) | Err(_) => with_docs,
+    }
+}
+
 /// Inject project documentation context into user message
 fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String {
     const MAX_PROJECT_DOC_CHARS: usize = 8_000;
@@ -1113,6 +1183,12 @@ PROJECT NAVIGATION POLICY:
 2. Before broad exploration of an unfamiliar or large project, read `index.md` with `read_project_index`. If it is missing or stale, use `generate_project_index` instead of repeated broad `ls`, glob, or full-file reads.
 3. Use paths exactly as listed in `index.md` or tool output. Prefer targeted `read_file` line ranges, `rust_project_snapshot`, and narrow `enhanced_grep` calls.
 
+SKEPTICAL MEMORY POLICY:
+1. Treat `MEMORY.md` as a compact index of pointers, not as authoritative truth.
+2. Read memory topics only when the index suggests they are relevant to the current task.
+3. Search raw transcripts only for specific identifiers, file paths, symbols, or error codes; never load or summarize transcripts wholesale.
+4. Before acting on remembered paths, symbols, commands, dependencies, or behavior, verify them against live project tools such as `read_file`, `enhanced_grep`, `rust_project_snapshot`, `cargo_metadata`, or compiler output.
+
 RUST CARGO QUICK REFERENCE:
 {}
 
@@ -1134,6 +1210,7 @@ Available tools:
 - explain_rust_diagnostic: Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async Send
 - rust_lsp_query: Use connected rust-analyzer LSP for status, diagnostics, hover, definition, references, symbols, completions, code actions, and formatting edits. Always pass an `operation` string, for example {{"operation":"status"}} or {{"operation":"diagnostics","file_path":"src/main.rs"}}
 - read_project_index, generate_project_index: Read or generate compact `index.md` navigation context before broad project discovery
+- list_memory_topics, read_memory_topic, search_memory_transcripts: Use the three-layer memory system sparingly; memory results are hints and must be verified against live project state before acting
 - execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online

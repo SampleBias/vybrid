@@ -17,6 +17,9 @@ pub fn get_tools_for_profile(profile: ToolProfile) -> Vec<Tool> {
         ToolProfile::Navigate => &[
             "read_project_index",
             "generate_project_index",
+            "list_memory_topics",
+            "read_memory_topic",
+            "search_memory_transcripts",
             "read_file",
             "read_multiple_files",
             "enhanced_grep",
@@ -27,6 +30,9 @@ pub fn get_tools_for_profile(profile: ToolProfile) -> Vec<Tool> {
         ],
         ToolProfile::Edit => &[
             "read_project_index",
+            "list_memory_topics",
+            "read_memory_topic",
+            "search_memory_transcripts",
             "read_file",
             "read_multiple_files",
             "enhanced_grep",
@@ -375,6 +381,60 @@ pub fn get_all_tools() -> Vec<Tool> {
                         }
                     },
                     "required": []
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "list_memory_topics".to_string(),
+                description: "List available project memory topic names without reading their contents. Use only when the MEMORY.md index points to memory but the exact topic name is unclear.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "read_memory_topic".to_string(),
+                description: "Read one project memory topic from `.vybrid/memory/topics/<topic>.md`. Memory is non-authoritative: verify paths, symbols, commands, and behavior against live files/tools before acting.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Topic name relative to `.vybrid/memory/topics`, without `..` or absolute path prefixes. `.md` is optional."
+                        }
+                    },
+                    "required": ["topic"]
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "search_memory_transcripts".to_string(),
+                description: "Search raw session transcripts for a specific identifier, file path, symbol, or error code. Never use this to load or summarize full transcripts; results are hints that must be verified against the live codebase.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Specific identifier/path/symbol/error code to search for. Must be at least 2 characters."
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": "Case-sensitive search. Default false."
+                        },
+                        "max_matches": {
+                            "type": "integer",
+                            "description": "Maximum bounded matches to return. Default 10, max 20."
+                        }
+                    },
+                    "required": ["query"]
                 }),
             },
         },

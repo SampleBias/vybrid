@@ -295,6 +295,9 @@ The system provides these tools to the AI:
 ### Search
 - `enhanced_grep` - Search files with regex, context lines, case sensitivity
 - `google_search` - Google search via SerpAPI (requires SERPAPI_KEY)
+- `list_memory_topics` - List available memory topic names without reading contents
+- `read_memory_topic` - Read one project memory topic on demand
+- `search_memory_transcripts` - Search raw transcripts for a specific identifier, path, symbol, or error code
 
 ### Project Management
 - `create_project_structure` - Create mandatory project files
@@ -482,6 +485,16 @@ Project documentation is stored in `.vybrid/docs.md` in the current project dire
 
 When you send a message to the AI, project docs are automatically appended to your message with a `---` separator. The AI will use this context when generating responses.
 
+## Three-Layer Memory Feature
+
+Vybrid uses a skeptical three-layer memory system to keep active context small:
+
+1. **Core index**: `.vybrid/memory/MEMORY.md` is loaded into each user turn as a compact pointer list. Each non-empty line is capped at 150 characters.
+2. **Topic files**: `.vybrid/memory/topics/<topic>.md` stores detailed knowledge and is fetched only through `read_memory_topic` when the index suggests it is relevant.
+3. **Raw transcripts**: Session messages are appended under `~/.vybrid/messages/<project-key>/<session>.jsonl` and are searchable only through `search_memory_transcripts` for specific identifiers.
+
+Memory is intentionally non-authoritative. Before relying on remembered paths, symbols, commands, dependencies, or behavior, verify against live project state with `read_file`, `enhanced_grep`, `rust_project_snapshot`, `cargo_metadata`, compiler output, or another direct tool.
+
 ### Example: Adding Bevy Framework Documentation
 
 ```bash
@@ -582,7 +595,7 @@ tools::executor::execute_tool(&tool_name, &arguments).await
 3. No CI/CD configuration
 4. Shell commands have wall-clock timeouts and output caps; long-running interactive workflows should still be monitored by the user
 5. No rate limiting for API calls
-6. No conversation persistence across sessions (in-memory only)
+6. Raw transcripts are persisted for bounded search, but conversations do not resume from prior sessions
 7. No syntax highlighting for code output
 8. No file watching/reloading
 

@@ -2,6 +2,7 @@ pub mod client;
 pub mod config;
 pub mod conversation;
 pub mod lsp;
+pub mod memory;
 pub mod project_context;
 pub mod project_docs;
 pub mod project_index;
