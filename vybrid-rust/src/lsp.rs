@@ -616,20 +616,7 @@ where
 }
 
 fn normalize_path(file_path: &str) -> PathBuf {
-    let trimmed = file_path.trim();
-    if let Some(stripped) = trimmed.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    let path = PathBuf::from(trimmed);
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
+    crate::project_context::resolve_path(file_path)
 }
 
 fn path_to_file_uri(path: &Path) -> Result<String> {

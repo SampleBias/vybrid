@@ -11,8 +11,9 @@ pub struct ProjectDocs {
 impl ProjectDocs {
     /// Create a new ProjectDocs instance for the current directory
     pub fn new() -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let docs_path = current_dir.join(".vybrid").join("docs.md");
+        let docs_path = crate::project_context::current_project_root()
+            .join(".vybrid")
+            .join("docs.md");
         Self { docs_path }
     }
 

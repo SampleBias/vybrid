@@ -6,7 +6,7 @@ use regex::RegexBuilder;
 use std::fs;
 use std::path::PathBuf;
 
-const MAX_GREP_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_GREP_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn truncate_output(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {

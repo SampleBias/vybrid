@@ -2,7 +2,9 @@ mod client;
 mod config;
 mod conversation;
 mod lsp;
+mod project_context;
 mod project_docs;
+mod project_index;
 mod rust_agent_reference;
 mod shell;
 mod tools;
@@ -16,7 +18,7 @@ use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, ToolCall};
 use crate::config::{Config, LlmProvider};
-use crate::conversation::{Conversation, REQUEST_CONTEXT_TOKEN_BUDGET};
+use crate::conversation::Conversation;
 use crate::lsp::RustLspManager;
 use crate::project_docs::ProjectDocs;
 use crate::tools::definitions::get_all_tools;
@@ -105,7 +107,12 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
     loop {
         let rust_lsp_status = rust_lsp.status().await;
-        ui::print_context_status_line(conversation.estimate_context_tokens(), &rust_lsp_status);
+        ui::print_context_status_line(
+            conversation.estimate_context_tokens(),
+            config.context_token_budget,
+            config.max_completion_tokens,
+            &rust_lsp_status,
+        );
         print!("{} ", style("You>").magenta().bold());
         io::stdout().flush()?;
 
@@ -177,6 +184,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             continue;
         }
 
+        if input.starts_with("/index") {
+            handle_index_command(input);
+            continue;
+        }
+
         // Handle single shell commands (!command)
         if let Some(cmd) = input.strip_prefix('!') {
             match tools::shell::execute_bash(cmd, None, None).await {
@@ -241,6 +253,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             0,
             spinner_label,
             &mut rate_limit_fallback,
+            config.context_token_budget,
+            config.retry_context_token_budget,
         )
         .await
         {
@@ -452,6 +466,8 @@ async fn process_ai_response(
     depth: u32,
     spinner_label: &'static str,
     rate_limit_fallback: &mut RateLimitFallbackState,
+    context_token_budget: u32,
+    retry_context_token_budget: u32,
 ) -> Result<()> {
     /// Prevents runaway tool loops when the model chains many rounds.
     const MAX_TOOL_ROUNDS: u32 = 48;
@@ -484,15 +500,10 @@ async fn process_ai_response(
         first_chunk = true;
 
         let request_budget = match attempt {
-            1 => REQUEST_CONTEXT_TOKEN_BUDGET,
-            2 => 40_000,
-            _ => 18_000,
+            1 => context_token_budget,
+            _ => retry_context_token_budget,
         };
-        let request_messages = if attempt == 1 {
-            conversation.messages_for_request()
-        } else {
-            conversation.messages_for_request_with_budget(request_budget)
-        };
+        let request_messages = conversation.messages_for_request_with_budget(request_budget);
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = rate_limit_fallback.client_for_request(client);
@@ -519,8 +530,8 @@ async fn process_ai_response(
                             "Rate limit reached — waiting {}s, then retrying with a compacted {}k-token request...",
                             delay.as_secs(),
                             match attempt {
-                                1 => 40,
-                                _ => 18,
+                                1 => retry_context_token_budget / 1_000,
+                                _ => retry_context_token_budget / 1_000,
                             }
                         ))
                         .yellow()
@@ -546,8 +557,8 @@ async fn process_ai_response(
                         style(format!(
                             "Context was too large for the provider — retrying with a compacted {}k-token request...",
                             match attempt {
-                                1 => 40,
-                                _ => 18,
+                                1 => retry_context_token_budget / 1_000,
+                                _ => retry_context_token_budget / 1_000,
                             }
                         ))
                         .yellow()
@@ -766,6 +777,8 @@ async fn process_ai_response(
             depth + 1,
             spinner_label,
             rate_limit_fallback,
+            context_token_budget,
+            retry_context_token_budget,
         ))
         .await?;
     }
@@ -775,7 +788,12 @@ async fn process_ai_response(
 
 /// Inject project documentation context into user message
 fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String {
-    const MAX_PROJECT_DOC_CHARS: usize = 24_000;
+    const MAX_PROJECT_DOC_CHARS: usize = 8_000;
+    let index_hint = if project_index::index_path().exists() {
+        "\n\n---\n\nPROJECT INDEX: `index.md` exists at the project root. Read it with `read_project_index` when project navigation is needed."
+    } else {
+        ""
+    };
     match project_docs.read() {
         Ok(Some(docs)) => {
             let docs = if docs.chars().count() > MAX_PROJECT_DOC_CHARS {
@@ -786,9 +804,12 @@ fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String
             } else {
                 docs
             };
-            format!("{}\n\n---\n\nPROJECT CONTEXT:\n{}", user_message, docs)
+            format!(
+                "{}{index_hint}\n\n---\n\nPROJECT CONTEXT:\n{}",
+                user_message, docs
+            )
         }
-        Ok(None) | Err(_) => user_message.to_string(),
+        Ok(None) | Err(_) => format!("{user_message}{index_hint}"),
     }
 }
 
@@ -806,6 +827,11 @@ RUST OPERATING POLICY:
 6. After changes, verify with `cargo check`, then `cargo test` or `cargo clippy` when appropriate.
 7. Explain Rust trade-offs at the user's requested depth; be concrete about ownership, trait, enum, lifetime, and async reasoning.
 8. Only create task/docs scaffolding when the user asks for project scaffolding or the target repository already follows that workflow.
+
+PROJECT NAVIGATION POLICY:
+1. Treat paths as project-root-relative unless the user gives an absolute path. Never concatenate absolute and relative project paths.
+2. Before broad exploration of an unfamiliar or large project, read `index.md` with `read_project_index`. If it is missing or stale, use `generate_project_index` instead of repeated broad `ls`, glob, or full-file reads.
+3. Use paths exactly as listed in `index.md` or tool output. Prefer targeted `read_file` line ranges, `rust_project_snapshot`, and narrow `enhanced_grep` calls.
 
 RUST CARGO QUICK REFERENCE:
 {}
@@ -827,6 +853,7 @@ Available tools:
 - rust_project_snapshot, cargo_metadata: Inspect Rust workspace/package layout before editing
 - explain_rust_diagnostic: Explain rustc error codes and Rust topics such as ownership, traits, enums, lifetimes, and async Send
 - rust_lsp_query: Use connected rust-analyzer LSP for status, diagnostics, hover, definition, references, symbols, completions, code actions, and formatting edits. Always pass an `operation` string, for example {{"operation":"status"}} or {{"operation":"diagnostics","file_path":"src/main.rs"}}
+- read_project_index, generate_project_index: Read or generate compact `index.md` navigation context before broad project discovery
 - execute_bash_command: Run shell commands (rustup, system packages, non-cargo scripts)
 - enhanced_grep: Search files with regex patterns
 - google_search: Search for information online
@@ -917,6 +944,10 @@ fn show_help() {
         "  {}     - Menu (Groq / LM Studio / SerpAPI / Rust LSP)",
         style("/menu").yellow()
     );
+    println!(
+        "  {}      - Show or refresh compact project index",
+        style("/index").yellow()
+    );
     println!();
     println!("{}", style("Project Docs Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
@@ -937,6 +968,31 @@ fn show_help() {
         style("/docs clear").yellow()
     );
     println!();
+}
+
+fn handle_index_command(input: &str) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    match parts.get(1).copied() {
+        None | Some("show") => match project_index::read_project_index() {
+            Ok(content) => {
+                println!();
+                println!("{}", style("Project Index").cyan().bold());
+                println!("{}", style("─".repeat(40)).dim());
+                println!("{}", content);
+                println!();
+            }
+            Err(e) => ui::print_error(&format!("Failed to read project index: {e}")),
+        },
+        Some("refresh") | Some("generate") => match project_index::generate_project_index(true) {
+            Ok(msg) => println!("{}", style(msg).green()),
+            Err(e) => ui::print_error(&format!("Failed to generate project index: {e}")),
+        },
+        Some("path") => println!("{}", project_index::index_path().display()),
+        Some(other) => {
+            ui::print_error(&format!("Unknown /index subcommand: '{other}'"));
+            println!("Available subcommands: show, refresh, path");
+        }
+    }
 }
 
 /// Handle /docs commands
@@ -1071,7 +1127,9 @@ fn saved_env_locations(config: &Config) -> String {
 fn rebuild_llm_client(config: &Config) -> Option<GroqClient> {
     config
         .effective_chat_client_params()
-        .map(|(api_key, base_url, model)| GroqClient::new(api_key, base_url, model))
+        .map(|(api_key, base_url, model)| {
+            GroqClient::new(api_key, base_url, model, config.max_completion_tokens)
+        })
 }
 
 fn resolve_rust_lsp_root(config: &Config) -> Result<std::path::PathBuf> {

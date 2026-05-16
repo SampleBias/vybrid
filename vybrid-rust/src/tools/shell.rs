@@ -7,7 +7,7 @@ use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
-const MAX_SHELL_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_SHELL_OUTPUT_BYTES: usize = 96 * 1024;
 
 fn truncate_output(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {

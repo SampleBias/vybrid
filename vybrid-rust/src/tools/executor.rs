@@ -37,7 +37,10 @@ pub async fn execute_tool_with_context(
         // File reading
         "read_file" => {
             let path = args["file_path"].as_str().unwrap_or("");
-            file_ops::read_file(path)
+            let start_line = args["start_line"].as_u64().map(|n| n as usize);
+            let line_count = args["line_count"].as_u64().map(|n| n as usize);
+            let max_bytes = args["max_bytes"].as_u64().map(|n| n as usize);
+            file_ops::read_file_with_options(path, start_line, line_count, max_bytes)
         }
 
         "read_multiple_files" => {
@@ -204,6 +207,13 @@ pub async fn execute_tool_with_context(
                 .await
         }
 
+        "read_project_index" => crate::project_index::read_project_index(),
+
+        "generate_project_index" => {
+            let force = args["force"].as_bool().unwrap_or(false);
+            crate::project_index::generate_project_index(force)
+        }
+
         // Enhanced grep
         "enhanced_grep" => {
             let pattern = args["pattern"].as_str().unwrap_or("");
@@ -233,9 +243,9 @@ pub async fn execute_tool_with_context(
                     "enhanced_grep: provide file_paths (array), file_path, or path (string)"
                 ));
             }
-            let context = args["context_lines"].as_u64().unwrap_or(3) as usize;
+            let context = args["context_lines"].as_u64().unwrap_or(1).min(5) as usize;
             let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(false);
-            let max_matches = args["max_matches"].as_u64().unwrap_or(20) as usize;
+            let max_matches = args["max_matches"].as_u64().unwrap_or(10).min(50) as usize;
             grep::enhanced_grep(pattern, &paths, context, case_sensitive, max_matches)
         }
 

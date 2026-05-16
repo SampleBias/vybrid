@@ -15,7 +15,19 @@ pub fn get_all_tools() -> Vec<Tool> {
                     "properties": {
                         "file_path": {
                             "type": "string",
-                            "description": "The path to the file to read (relative or absolute)"
+                            "description": "The path to the file to read (root-relative or absolute)"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "Optional 1-based first line to return"
+                        },
+                        "line_count": {
+                            "type": "integer",
+                            "description": "Optional number of lines to return"
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Optional output byte cap for this read"
                         }
                     },
                     "required": ["file_path"]
@@ -280,6 +292,35 @@ pub fn get_all_tools() -> Vec<Tool> {
                         }
                     },
                     "description": "Provide `operation` for every call. The schema is intentionally loose so provider validation does not fail before Vybrid can return a recoverable tool error."
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "read_project_index".to_string(),
+                description: "Read the compact root-level index.md for cheap project navigation before broad searches or full-file reads.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
+        },
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDef {
+                name: "generate_project_index".to_string(),
+                description: "Generate or refresh a compact root-level index.md with root-relative paths. Use before broad navigation when index.md is missing or stale.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "force": {
+                            "type": "boolean",
+                            "description": "Overwrite an existing Vybrid-generated index.md. Default false; hand-written files are protected."
+                        }
+                    },
+                    "required": []
                 }),
             },
         },

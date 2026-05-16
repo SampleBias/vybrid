@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use super::file_ops::normalize_path;
 
 /// Maximum combined stdout+stderr returned to the model (bytes).
-pub const MAX_CARGO_OUTPUT_BYTES: usize = 256 * 1024;
+pub const MAX_CARGO_OUTPUT_BYTES: usize = 128 * 1024;
 
 /// How `run_cargo` should ask Cargo/rustc to format compiler diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

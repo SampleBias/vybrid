@@ -2,34 +2,82 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
+const DEFAULT_READ_FILE_BYTES: usize = 64 * 1024;
+const MIN_READ_FILE_BYTES: usize = 4 * 1024;
+const MAX_READ_FILE_BYTES: usize = 256 * 1024;
+
 /// Normalize a file path (expand ~ and make absolute if needed)
 pub fn normalize_path(path: &str) -> String {
-    let path = path.trim();
-
-    // Expand home directory
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped).to_string_lossy().to_string();
-        }
-    }
-
-    // If relative, make it relative to current dir
-    if !path.starts_with('/') {
-        if let Ok(cwd) = std::env::current_dir() {
-            return cwd.join(path).to_string_lossy().to_string();
-        }
-    }
-
-    path.to_string()
+    crate::project_context::resolve_path(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Read a single file
 pub fn read_file(path: &str) -> Result<String> {
+    read_file_with_options(path, None, None, None)
+}
+
+/// Read a single file with optional 1-based line range and byte cap.
+pub fn read_file_with_options(
+    path: &str,
+    start_line: Option<usize>,
+    line_count: Option<usize>,
+    max_bytes: Option<usize>,
+) -> Result<String> {
     let normalized = normalize_path(path);
+    let file_path = Path::new(&normalized);
+    if !file_path.exists() {
+        return Err(anyhow::anyhow!(
+            "{}",
+            crate::project_context::path_not_found_message(path, file_path)
+        ));
+    }
+
     let content = fs::read_to_string(&normalized)
         .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", normalized, e))?;
 
-    Ok(format!("Content of '{}':\n\n{}", path, content))
+    let total_lines = content.lines().count();
+    let total_bytes = content.len();
+    let start = start_line.unwrap_or(1).max(1);
+    let count = line_count.unwrap_or(usize::MAX);
+    let selected = content
+        .lines()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            let line_no = idx + 1;
+            (line_no >= start && line_no < start.saturating_add(count)).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let limit = max_bytes
+        .unwrap_or(DEFAULT_READ_FILE_BYTES)
+        .clamp(MIN_READ_FILE_BYTES, MAX_READ_FILE_BYTES);
+    let (body, truncated) = truncate_utf8(&selected, limit);
+    let display_path = crate::project_context::root_relative(file_path);
+
+    let mut header = format!(
+        "Content of '{}' (resolved: '{}', total_lines: {}, total_bytes: {}, returned_bytes: {}",
+        path,
+        display_path,
+        total_lines,
+        total_bytes,
+        body.len()
+    );
+    if start_line.is_some() || line_count.is_some() {
+        let end = start
+            .saturating_add(count)
+            .saturating_sub(1)
+            .min(total_lines);
+        header.push_str(&format!(", returned_lines: {}-{}", start, end));
+    }
+    if truncated {
+        header.push_str(", truncated: true");
+    }
+    header.push_str("):\n\n");
+
+    Ok(format!("{header}{body}"))
 }
 
 /// Read multiple files
@@ -37,7 +85,7 @@ pub fn read_multiple_files(paths: &[&str]) -> Result<String> {
     let mut results = Vec::new();
 
     for path in paths {
-        match read_file(path) {
+        match read_file_with_options(path, None, None, Some(DEFAULT_READ_FILE_BYTES / 2)) {
             Ok(content) => results.push(content),
             Err(e) => results.push(format!("Error reading '{}': {}", path, e)),
         }
@@ -156,6 +204,26 @@ pub fn file_exists(path: &str) -> bool {
     Path::new(&normalized).exists()
 }
 
+fn truncate_utf8(content: &str, max_bytes: usize) -> (String, bool) {
+    if content.len() <= max_bytes {
+        return (content.to_string(), false);
+    }
+    let split = content
+        .char_indices()
+        .take_while(|(idx, _)| *idx < max_bytes)
+        .last()
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    (
+        format!(
+            "{}\n\n[File output truncated at {} bytes; read a narrower line range for more.]",
+            &content[..split],
+            max_bytes
+        ),
+        true,
+    )
+}
+
 /// Append content to a file
 pub fn append_to_file(path: &str, content: &str) -> Result<String> {
     use std::fs::OpenOptions;
@@ -214,5 +282,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(err.to_string().contains("occurrences"));
+    }
+
+    #[test]
+    fn read_file_can_return_line_range_with_cap() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-read-range-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let result =
+            read_file_with_options(path.to_str().unwrap(), Some(2), Some(2), Some(8)).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.contains("returned_lines: 2-3"));
+        assert!(result.contains("two"));
+        assert!(result.contains("three"));
+        assert!(!result.contains("four"));
     }
 }

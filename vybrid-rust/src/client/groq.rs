@@ -5,7 +5,11 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Shorten repetitive Groq tool-schema validation messages for the terminal.
 fn simplify_tool_validation_message(msg: &str) -> String {
@@ -71,6 +75,9 @@ pub struct GroqClient {
     api_key: String,
     base_url: String,
     model: String,
+    max_tokens: u32,
+    tpm_limit: u32,
+    rate_window: Arc<Mutex<VecDeque<(Instant, u32)>>>,
 }
 
 /// Chat completion request (OpenAI-compatible subset).
@@ -192,7 +199,7 @@ pub struct AccumulatedToolCall {
 }
 
 impl GroqClient {
-    pub fn new(api_key: String, base_url: String, model: String) -> Self {
+    pub fn new(api_key: String, base_url: String, model: String, max_tokens: u32) -> Self {
         Self {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
@@ -201,6 +208,13 @@ impl GroqClient {
             api_key,
             base_url,
             model,
+            max_tokens,
+            tpm_limit: std::env::var("VYBRID_GROQ_TPM_LIMIT")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(240_000),
+            rate_window: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -210,7 +224,53 @@ impl GroqClient {
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             model: model.into(),
+            max_tokens: self.max_tokens,
+            tpm_limit: self.tpm_limit,
+            rate_window: self.rate_window.clone(),
         }
+    }
+
+    async fn throttle_if_needed(&self, request: &ChatRequest) {
+        if !self.base_url.contains("groq.com") {
+            return;
+        }
+        let requested = estimate_request_tokens(request);
+        let now = Instant::now();
+        let mut window = self.rate_window.lock().await;
+        while let Some((instant, _)) = window.front() {
+            if now.duration_since(*instant) > Duration::from_secs(60) {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+        let used: u32 = window.iter().map(|(_, tokens)| *tokens).sum();
+        if used.saturating_add(requested) > self.tpm_limit {
+            if let Some((oldest, _)) = window.front() {
+                let wait = Duration::from_secs(60).saturating_sub(now.duration_since(*oldest));
+                if !wait.is_zero() {
+                    drop(window);
+                    eprintln!(
+                        "Groq TPM preflight: waiting {}s before sending estimated {} token request",
+                        wait.as_secs().max(1),
+                        requested
+                    );
+                    tokio::time::sleep(wait).await;
+                    let mut refreshed = self.rate_window.lock().await;
+                    let now = Instant::now();
+                    while let Some((instant, _)) = refreshed.front() {
+                        if now.duration_since(*instant) > Duration::from_secs(60) {
+                            refreshed.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    refreshed.push_back((now, requested));
+                    return;
+                }
+            }
+        }
+        window.push_back((now, requested));
     }
 
     /// Stream chat completion response
@@ -225,9 +285,11 @@ impl GroqClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: true,
-            max_tokens: 8192,
+            max_tokens: self.max_tokens,
             temperature: 1.0,
         };
+
+        self.throttle_if_needed(&request).await;
 
         let response = self
             .client
@@ -246,7 +308,11 @@ impl GroqClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!("API error ({}): {}", status, body);
+            anyhow::bail!(
+                "API error ({}): {}",
+                status,
+                enrich_api_error_body(status.as_u16(), &body)
+            );
         }
 
         let stream = response.bytes_stream();
@@ -336,9 +402,11 @@ impl GroqClient {
             tools,
             tool_choice: Some("auto".to_string()),
             stream: false,
-            max_tokens: 8192,
+            max_tokens: self.max_tokens,
             temperature: 1.0,
         };
+
+        self.throttle_if_needed(&request).await;
 
         let response = self
             .client
@@ -356,7 +424,11 @@ impl GroqClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            anyhow::bail!("API error ({}): {}", status, body);
+            anyhow::bail!(
+                "API error ({}): {}",
+                status,
+                enrich_api_error_body(status.as_u16(), &body)
+            );
         }
 
         #[derive(Deserialize)]
@@ -380,5 +452,76 @@ impl GroqClient {
             .next()
             .map(|c| c.message)
             .context("No response from API")
+    }
+}
+
+fn estimate_request_tokens(request: &ChatRequest) -> u32 {
+    let serialized = serde_json::to_string(request).unwrap_or_default();
+    (serialized.len() / 4) as u32 + request.max_tokens
+}
+
+fn enrich_api_error_body(status: u16, body: &str) -> String {
+    if status != 429 {
+        return body.to_string();
+    }
+    let limit = number_after(body, "Limit ");
+    let used = number_after(body, "Used ");
+    let requested = number_after(body, "Requested ");
+    let retry = number_after(body, "Please try again in ");
+    match (limit, used, requested) {
+        (Some(limit), Some(used), Some(requested)) => format!(
+            "{body}\nGroq TPM details: limit={limit}, used={used}, requested={requested}, retry_after_seconds={}. Lower VYBRID_GROQ_CONTEXT_TOKEN_BUDGET or refresh/use index.md to reduce request size.",
+            retry.unwrap_or_default()
+        ),
+        _ => format!(
+            "{body}\nGroq rate limit hit. Lower VYBRID_GROQ_CONTEXT_TOKEN_BUDGET or use index.md/root-relative targeted reads to reduce request size."
+        ),
+    }
+}
+
+fn number_after(body: &str, marker: &str) -> Option<String> {
+    let start = body.find(marker)? + marker.len();
+    let suffix = &body[start..];
+    let end = suffix
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_ascii_digit() && ch != '.').then_some(idx))
+        .unwrap_or(suffix.len());
+    let value = suffix[..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enriches_groq_tpm_errors_with_budget_hint() {
+        let body = "Rate limit reached for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 250000, Used 224739, Requested 88828. Please try again in 15.25s.";
+        let enriched = enrich_api_error_body(429, body);
+
+        assert!(enriched.contains("limit=250000"));
+        assert!(enriched.contains("used=224739"));
+        assert!(enriched.contains("requested=88828"));
+        assert!(enriched.contains("VYBRID_GROQ_CONTEXT_TOKEN_BUDGET"));
+    }
+
+    #[test]
+    fn estimates_request_tokens_with_completion_headroom() {
+        let request = ChatRequest {
+            model: "test".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: Some("hello".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            tool_choice: Some("auto".to_string()),
+            stream: true,
+            max_tokens: 1024,
+            temperature: 1.0,
+        };
+
+        assert!(estimate_request_tokens(&request) >= 1024);
     }
 }

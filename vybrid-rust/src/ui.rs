@@ -90,14 +90,20 @@ fn format_tokens_short(n: u32) -> String {
     }
 }
 
-/// One dim line: context fill vs model window (heuristic; see `Conversation::estimate_context_tokens`).
-pub fn print_context_status_line(estimated_tokens: u32, rust_lsp: &RustLspStatus) {
+/// One dim line: context fill vs active request budget (heuristic; see `Conversation::estimate_context_tokens`).
+pub fn print_context_status_line(
+    estimated_tokens: u32,
+    request_budget: u32,
+    max_completion_tokens: u32,
+    rust_lsp: &RustLspStatus,
+) {
     let line = format!(
-        "{}  {}",
-        format_context_ring(estimated_tokens, CONTEXT_WINDOW_TOKENS),
+        "{}  out {}  {}",
+        format_context_ring(estimated_tokens, request_budget),
+        format_tokens_short(max_completion_tokens),
         format_rust_lsp_indicator(rust_lsp)
     );
-    let pct = estimated_tokens as f64 / CONTEXT_WINDOW_TOKENS as f64;
+    let pct = estimated_tokens as f64 / request_budget.max(1) as f64;
     if pct >= 0.85 {
         println!("{}", style(line).yellow().dim());
     } else if pct >= 0.65 {

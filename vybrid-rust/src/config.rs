@@ -13,6 +13,9 @@ pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
+pub const DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
+pub const DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET: u32 = 18_000;
+pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4_096;
 
 /// Which LLM backend Vybrid uses (`VYBRID_LLM_PROVIDER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +76,9 @@ pub struct Config {
     pub rust_lsp_enabled: bool,
     pub rust_lsp_command: String,
     pub rust_lsp_root: Option<PathBuf>,
+    pub context_token_budget: u32,
+    pub retry_context_token_budget: u32,
+    pub max_completion_tokens: u32,
 }
 
 impl Config {
@@ -143,6 +149,18 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let context_token_budget = parse_u32_env(
+            "VYBRID_GROQ_CONTEXT_TOKEN_BUDGET",
+            DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET,
+        );
+        let retry_context_token_budget = parse_u32_env(
+            "VYBRID_GROQ_RETRY_CONTEXT_TOKEN_BUDGET",
+            DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET,
+        );
+        let max_completion_tokens = parse_u32_env(
+            "VYBRID_MAX_COMPLETION_TOKENS",
+            DEFAULT_MAX_COMPLETION_TOKENS,
+        );
 
         Ok(Self {
             llm_provider,
@@ -161,6 +179,9 @@ impl Config {
             rust_lsp_enabled,
             rust_lsp_command,
             rust_lsp_root,
+            context_token_budget,
+            retry_context_token_budget,
+            max_completion_tokens,
         })
     }
 
@@ -329,6 +350,14 @@ fn parse_bool_env(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn parse_u32_env(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
 }
 
 fn format_env_value(value: &str) -> String {

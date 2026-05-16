@@ -1,7 +1,8 @@
 use crate::client::groq::Message;
 
-const MAX_TOOL_RESULT_CHARS: usize = 96 * 1024;
-pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 72_000;
+const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
+#[allow(dead_code)]
+pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 const MIN_COMPACTED_MESSAGE_CHARS: usize = 2_048;
 
 fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
@@ -51,8 +52,11 @@ fn compact_message_for_request(message: &Message, max_chars: usize) -> Message {
                 .iter()
                 .map(|tc| {
                     let mut tc = tc.clone();
-                    tc.function.arguments =
-                        truncate_middle(&tc.function.arguments, max_chars, "tool arguments");
+                    tc.function.arguments = truncate_middle(
+                        &tc.function.arguments,
+                        max_chars.min(8 * 1024),
+                        "tool arguments",
+                    );
                     tc
                 })
                 .collect(),
@@ -145,6 +149,7 @@ impl Conversation {
     }
 
     /// Request payload with adaptive compaction when history grows large.
+    #[allow(dead_code)]
     pub fn messages_for_request(&self) -> Vec<Message> {
         self.messages_for_request_with_budget(REQUEST_CONTEXT_TOKEN_BUDGET)
     }
