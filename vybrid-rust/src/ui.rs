@@ -113,6 +113,31 @@ pub fn print_context_status_line(
     }
 }
 
+/// Dim per-response usage line: real prompt/completion tokens plus Groq prompt-cache
+/// hits, so users can see whether the cache (50% cheaper, TPM-exempt) is working.
+pub fn print_usage_line(usage: &crate::client::groq::Usage, model: &str) {
+    let prompt = usage.prompt_tokens.unwrap_or(0);
+    let completion = usage.completion_tokens.unwrap_or(0);
+    if prompt == 0 && completion == 0 {
+        return;
+    }
+    let cached = usage.cached_tokens();
+    let cache_part = if cached > 0 {
+        format!(" ({} cached)", format_tokens_short(cached))
+    } else {
+        String::new()
+    };
+    println!(
+        "{}",
+        style(format!(
+            "tokens: in {}{cache_part} · out {} · {model}",
+            format_tokens_short(prompt),
+            format_tokens_short(completion)
+        ))
+        .dim()
+    );
+}
+
 fn format_rust_lsp_indicator(status: &RustLspStatus) -> String {
     match status.state {
         RustLspState::Off => "○ rust-lsp off".to_string(),

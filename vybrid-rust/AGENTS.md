@@ -357,10 +357,14 @@ The system provides these tools to the AI:
   - `Content-Type: application/json`
   - `Accept: text/event-stream` (for streaming)
 - Default model: `openai/gpt-oss-120b` (optional override: env `GROQ_MODEL`)
-- Max tokens: 8192 (within model completion limit; see [model docs](https://console.groq.com/docs/model/openai/gpt-oss-120b))
-- Temperature: 1.0
-- Request body: OpenAI-compatible (`model`, `messages`, `tools`, `tool_choice`, `stream`, `max_tokens`, `temperature`) — do not send unsupported fields ([compatibility](https://console.groq.com/docs/openai))
+- Max completion tokens: 4096 default (`VYBRID_MAX_COMPLETION_TOKENS`); sent as `max_completion_tokens` to Groq (its `max_tokens` is deprecated) and as `max_tokens` to other OpenAI-compatible servers (LM Studio)
+- Temperature: 0.3 default (`VYBRID_TEMPERATURE`); low temperature reduces malformed tool-call JSON
+- Optional `reasoning_effort` (`VYBRID_REASONING_EFFORT`): `low`/`medium`/`high` for GPT-OSS, `none`/`default` for Qwen3 — only sent when the active model supports the configured value
+- Groq `service_tier` (`VYBRID_GROQ_SERVICE_TIER`, default `auto`) — Groq-only request field
+- Request body: OpenAI-compatible (`model`, `messages`, `tools`, `tool_choice`, `stream`, `max_completion_tokens`/`max_tokens`, `temperature`, optional `reasoning_effort`, `service_tier`) — do not send unsupported fields ([compatibility](https://console.groq.com/docs/openai))
 - Delta may include `reasoning_content` on some models; Groq may omit it
+- **Prompt caching**: Groq prefix-caches GPT-OSS requests (cached tokens are 50% cheaper and exempt from TPM limits). Vybrid keeps the prefix stable on purpose: one static tool set for every round, append-only history within a turn, and a sticky compaction floor in `Conversation`. Do not reintroduce per-round tool profiles or per-request prefix rewrites.
+- **Rate limits**: the client reads `x-ratelimit-remaining-tokens`/`x-ratelimit-reset-tokens` from every response (authoritative when fresh) and falls back to a local sliding-window estimate; 429 `retry-after` headers are honored. Streamed `usage` (including `prompt_tokens_details.cached_tokens`) reconciles the local window and powers the per-response token line.
 
 ### Streaming Response Format
 ```
@@ -611,7 +615,7 @@ tools::executor::execute_tool(&tool_name, &arguments).await
 2. Test coverage is focused on Rust tooling and core helpers; expand eval coverage as new agent behaviors are added
 3. No CI/CD configuration
 4. Shell commands have wall-clock timeouts and output caps; long-running interactive workflows should still be monitored by the user
-5. No rate limiting for API calls
+5. Rate limiting is client-side best effort (header snapshots + local TPM window); no request queueing across concurrent processes
 6. Raw transcripts are persisted for bounded search, but conversations do not resume from prior sessions
 7. No syntax highlighting for code output
 8. No file watching/reloading

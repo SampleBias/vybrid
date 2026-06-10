@@ -80,6 +80,13 @@ GROQ_API_KEY=your_api_key_here
 # GROQ_MODEL=openai/gpt-oss-120b
 # Optional: current-response fallback after two OSS120B rate-limit waits
 # GROQ_RATE_LIMIT_FALLBACK_MODEL=qwen/qwen3-32b
+# Optional: sampling temperature 0.0–2.0 (default 0.3; low improves tool-call reliability)
+# VYBRID_TEMPERATURE=0.3
+# Optional: GPT-OSS reasoning effort low|medium|high (unset = provider default, medium).
+# `low` is noticeably faster/cheaper for tool-heavy agent loops.
+# VYBRID_REASONING_EFFORT=low
+# Optional: Groq service tier auto|on_demand|flex|performance (default auto)
+# VYBRID_GROQ_SERVICE_TIER=auto
 
 # --- LM Studio (local) — set VYBRID_LLM_PROVIDER=lmstudio and fill these ---
 # LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1

@@ -15,16 +15,17 @@ use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Confirm, Input, Select};
 use futures::StreamExt;
+use std::borrow::Cow;
 use std::io::{self, Write};
 
-use crate::client::groq::{GroqClient, Message, ToolCall};
+use crate::client::groq::{GroqClient, Message, Tool, ToolCall, Usage};
 use crate::config::{Config, LlmProvider};
 use crate::conversation::Conversation;
 use crate::lsp::RustLspManager;
 use crate::memory::{AutoDreamOutcome, MemoryStore};
 use crate::project_docs::ProjectDocs;
-use crate::tools::definitions::{get_all_tools, get_tools_for_profile, ToolProfile};
-use crate::tools::executor::{execute_tool_with_context, ToolRuntime};
+use crate::tools::definitions::get_all_tools;
+use crate::tools::executor::{execute_tool_with_context, is_read_only_tool, ToolRuntime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -122,15 +123,16 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         print!("{} ", style("You>").magenta().bold());
         io::stdout().flush()?;
 
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        // Read on a blocking thread so the Tokio runtime (spinner, LSP, Ctrl-C
+        // handling) is never stalled while waiting on the user.
+        let input = match read_stdin_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break, // EOF
             Err(e) => {
                 ui::print_error(&format!("Input error: {}", e));
                 continue;
             }
-        }
+        };
 
         let input = input.trim();
 
@@ -276,6 +278,20 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Blocking stdin read off the async runtime. `Ok(None)` signals EOF.
+async fn read_stdin_line() -> io::Result<Option<String>> {
+    tokio::task::spawn_blocking(|| {
+        let mut line = String::new();
+        match io::stdin().read_line(&mut line) {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(line)),
+            Err(e) => Err(e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(io::Error::other(format!("stdin task failed: {e}"))))
+}
+
 fn llm_spinner_label(provider: LlmProvider) -> &'static str {
     match provider {
         LlmProvider::Groq => "groq",
@@ -352,10 +368,14 @@ impl RouteState {
         }
     }
 
-    fn tools_for_request(&self, profile: ToolProfile) -> Option<Vec<crate::client::groq::Tool>> {
+    /// The full tool set is sent on every tool-capable request. Tool definitions
+    /// are part of Groq's cached prompt prefix, so a stable set across rounds is
+    /// both cheaper and faster than per-round reduced profiles (which caused a
+    /// full cache miss whenever the profile changed between rounds).
+    fn tools_for_request(&self) -> Option<&'static [Tool]> {
         match self.mode {
             RouteMode::Compound | RouteMode::CompoundMini => None,
-            _ => Some(get_tools_for_profile(profile)),
+            _ => Some(get_all_tools()),
         }
     }
 
@@ -446,11 +466,6 @@ fn is_preflight_route_error(e: &anyhow::Error) -> bool {
     e.to_string().contains("preflight_route_required")
 }
 
-fn is_missing_requested_tool_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("attempted to call tool") && s.contains("not in request.tools")
-}
-
 fn parse_retry_after_seconds(message: &str) -> Option<f64> {
     let marker = "Please try again in ";
     let start = message.find(marker)? + marker.len();
@@ -535,21 +550,12 @@ mod retry_tests {
     }
 
     #[test]
-    fn recognizes_missing_requested_tool_errors() {
-        let err = anyhow::anyhow!(
-            "Tool call validation failed: attempted to call tool 'run_cargo' which was not in request.tools"
-        );
-
-        assert!(is_missing_requested_tool_error(&err));
-    }
-
-    #[test]
     fn compound_messages_end_with_user_and_drop_tool_roles() {
         let mut conversation = Conversation::new("system");
         conversation.add_user_message("please inspect");
         conversation.add_tool_result("call-1", "tool output");
 
-        let messages = compound_messages_for_request(&conversation, 8_000);
+        let messages = compound_messages_for_request(&mut conversation, 8_000);
 
         assert_eq!(messages.last().unwrap().role, "user");
         assert!(!messages.iter().any(|m| m.role == "tool"));
@@ -610,14 +616,6 @@ fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) ->
     }
 }
 
-fn tool_profile_for_round(depth: u32) -> ToolProfile {
-    match depth {
-        0 => ToolProfile::Navigate,
-        1 | 2 => ToolProfile::Full,
-        _ => ToolProfile::Edit,
-    }
-}
-
 /// Process AI response with streaming and tool calls
 async fn process_ai_response(
     client: &GroqClient,
@@ -648,7 +646,11 @@ async fn process_ai_response(
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut first_chunk: bool;
     let mut rate_limit_note_added = false;
-    let mut force_full_tools = false;
+    // Only shrink the request after a genuine context-length rejection. Shrinking on
+    // every retry used to rewrite the message prefix, invalidating Groq's prompt
+    // cache exactly when rate limits made cached (free) tokens most valuable.
+    let mut shrink_context = false;
+    let mut last_usage: Option<Usage>;
 
     let mut attempt: u32 = 0;
     'stream: loop {
@@ -659,41 +661,28 @@ async fn process_ai_response(
         final_content.clear();
         tool_calls.clear();
         first_chunk = true;
+        last_usage = None;
 
-        let request_budget = match attempt {
-            1 if route_state.mode == RouteMode::Primary => context_token_budget,
-            _ => retry_context_token_budget,
+        let request_budget = if route_state.mode == RouteMode::Primary && !shrink_context {
+            context_token_budget
+        } else {
+            retry_context_token_budget
         };
-        let request_messages =
-            request_messages_for_route(conversation, request_budget, route_state);
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = route_state.client_for_request(client);
-        let tool_profile = if force_full_tools {
-            ToolProfile::Full
-        } else {
-            tool_profile_for_round(depth)
+        let request_tools = route_state.tools_for_request();
+        let stream = {
+            let request_messages =
+                request_messages_for_route(conversation, request_budget, route_state);
+            request_client
+                .chat_stream(&request_messages, request_tools)
+                .await
         };
-        let request_tools = route_state.tools_for_request(tool_profile);
-        let stream = request_client
-            .chat_stream(request_messages, request_tools)
-            .await;
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
                 spinner.finish().await;
-                if attempt < MAX_STREAM_ATTEMPTS && is_missing_requested_tool_error(&e) {
-                    force_full_tools = true;
-                    conversation.add_user_message(
-                        "[Vybrid] The previous request used a reduced tool profile, but the model selected a tool outside that profile. Retry now with the full local tool set.",
-                    );
-                    println!(
-                        "{}",
-                        style("Tool was missing from the reduced profile — retrying with full tools...")
-                            .yellow()
-                    );
-                    continue 'stream;
-                }
                 if is_preflight_route_error(&e) {
                     if route_state.route_preflight_wait() {
                         println!(
@@ -721,12 +710,8 @@ async fn process_ai_response(
                     println!(
                         "{}",
                         style(format!(
-                            "Rate limit reached — waiting {}s, then retrying with a compacted {}k-token request...",
-                            delay.as_secs(),
-                            match attempt {
-                                1 => retry_context_token_budget / 1_000,
-                                _ => retry_context_token_budget / 1_000,
-                            }
+                            "Rate limit reached — waiting {}s, then retrying...",
+                            delay.as_secs()
                         ))
                         .yellow()
                     );
@@ -747,14 +732,12 @@ async fn process_ai_response(
                     continue 'stream;
                 }
                 if attempt < MAX_STREAM_ATTEMPTS && is_context_length_error(&e) {
+                    shrink_context = true;
                     println!(
                         "{}",
                         style(format!(
                             "Context was too large for the provider — retrying with a compacted {}k-token request...",
-                            match attempt {
-                                1 => retry_context_token_budget / 1_000,
-                                _ => retry_context_token_budget / 1_000,
-                            }
+                            retry_context_token_budget / 1_000
                         ))
                         .yellow()
                     );
@@ -773,6 +756,9 @@ async fn process_ai_response(
             }
             match chunk_result {
                 Ok(chunk) => {
+                    if let Some(usage) = chunk.effective_usage() {
+                        last_usage = Some(*usage);
+                    }
                     if let Some(choice) = chunk.choices.first() {
                         // Handle reasoning content (thinking)
                         if let Some(reasoning) = &choice.delta.reasoning_content {
@@ -834,21 +820,6 @@ async fn process_ai_response(
                 }
                 Err(e) => {
                     println!();
-                    if attempt < MAX_STREAM_ATTEMPTS && is_missing_requested_tool_error(&e) {
-                        force_full_tools = true;
-                        conversation.add_user_message(
-                            "[Vybrid] The previous request used a reduced tool profile, but the model selected a tool outside that profile. Retry now with the full local tool set.",
-                        );
-                        println!(
-                            "{}",
-                            style(
-                                "Tool was missing from the reduced profile — retrying with full tools...",
-                            )
-                            .yellow()
-                        );
-                        spinner.finish().await;
-                        continue 'stream;
-                    }
                     if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) && !content_started
                     {
                         spinner.finish().await;
@@ -864,7 +835,7 @@ async fn process_ai_response(
                         println!(
                             "{}",
                             style(format!(
-                                "Rate limit reached mid-stream — waiting {}s, then retrying compacted...",
+                                "Rate limit reached mid-stream — waiting {}s, then retrying...",
                                 delay.as_secs()
                             ))
                             .yellow()
@@ -919,6 +890,10 @@ async fn process_ai_response(
         println!();
     }
 
+    if let Some(usage) = &last_usage {
+        ui::print_usage_line(usage, &route_state.route_label(client));
+    }
+
     // Store assistant message
     let assistant_msg = Message {
         role: "assistant".to_string(),
@@ -961,20 +936,43 @@ async fn process_ai_response(
         }
         ui::print_tool_execution(tool_calls.len());
 
-        for tool_call in &tool_calls {
-            if tool_call.function.name.is_empty() {
-                continue;
+        let executable: Vec<&ToolCall> = tool_calls
+            .iter()
+            .filter(|tc| !tc.function.name.is_empty())
+            .collect();
+
+        // Rounds made of purely read-only tools (multi-file reads, greps, metadata
+        // lookups) run concurrently; anything that mutates state stays sequential.
+        let run_concurrently = executable.len() > 1
+            && executable
+                .iter()
+                .all(|tc| is_read_only_tool(&tc.function.name));
+
+        let results: Vec<Result<String>> = if run_concurrently {
+            for tool_call in &executable {
+                ui::print_tool_call(&tool_call.function.name);
             }
+            futures::future::join_all(executable.iter().map(|tc| {
+                execute_tool_with_context(&tc.function.name, &tc.function.arguments, tool_runtime)
+            }))
+            .await
+        } else {
+            let mut results = Vec::with_capacity(executable.len());
+            for tool_call in &executable {
+                ui::print_tool_call(&tool_call.function.name);
+                results.push(
+                    execute_tool_with_context(
+                        &tool_call.function.name,
+                        &tool_call.function.arguments,
+                        tool_runtime,
+                    )
+                    .await,
+                );
+            }
+            results
+        };
 
-            ui::print_tool_call(&tool_call.function.name);
-
-            let result = execute_tool_with_context(
-                &tool_call.function.name,
-                &tool_call.function.arguments,
-                tool_runtime,
-            )
-            .await;
-
+        for (tool_call, result) in executable.iter().zip(results) {
             match &result {
                 Ok(output) => {
                     ui::print_tool_result(&tool_call.function.name, true);
@@ -1038,38 +1036,32 @@ fn compact_tool_result_for_history(tool_name: &str, result: &str, depth: u32) ->
         max_chars
     };
 
-    if result.chars().count() <= max_chars {
+    let total_chars = result.chars().count();
+    if total_chars <= max_chars {
         return result.to_string();
     }
 
-    let head: String = result.chars().take(max_chars / 2).collect();
-    let tail: String = result
-        .chars()
-        .rev()
-        .take(max_chars / 2)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let truncated = conversation::truncate_middle(result, max_chars, "omitted middle of");
     format!(
-        "[Vybrid compacted `{tool_name}` result for history: original {} chars, kept {} chars. Re-read a narrower range if exact omitted content is needed.]\n\n{head}\n\n[... omitted middle ...]\n\n{tail}",
-        result.chars().count(),
-        max_chars
+        "[Vybrid compacted `{tool_name}` result for history: original {total_chars} chars, kept ~{max_chars} chars. Re-read a narrower range if exact omitted content is needed.]\n\n{truncated}"
     )
 }
 
-fn request_messages_for_route(
-    conversation: &Conversation,
+fn request_messages_for_route<'a>(
+    conversation: &'a mut Conversation,
     request_budget: u32,
     route_state: &RouteState,
-) -> Vec<Message> {
+) -> Cow<'a, [Message]> {
     if route_state.is_compound() {
-        return compound_messages_for_request(conversation, request_budget);
+        return Cow::Owned(compound_messages_for_request(conversation, request_budget));
     }
     conversation.messages_for_request_with_budget(request_budget)
 }
 
-fn compound_messages_for_request(conversation: &Conversation, request_budget: u32) -> Vec<Message> {
+fn compound_messages_for_request(
+    conversation: &mut Conversation,
+    request_budget: u32,
+) -> Vec<Message> {
     let source = conversation.messages_for_request_with_budget(request_budget);
     let system = source
         .first()
@@ -1512,7 +1504,7 @@ fn rebuild_llm_client(config: &Config) -> Option<GroqClient> {
     config
         .effective_chat_client_params()
         .map(|(api_key, base_url, model)| {
-            GroqClient::new(api_key, base_url, model, config.max_completion_tokens)
+            GroqClient::new(api_key, base_url, model, config.request_tuning())
         })
 }
 

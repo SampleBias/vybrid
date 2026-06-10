@@ -1,5 +1,14 @@
 use anyhow::Result;
 use serde::Deserialize;
+use std::sync::LazyLock;
+
+/// Shared client so repeated searches reuse pooled connections and TLS sessions.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to create search HTTP client")
+});
 
 /// Perform a Google search using SerpAPI
 pub async fn google_search(query: &str, num_results: usize) -> Result<String> {
@@ -26,8 +35,7 @@ pub async fn google_search(query: &str, num_results: usize) -> Result<String> {
     );
 
     // Make the request
-    let client = reqwest::Client::new();
-    let response = client
+    let response = HTTP_CLIENT
         .get(&url)
         .send()
         .await

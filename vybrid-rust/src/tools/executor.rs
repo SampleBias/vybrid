@@ -16,6 +16,27 @@ pub struct ToolRuntime {
     pub output_store: output::ToolOutputStore,
 }
 
+/// Tools that never mutate project or session state. Rounds consisting solely of
+/// these can run concurrently without changing observable behavior.
+pub fn is_read_only_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_multiple_files"
+            | "enhanced_grep"
+            | "cargo_metadata"
+            | "rust_project_snapshot"
+            | "explain_rust_diagnostic"
+            | "rust_lsp_query"
+            | "read_project_index"
+            | "list_memory_topics"
+            | "read_memory_topic"
+            | "search_memory_transcripts"
+            | "google_search"
+            | "get_current_todo_items"
+    )
+}
+
 /// Execute a tool by name with given arguments
 pub async fn execute_tool(name: &str, arguments: &str) -> Result<String> {
     let runtime = ToolRuntime::default();

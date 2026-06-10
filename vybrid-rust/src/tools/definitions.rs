@@ -1,5 +1,10 @@
 use crate::client::groq::{FunctionDef, Tool};
 use serde_json::json;
+use std::sync::LazyLock;
+
+/// Tool definitions are part of the prompt-cache prefix on Groq, so the same
+/// `Vec` is built once and reused for every request (identical bytes each time).
+static ALL_TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(build_all_tools);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -11,9 +16,10 @@ pub enum ToolProfile {
     None,
 }
 
+#[allow(dead_code)]
 pub fn get_tools_for_profile(profile: ToolProfile) -> Vec<Tool> {
     let names: &[&str] = match profile {
-        ToolProfile::Full => return get_all_tools(),
+        ToolProfile::Full => return get_all_tools().to_vec(),
         ToolProfile::Navigate => &[
             "read_project_index",
             "generate_project_index",
@@ -54,13 +60,18 @@ pub fn get_tools_for_profile(profile: ToolProfile) -> Vec<Tool> {
     };
 
     get_all_tools()
-        .into_iter()
+        .iter()
         .filter(|tool| names.contains(&tool.function.name.as_str()))
+        .cloned()
         .collect()
 }
 
-/// Get all available tools for function calling
-pub fn get_all_tools() -> Vec<Tool> {
+/// All available tools for function calling (cached; stable across requests).
+pub fn get_all_tools() -> &'static [Tool] {
+    &ALL_TOOLS
+}
+
+fn build_all_tools() -> Vec<Tool> {
     vec![
         // File reading
         Tool {

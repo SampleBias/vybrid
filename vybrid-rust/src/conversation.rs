@@ -1,28 +1,56 @@
 use crate::client::groq::Message;
+use std::borrow::Cow;
 
 const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 #[allow(dead_code)]
 pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
-const MIN_COMPACTED_MESSAGE_CHARS: usize = 2_048;
 
-fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
-    if content.chars().count() <= max_chars {
+/// Stable marker inserted when older messages are dropped from the request window.
+/// Its content must never vary between requests: Groq prefix-caches identical
+/// request prefixes (system prompt, tools, leading messages), so any churn here
+/// would invalidate the cache on every call.
+const COMPACTION_MARKER: &str = "[Vybrid context summary] Earlier messages were compacted to stay within the model context window. Keep using the visible recent tool results, compiler spans, and file contents as authoritative context.";
+
+fn compaction_marker_message() -> Message {
+    Message {
+        role: "user".to_string(),
+        content: Some(COMPACTION_MARKER.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    }
+}
+
+/// Keep the head and tail of oversized content. Single forward/backward scan over
+/// char boundaries; avoids intermediate `Vec<char>` allocations.
+pub(crate) fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
         return content.to_string();
     }
     let half = max_chars / 2;
-    let head: String = content.chars().take(half).collect();
-    let tail: String = content
-        .chars()
-        .rev()
-        .take(half)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{head}\n\n[{label} truncated: showing head and tail]\n\n{tail}",)
+    let head_end = content
+        .char_indices()
+        .nth(half)
+        .map(|(idx, _)| idx)
+        .unwrap_or(content.len());
+    let tail_start = if half == 0 {
+        content.len()
+    } else {
+        content
+            .char_indices()
+            .rev()
+            .nth(half - 1)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    };
+    format!(
+        "{}\n\n[{label} truncated: showing head and tail]\n\n{}",
+        &content[..head_end],
+        &content[tail_start..]
+    )
 }
 
-fn estimate_message_tokens(message: &Message) -> u32 {
+pub(crate) fn estimate_message_tokens(message: &Message) -> u32 {
     let mut chars: usize = 0;
     if let Some(c) = &message.content {
         chars += c.len();
@@ -40,73 +68,15 @@ fn estimate_message_tokens(message: &Message) -> u32 {
     chars.div_ceil(4).min(u32::MAX as usize) as u32
 }
 
-fn compact_message_for_request(message: &Message, max_chars: usize) -> Message {
-    let mut compacted = message.clone();
-    if let Some(content) = &message.content {
-        compacted.content = Some(truncate_middle(content, max_chars, "message"));
-    }
-
-    if let Some(tool_calls) = &message.tool_calls {
-        compacted.tool_calls = Some(
-            tool_calls
-                .iter()
-                .map(|tc| {
-                    let mut tc = tc.clone();
-                    tc.function.arguments = truncate_middle(
-                        &tc.function.arguments,
-                        max_chars.min(8 * 1024),
-                        "tool arguments",
-                    );
-                    tc
-                })
-                .collect(),
-        );
-    }
-
-    compacted
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_results_are_truncated_before_storage() {
-        let mut conversation = Conversation::new("system");
-        let large = "x".repeat(MAX_TOOL_RESULT_CHARS + 1024);
-        conversation.add_tool_result("call-1", &large);
-
-        let stored = conversation
-            .messages
-            .last()
-            .unwrap()
-            .content
-            .as_ref()
-            .unwrap();
-        assert!(stored.contains("tool result"));
-        assert!(stored.len() < large.len());
-    }
-
-    #[test]
-    fn request_messages_keep_system_and_recent_messages() {
-        let mut conversation = Conversation::new(&"s".repeat(16_000));
-        for i in 0..120 {
-            conversation.add_user_message(&format!("message-{i}: {}", "x".repeat(4_000)));
-        }
-
-        let request = conversation.messages_for_request();
-        assert_eq!(request.first().unwrap().role, "system");
-        assert!(request.len() < conversation.messages.len());
-        assert!(request
-            .iter()
-            .any(|m| m.content.as_deref().unwrap_or("").contains("compacted")));
-    }
-}
-
 /// Manages conversation history
 #[derive(Debug, Clone)]
 pub struct Conversation {
     pub messages: Vec<Message>,
+    /// Index of the first non-system message included in requests. Monotonically
+    /// non-decreasing within a conversation so consecutive requests share an
+    /// identical prefix (system prompt + marker + same leading messages), which
+    /// maximizes Groq prompt-cache hits.
+    request_floor: usize,
 }
 
 impl Conversation {
@@ -118,6 +88,7 @@ impl Conversation {
                 tool_calls: None,
                 tool_call_id: None,
             }],
+            request_floor: 1,
         }
     }
 
@@ -144,79 +115,81 @@ impl Conversation {
         });
     }
 
+    #[allow(dead_code)]
     pub fn get_messages(&self) -> Vec<Message> {
         self.messages.clone()
     }
 
     /// Request payload with adaptive compaction when history grows large.
     #[allow(dead_code)]
-    pub fn messages_for_request(&self) -> Vec<Message> {
+    pub fn messages_for_request(&mut self) -> Cow<'_, [Message]> {
         self.messages_for_request_with_budget(REQUEST_CONTEXT_TOKEN_BUDGET)
     }
 
-    /// Request payload that keeps the system prompt and the newest complete messages within budget.
-    pub fn messages_for_request_with_budget(&self, token_budget: u32) -> Vec<Message> {
-        if self.estimate_context_tokens() <= token_budget {
-            return self.get_messages();
+    /// Request payload that keeps the system prompt and the newest complete messages
+    /// within budget. Borrows the full history when no compaction is needed (no clone),
+    /// and uses a sticky floor so consecutive requests share a cacheable prefix.
+    pub fn messages_for_request_with_budget(&mut self, token_budget: u32) -> Cow<'_, [Message]> {
+        self.advance_floor_to_fit(token_budget);
+
+        if self.request_floor <= 1 {
+            return Cow::Borrowed(&self.messages);
         }
 
-        let mut messages = Vec::new();
-        let mut used_tokens = 0u32;
-        if let Some(system_msg) = self.messages.first().cloned() {
-            used_tokens = used_tokens.saturating_add(estimate_message_tokens(&system_msg));
-            messages.push(system_msg);
+        let tail = &self.messages[self.request_floor.min(self.messages.len())..];
+        let mut out = Vec::with_capacity(tail.len() + 2);
+        if let Some(system) = self.messages.first() {
+            if system.role == "system" {
+                out.push(system.clone());
+            }
+        }
+        out.push(compaction_marker_message());
+        out.extend(tail.iter().cloned());
+        Cow::Owned(out)
+    }
+
+    /// Advance the request floor (never backward) until the request fits the budget.
+    fn advance_floor_to_fit(&mut self, token_budget: u32) {
+        const MARKER_TOKENS: u32 = 64;
+        if self.request_floor < 1 {
+            self.request_floor = 1;
         }
 
-        let summary = Message {
-            role: "user".to_string(),
-            content: Some(format!(
-                "[Vybrid context summary] Earlier messages were compacted to stay within the model context window. Keep using the visible recent tool results, compiler spans, and file contents as authoritative context."
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-        };
-        used_tokens = used_tokens.saturating_add(estimate_message_tokens(&summary));
-        messages.push(summary);
-
-        let mut selected = Vec::new();
-        let mut remaining_tokens = token_budget.saturating_sub(used_tokens);
-
-        for message in self.messages.iter().skip(1).rev() {
-            if remaining_tokens == 0 {
+        loop {
+            let last_idx = self.messages.len().saturating_sub(1);
+            if self.request_floor > last_idx {
                 break;
             }
 
-            let message_tokens = estimate_message_tokens(message);
-            if message_tokens <= remaining_tokens {
-                selected.push(message.clone());
-                remaining_tokens = remaining_tokens.saturating_sub(message_tokens);
-                continue;
+            let mut used: u32 = self
+                .messages
+                .first()
+                .filter(|m| m.role == "system")
+                .map(estimate_message_tokens)
+                .unwrap_or(0);
+            if self.request_floor > 1 {
+                used = used.saturating_add(MARKER_TOKENS);
+            }
+            for message in &self.messages[self.request_floor..] {
+                used = used.saturating_add(estimate_message_tokens(message));
             }
 
-            let remaining_chars = (remaining_tokens as usize).saturating_mul(4);
-            if remaining_chars >= MIN_COMPACTED_MESSAGE_CHARS {
-                let compacted = compact_message_for_request(message, remaining_chars);
-                let compacted_tokens = estimate_message_tokens(&compacted);
-                if compacted_tokens <= remaining_tokens {
-                    selected.push(compacted);
-                }
+            if used <= token_budget || self.request_floor >= last_idx {
+                break;
             }
-            break;
+
+            self.request_floor += 1;
+            // OpenAI-compatible APIs reject orphan tool messages whose matching
+            // assistant call fell outside the window; skip past them.
+            while self.request_floor < last_idx && self.messages[self.request_floor].role == "tool"
+            {
+                self.request_floor += 1;
+            }
         }
-
-        selected.reverse();
-
-        // OpenAI-compatible APIs reject orphan tool messages whose matching assistant call was
-        // outside the window. Drop any such leading tool messages after compaction.
-        while selected.first().map(|m| m.role.as_str()) == Some("tool") {
-            selected.remove(0);
-        }
-
-        messages.extend(selected);
-        messages
     }
 
     pub fn clear_keeping_system(&mut self) {
+        self.request_floor = 1;
         if let Some(system_msg) = self.messages.first().cloned() {
             if system_msg.role == "system" {
                 self.messages = vec![system_msg];
@@ -228,10 +201,113 @@ impl Conversation {
 
     /// Rough token estimate for the context meter (~4 chars per token for mixed text/code).
     pub fn estimate_context_tokens(&self) -> u32 {
-        let mut chars: usize = 0;
-        for m in &self.messages {
-            chars += estimate_message_tokens(m) as usize * 4;
+        self.messages
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0u32, |acc, t| acc.saturating_add(t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_results_are_truncated_before_storage() {
+        let mut conversation = Conversation::new("system");
+        let large = "x".repeat(MAX_TOOL_RESULT_CHARS + 1024);
+        conversation.add_tool_result("call-1", &large);
+
+        let stored = conversation
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_ref()
+            .unwrap();
+        assert!(stored.contains("tool result"));
+        assert!(stored.len() < large.len());
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail() {
+        let content: String = ('a'..='z').cycle().take(1_000).collect();
+        let truncated = truncate_middle(&content, 100, "test");
+
+        assert!(truncated.starts_with(&content[..50]));
+        assert!(truncated.ends_with(&content[content.len() - 50..]));
+        assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn request_messages_keep_system_and_recent_messages() {
+        let mut conversation = Conversation::new(&"s".repeat(16_000));
+        for i in 0..120 {
+            conversation.add_user_message(&format!("message-{i}: {}", "x".repeat(4_000)));
         }
-        chars.div_ceil(4).min(u32::MAX as usize) as u32
+
+        let total_messages = conversation.messages.len();
+        let request = conversation.messages_for_request();
+        assert_eq!(request.first().unwrap().role, "system");
+        assert!(request.len() < total_messages);
+        assert!(request
+            .iter()
+            .any(|m| m.content.as_deref().unwrap_or("").contains("compacted")));
+    }
+
+    #[test]
+    fn under_budget_requests_borrow_without_compaction() {
+        let mut conversation = Conversation::new("system");
+        conversation.add_user_message("hello");
+
+        let request = conversation.messages_for_request_with_budget(10_000);
+        assert!(matches!(request, Cow::Borrowed(_)));
+        assert_eq!(request.len(), 2);
+    }
+
+    #[test]
+    fn compaction_floor_is_sticky_for_stable_prefixes() {
+        let mut conversation = Conversation::new("system");
+        for i in 0..40 {
+            conversation.add_user_message(&format!("message-{i}: {}", "x".repeat(2_000)));
+        }
+
+        let first: Vec<Message> = conversation
+            .messages_for_request_with_budget(8_000)
+            .to_vec();
+        let second: Vec<Message> = conversation
+            .messages_for_request_with_budget(8_000)
+            .to_vec();
+
+        // Same budget, no new messages: requests must be byte-identical for cache hits.
+        let first_json = serde_json::to_string(&first).unwrap();
+        let second_json = serde_json::to_string(&second).unwrap();
+        assert_eq!(first_json, second_json);
+
+        // New message appended: previous prefix must be preserved exactly.
+        conversation.add_user_message("newest");
+        let third: Vec<Message> = conversation
+            .messages_for_request_with_budget(8_000)
+            .to_vec();
+        for (a, b) in second.iter().zip(third.iter()) {
+            assert_eq!(
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap()
+            );
+        }
+        assert_eq!(third.len(), second.len() + 1);
+    }
+
+    #[test]
+    fn compaction_skips_orphan_tool_messages() {
+        let mut conversation = Conversation::new("system");
+        for i in 0..30 {
+            conversation.add_user_message(&format!("message-{i}: {}", "x".repeat(2_000)));
+            conversation.add_tool_result(&format!("call-{i}"), &"y".repeat(2_000));
+        }
+
+        let request = conversation.messages_for_request_with_budget(6_000);
+        let first_non_marker = request.get(2).map(|m| m.role.clone()).unwrap_or_default();
+        assert_ne!(first_non_marker, "tool");
     }
 }

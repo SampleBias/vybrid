@@ -18,6 +18,10 @@ pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
 pub const DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 pub const DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET: u32 = 18_000;
 pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4_096;
+/// Low temperature improves tool-call JSON validity for a coding agent.
+pub const DEFAULT_TEMPERATURE: f32 = 0.3;
+/// `auto` lets Groq pick the highest service tier available to the org.
+pub const DEFAULT_GROQ_SERVICE_TIER: &str = "auto";
 
 /// Which LLM backend Vybrid uses (`VYBRID_LLM_PROVIDER`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +88,12 @@ pub struct Config {
     pub context_token_budget: u32,
     pub retry_context_token_budget: u32,
     pub max_completion_tokens: u32,
+    pub temperature: f32,
+    /// `VYBRID_REASONING_EFFORT` — `low`/`medium`/`high` (GPT-OSS) or `none`/`default` (Qwen3).
+    /// Unset means the provider default (medium for GPT-OSS).
+    pub reasoning_effort: Option<String>,
+    /// `VYBRID_GROQ_SERVICE_TIER` — `auto`, `on_demand`, `flex`, or `performance`.
+    pub groq_service_tier: String,
 }
 
 impl Config {
@@ -180,6 +190,20 @@ impl Config {
             "VYBRID_MAX_COMPLETION_TOKENS",
             DEFAULT_MAX_COMPLETION_TOKENS,
         );
+        let temperature = std::env::var("VYBRID_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .filter(|t| (0.0..=2.0).contains(t))
+            .unwrap_or(DEFAULT_TEMPERATURE);
+        let reasoning_effort = std::env::var("VYBRID_REASONING_EFFORT")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "low" | "medium" | "high" | "none" | "default"));
+        let groq_service_tier = std::env::var("VYBRID_GROQ_SERVICE_TIER")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "auto" | "on_demand" | "flex" | "performance"))
+            .unwrap_or_else(|| DEFAULT_GROQ_SERVICE_TIER.to_string());
 
         Ok(Self {
             llm_provider,
@@ -204,7 +228,20 @@ impl Config {
             context_token_budget,
             retry_context_token_budget,
             max_completion_tokens,
+            temperature,
+            reasoning_effort,
+            groq_service_tier,
         })
+    }
+
+    /// Generation settings for the chat client.
+    pub fn request_tuning(&self) -> crate::client::groq::RequestTuning {
+        crate::client::groq::RequestTuning {
+            max_completion_tokens: self.max_completion_tokens,
+            temperature: self.temperature,
+            reasoning_effort: self.reasoning_effort.clone(),
+            service_tier: Some(self.groq_service_tier.clone()),
+        }
     }
 
     /// Resolves `(api_key, base_url, model)` for the active [`LlmProvider`] for OpenAI-compatible chat.
