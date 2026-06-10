@@ -365,6 +365,7 @@ The system provides these tools to the AI:
 - Delta may include `reasoning_content` on some models; Groq may omit it
 - **Prompt caching**: Groq prefix-caches GPT-OSS requests (cached tokens are 50% cheaper and exempt from TPM limits). Vybrid keeps the prefix stable on purpose: one static tool set for every round, append-only history within a turn, and a sticky compaction floor in `Conversation`. Do not reintroduce per-round tool profiles or per-request prefix rewrites.
 - **Rate limits**: the client reads `x-ratelimit-remaining-tokens`/`x-ratelimit-reset-tokens` from every response (authoritative when fresh) and falls back to a local sliding-window estimate; 429 `retry-after` headers are honored. Streamed `usage` (including `prompt_tokens_details.cached_tokens`) reconciles the local window and powers the per-response token line.
+- **Tool-round budget**: each turn allows `VYBRID_MAX_TOOL_ROUNDS` tool rounds (default 48). Reaching the cap is not an error: Vybrid asks the user whether to continue for another batch of rounds; declining triggers one final tool-free request so the model summarizes progress and next steps. Identical read-only tool calls repeated 3+ times with no mutation in between get a corrective note appended to the tool result to break model loops early.
 
 ### Streaming Response Format
 ```

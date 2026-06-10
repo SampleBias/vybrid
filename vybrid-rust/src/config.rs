@@ -20,6 +20,8 @@ pub const DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET: u32 = 18_000;
 pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4_096;
 /// Low temperature improves tool-call JSON validity for a coding agent.
 pub const DEFAULT_TEMPERATURE: f32 = 0.3;
+/// Tool rounds per turn before Vybrid asks whether to keep going.
+pub const DEFAULT_MAX_TOOL_ROUNDS: u32 = 48;
 /// `auto` lets Groq pick the highest service tier available to the org.
 pub const DEFAULT_GROQ_SERVICE_TIER: &str = "auto";
 
@@ -94,6 +96,8 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     /// `VYBRID_GROQ_SERVICE_TIER` — `auto`, `on_demand`, `flex`, or `performance`.
     pub groq_service_tier: String,
+    /// `VYBRID_MAX_TOOL_ROUNDS` — tool rounds per turn before asking to continue.
+    pub max_tool_rounds: u32,
 }
 
 impl Config {
@@ -204,6 +208,7 @@ impl Config {
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| matches!(s.as_str(), "auto" | "on_demand" | "flex" | "performance"))
             .unwrap_or_else(|| DEFAULT_GROQ_SERVICE_TIER.to_string());
+        let max_tool_rounds = parse_u32_env("VYBRID_MAX_TOOL_ROUNDS", DEFAULT_MAX_TOOL_ROUNDS);
 
         Ok(Self {
             llm_provider,
@@ -231,6 +236,7 @@ impl Config {
             temperature,
             reasoning_effort,
             groq_service_tier,
+            max_tool_rounds,
         })
     }
 

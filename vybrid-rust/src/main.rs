@@ -255,6 +255,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             config.groq_compound_mini_model.clone(),
             config.compound_enabled,
         );
+        let mut turn_state = TurnState::new(&config);
         if let Err(e) = process_ai_response(
             c,
             &mut conversation,
@@ -262,8 +263,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             0,
             spinner_label,
             &mut route_state,
-            config.context_token_budget,
-            config.retry_context_token_budget,
+            &mut turn_state,
         )
         .await
         {
@@ -316,6 +316,52 @@ fn run_autodream_idle_consolidation(memory_store: &MemoryStore) {
         }
         Ok(AutoDreamOutcome::Skipped(_)) => {}
         Err(e) => eprintln!("{}", style(format!("autoDream warning: {e}")).dim()),
+    }
+}
+
+/// Per-turn agent state: round budget (extendable with user consent) and
+/// repeated-tool-call tracking for loop detection.
+struct TurnState {
+    /// Tool rounds allowed before asking the user whether to continue.
+    max_rounds: u32,
+    context_token_budget: u32,
+    retry_context_token_budget: u32,
+    /// Counts of identical read-only tool calls since the last mutating tool ran.
+    repeated_tool_calls: std::collections::HashMap<String, u32>,
+}
+
+impl TurnState {
+    fn new(config: &Config) -> Self {
+        Self {
+            max_rounds: config.max_tool_rounds,
+            context_token_budget: config.context_token_budget,
+            retry_context_token_budget: config.retry_context_token_budget,
+            repeated_tool_calls: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Detect the model spinning on the same read-only call. Mutating tools clear the
+/// map (project state changed, so re-running an identical read is legitimate again).
+/// Returns a corrective note to append to the tool result from the third identical
+/// execution onward.
+fn record_tool_call_repetition(
+    seen: &mut std::collections::HashMap<String, u32>,
+    name: &str,
+    arguments: &str,
+) -> Option<String> {
+    if !is_read_only_tool(name) {
+        seen.clear();
+        return None;
+    }
+    let key = format!("{name}\u{1}{arguments}");
+    let count = seen.entry(key).and_modify(|c| *c += 1).or_insert(1);
+    if *count >= 3 {
+        Some(format!(
+            "\n\n[Vybrid] This exact `{name}` call has now run {count} times this turn with no file changes in between, so its output cannot differ. Do not repeat it. Use the result above and take the next concrete step toward finishing the task; if you are blocked, say so and summarize instead of calling tools."
+        ))
+    } else {
+        None
     }
 }
 
@@ -550,6 +596,49 @@ mod retry_tests {
     }
 
     #[test]
+    fn repeated_read_only_calls_get_a_nudge_on_third_run() {
+        let mut seen = std::collections::HashMap::new();
+        let args = r#"{"file_path":"src/main.rs"}"#;
+
+        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
+        let nudge = record_tool_call_repetition(&mut seen, "read_file", args);
+
+        assert!(nudge.is_some());
+        assert!(nudge.unwrap().contains("Do not repeat"));
+    }
+
+    #[test]
+    fn different_arguments_are_not_repetitions() {
+        let mut seen = std::collections::HashMap::new();
+
+        for i in 0..5 {
+            let args = format!(r#"{{"file_path":"src/file{i}.rs"}}"#);
+            assert!(record_tool_call_repetition(&mut seen, "read_file", &args).is_none());
+        }
+    }
+
+    #[test]
+    fn mutating_calls_reset_repetition_tracking() {
+        let mut seen = std::collections::HashMap::new();
+        let args = r#"{"subcommand":"check"}"#;
+
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        // run_cargo is mutating, so the map is cleared every time and a third
+        // identical invocation (a legitimate compile/fix loop) is never flagged.
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        assert!(seen.is_empty());
+
+        let read_args = r#"{"file_path":"src/main.rs"}"#;
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+        // A mutation between reads makes a re-read legitimate again.
+        assert!(record_tool_call_repetition(&mut seen, "edit_file", "{}").is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+    }
+
+    #[test]
     fn compound_messages_end_with_user_and_drop_tool_roles() {
         let mut conversation = Conversation::new("system");
         conversation.add_user_message("please inspect");
@@ -624,16 +713,43 @@ async fn process_ai_response(
     depth: u32,
     spinner_label: &'static str,
     route_state: &mut RouteState,
-    context_token_budget: u32,
-    retry_context_token_budget: u32,
+    turn: &mut TurnState,
 ) -> Result<()> {
-    /// Prevents runaway tool loops when the model chains many rounds.
-    const MAX_TOOL_ROUNDS: u32 = 48;
-    if depth >= MAX_TOOL_ROUNDS {
-        anyhow::bail!(
-            "Stopped: tool loop exceeded {} rounds. Try /new or a smaller task.",
-            MAX_TOOL_ROUNDS
+    /// Extra rounds granted each time the user chooses to keep going.
+    const ROUND_EXTENSION: u32 = 24;
+
+    // Reaching the round cap is no longer a hard error that throws away the whole
+    // turn. The user can extend the budget; otherwise the model is asked for one
+    // final tool-free wrap-up so progress so far is summarized instead of lost.
+    let mut final_answer_only = false;
+    if depth >= turn.max_rounds {
+        println!(
+            "{}",
+            style(format!(
+                "Tool loop reached {} rounds without finishing.",
+                turn.max_rounds
+            ))
+            .yellow()
         );
+        let extend = Confirm::new()
+            .with_prompt(format!(
+                "Let the agent continue for another {ROUND_EXTENSION} tool rounds?"
+            ))
+            .default(true)
+            .interact()
+            .unwrap_or(false);
+        if extend {
+            turn.max_rounds += ROUND_EXTENSION;
+        } else {
+            final_answer_only = true;
+            conversation.add_user_message(
+                "[Vybrid] The tool-round limit for this turn was reached. Do not call any more tools. Using the results gathered so far, summarize what was accomplished, what remains unfinished, and the exact next steps to continue.",
+            );
+            println!(
+                "{}",
+                style("Asking the model to wrap up without tools...").dim()
+            );
+        }
     }
 
     /// If the API rejects a tool call, retry with a corrective user note. Some providers stream
@@ -664,14 +780,18 @@ async fn process_ai_response(
         last_usage = None;
 
         let request_budget = if route_state.mode == RouteMode::Primary && !shrink_context {
-            context_token_budget
+            turn.context_token_budget
         } else {
-            retry_context_token_budget
+            turn.retry_context_token_budget
         };
 
         let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = route_state.client_for_request(client);
-        let request_tools = route_state.tools_for_request();
+        let request_tools = if final_answer_only {
+            None
+        } else {
+            route_state.tools_for_request()
+        };
         let stream = {
             let request_messages =
                 request_messages_for_route(conversation, request_budget, route_state);
@@ -737,7 +857,7 @@ async fn process_ai_response(
                         "{}",
                         style(format!(
                             "Context was too large for the provider — retrying with a compacted {}k-token request...",
-                            retry_context_token_budget / 1_000
+                            turn.retry_context_token_budget / 1_000
                         ))
                         .yellow()
                     );
@@ -914,8 +1034,9 @@ async fn process_ai_response(
         record_latest_memory_message(memory, conversation);
     }
 
-    // Execute tool calls if any
-    if !tool_calls.is_empty() {
+    // Execute tool calls if any. After a final-answer-only round no tools were
+    // offered, so any stray tool_calls are ignored rather than recursed on.
+    if !tool_calls.is_empty() && !final_answer_only {
         if route_state.is_compound() {
             conversation.add_user_message(
                 "[Vybrid] Compound returned tool calls, but local tool execution is disabled for Compound routes. Continue by summarizing the intended next local action for OSS/Qwen.",
@@ -928,8 +1049,7 @@ async fn process_ai_response(
                 depth + 1,
                 spinner_label,
                 route_state,
-                context_token_budget,
-                retry_context_token_budget,
+                turn,
             ))
             .await?;
             return Ok(());
@@ -995,8 +1115,15 @@ async fn process_ai_response(
             // Add compacted tool result to conversation. The terminal still shows previews, but
             // the model should not carry large repeated tool payloads across every follow-up turn.
             let result_str = result.unwrap_or_else(|e| format!("Error: {}", e));
-            let history_result =
+            let mut history_result =
                 compact_tool_result_for_history(&tool_call.function.name, &result_str, depth);
+            if let Some(nudge) = record_tool_call_repetition(
+                &mut turn.repeated_tool_calls,
+                &tool_call.function.name,
+                &tool_call.function.arguments,
+            ) {
+                history_result.push_str(&nudge);
+            }
             conversation.add_tool_result(&tool_call.id, &history_result);
             if let Some(memory) = tool_runtime.memory.as_ref() {
                 record_latest_memory_message(memory, conversation);
@@ -1012,8 +1139,7 @@ async fn process_ai_response(
             depth + 1,
             spinner_label,
             route_state,
-            context_token_budget,
-            retry_context_token_budget,
+            turn,
         ))
         .await?;
     }
