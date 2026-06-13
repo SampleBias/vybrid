@@ -8,11 +8,12 @@ mod project_context;
 mod project_docs;
 mod project_index;
 mod rust_agent_reference;
+mod skills;
 mod shell;
 mod tools;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use console::style;
 use dialoguer::Confirm;
 use futures::StreamExt;
@@ -21,10 +22,11 @@ use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, Tool, ToolCall, Usage};
 use crate::config::{Config, LlmProvider};
-use crate::conversation::Conversation;
+use crate::conversation::{Conversation, COMPACT_KEEP_RECENT};
 use crate::lsp::RustLspManager;
 use crate::memory::{AutoDreamOutcome, MemoryStore};
 use crate::project_docs::ProjectDocs;
+use crate::skills::SkillRegistry;
 use crate::tools::definitions::get_all_tools;
 use crate::tools::executor::{execute_tool_with_context, is_read_only_tool, ToolRuntime};
 
@@ -106,7 +108,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
     let project_docs = ProjectDocs::new();
     let memory_store = MemoryStore::new(config.messages_dir.clone());
-    let mut conversation = Conversation::new(&get_system_prompt());
+    let mut skill_registry = SkillRegistry::discover();
+    let mut conversation = Conversation::new(&build_system_prompt(&skill_registry));
     let tool_runtime = ToolRuntime {
         rust_lsp: Some(rust_lsp.clone()),
         memory: Some(memory_store.clone()),
@@ -203,6 +206,27 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         if input.starts_with("/index") {
             handle_index_command(input);
+            continue;
+        }
+
+        if input.starts_with("/skills") {
+            handle_skills_command(input, &mut skill_registry, &mut conversation);
+            continue;
+        }
+
+        if let Some(skill_input) = input.strip_prefix("/skill:") {
+            handle_skill_load_command(skill_input, &skill_registry, &mut conversation);
+            continue;
+        }
+
+        if input.starts_with("/compact") {
+            if let Some(ref c) = client {
+                if let Err(e) = handle_compact_command(input, c, &mut conversation).await {
+                    ui::print_error(&format!("Compact failed: {}", e));
+                }
+            } else {
+                ui::print_error("Compact requires a configured LLM provider. Use /menu to set up API keys.");
+            }
             continue;
         }
 
@@ -1321,7 +1345,16 @@ fn inject_project_docs(user_message: &str, project_docs: &ProjectDocs) -> String
 }
 
 /// Get the system prompt for agent mode
-fn get_system_prompt() -> String {
+fn build_system_prompt(skills: &SkillRegistry) -> String {
+    let skills_block = skills.prompt_block();
+    let skills_policy = if skills_block.is_empty() {
+        "SKILLS POLICY:\n1. No skills are currently loaded. Users can add skills under ~/.vybrid/skills/ or .vybrid/skills/ (see /skills path).\n2. Skills follow the Agent Skills standard: directories with SKILL.md files.\n".to_string()
+    } else {
+        format!(
+            "SKILLS POLICY:\n1. Available skills are listed below by name and description only (progressive disclosure).\n2. When a task matches a skill description, load full instructions with read_file on the skill location path before acting.\n3. Skill scripts and assets use paths relative to the skill directory.\n4. Users can force-load a skill with /skill:name or /skills load name.\n\n{skills_block}\n"
+        )
+    };
+
     format!(
         r#"You are Vybrid, an elite Rust coding agent. Your job is to solve software engineering tasks with compiler-aware Rust judgment, careful file inspection, and verified edits.
 
@@ -1347,6 +1380,7 @@ SKEPTICAL MEMORY POLICY:
 4. Before acting on remembered paths, symbols, commands, dependencies, or behavior, verify them against live project tools such as `read_file`, `enhanced_grep`, `rust_project_snapshot`, `cargo_metadata`, or compiler output.
 5. autoDream may consolidate completed-session transcripts into `topics/autodream.md` after idle gates pass; treat that topic as a compressed hint layer and verify it like any other memory.
 
+{}
 RUST CARGO QUICK REFERENCE:
 {}
 
@@ -1392,6 +1426,7 @@ Guidelines:
 5. Be thorough in analysis and recommendations
 
 IMPORTANT: Be efficient and thorough. If the user asks for implementation, proceed with the smallest verified changes that satisfy the request."#,
+        skills_policy,
         crate::rust_agent_reference::RUST_CARGO_QUICKREF,
         crate::rust_agent_reference::RUST_COMPILE_FIX_LOOP,
         crate::rust_agent_reference::RUST_DIAGNOSTICS_HINTS,
@@ -1487,6 +1522,36 @@ fn show_help() {
     println!(
         "  {}         - Clear project docs",
         style("/docs clear").yellow()
+    );
+    println!();
+    println!("{}", style("Skills Commands:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+    println!(
+        "  {}           - List loaded skills",
+        style("/skills").yellow()
+    );
+    println!(
+        "  {}     - Rescan skill directories",
+        style("/skills reload").yellow()
+    );
+    println!(
+        "  {}       - Show skill search paths",
+        style("/skills path").yellow()
+    );
+    println!(
+        "  {}  - Load a skill into the conversation",
+        style("/skill:<name> [args]").yellow()
+    );
+    println!(
+        "  {}  - Load a skill (alias)",
+        style("/skills load <name> [args]").yellow()
+    );
+    println!();
+    println!("{}", style("Context Commands:").cyan().bold());
+    println!("{}", style("─".repeat(40)).dim());
+    println!(
+        "  {}  - Summarize older messages to free context",
+        style("/compact [focus]").yellow()
     );
     println!();
 }
@@ -1710,5 +1775,194 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
             println!("Available subcommands: show, add, read, clear");
         }
     }
+}
+
+fn handle_skills_command(
+    input: &str,
+    skill_registry: &mut SkillRegistry,
+    conversation: &mut Conversation,
+) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+        None | Some("list") | Some("") => {
+            println!();
+            println!("{}", style("Loaded Skills:").cyan().bold());
+            println!("{}", style("─".repeat(40)).dim());
+            if skill_registry.skills().is_empty() {
+                println!("{}", style("No skills found.").dim());
+                println!(
+                    "Add skills to {} or .vybrid/skills/ (see /skills path).",
+                    dirs::home_dir()
+                        .map(|h| h.join(".vybrid/skills").display().to_string())
+                        .unwrap_or_else(|| "~/.vybrid/skills".to_string())
+                );
+            } else {
+                for skill in skill_registry.skills() {
+                    let hidden = if skill.disable_model_invocation {
+                        " (user-only)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  {} — {}{}",
+                        style(&skill.name).yellow(),
+                        skill.description,
+                        style(hidden).dim()
+                    );
+                    println!("    {}", style(skill.path.display().to_string()).dim());
+                }
+            }
+            println!();
+        }
+        Some("reload") => {
+            skill_registry.rescan();
+            conversation.set_system_prompt(&build_system_prompt(skill_registry));
+            println!(
+                "{}",
+                style(format!(
+                    "Reloaded {} skill(s).",
+                    skill_registry.skills().len()
+                ))
+                .green()
+            );
+        }
+        Some("path") => {
+            println!();
+            println!("{}", style("Skill search paths:").cyan().bold());
+            println!("{}", style("─".repeat(40)).dim());
+            for path in SkillRegistry::discovery_paths() {
+                let status = if path.exists() { "exists" } else { "missing" };
+                println!(
+                    "  {} ({})",
+                    path.display(),
+                    style(status).dim()
+                );
+            }
+            println!(
+                "{}",
+                style("Copy example skills from vybrid-rust/skills/ into ~/.vybrid/skills/ or .vybrid/skills/.").dim()
+            );
+            println!();
+        }
+        Some("load") => {
+            let name = parts.get(2).unwrap_or(&"").to_string();
+            if name.is_empty() {
+                println!("{}", style("Usage: /skills load <name> [args]").dim());
+                return;
+            }
+            let args = parts.get(3..).map(|p| p.join(" "));
+            handle_skill_load_by_name(&name, args.as_deref(), skill_registry, conversation);
+        }
+        Some(unknown) => {
+            println!(
+                "{}",
+                style(format!("Unknown /skills subcommand: '{unknown}'")).red()
+            );
+            println!("Available subcommands: list, reload, path, load");
+        }
+    }
+}
+
+fn handle_skill_load_command(
+    skill_input: &str,
+    skill_registry: &SkillRegistry,
+    conversation: &mut Conversation,
+) {
+    let mut parts = skill_input.splitn(2, ' ');
+    let name = parts.next().unwrap_or("").trim();
+    let args = parts.next().map(str::trim);
+    if name.is_empty() {
+        println!("{}", style("Usage: /skill:<name> [args]").dim());
+        return;
+    }
+    handle_skill_load_by_name(name, args, skill_registry, conversation);
+}
+
+fn handle_skill_load_by_name(
+    name: &str,
+    user_args: Option<&str>,
+    skill_registry: &SkillRegistry,
+    conversation: &mut Conversation,
+) {
+    match skill_registry.load_body(name, user_args) {
+        Ok(body) => {
+            conversation.add_user_message(&format!("[Skill: {name}]\n\n{body}"));
+            println!(
+                "{}",
+                style(format!("Loaded skill '{name}' into the conversation.")).green()
+            );
+        }
+        Err(e) => ui::print_error(&format!("{e}")),
+    }
+}
+
+async fn handle_compact_command(
+    input: &str,
+    client: &GroqClient,
+    conversation: &mut Conversation,
+) -> Result<()> {
+    let focus = input
+        .strip_prefix("/compact")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(
+            "Preserve task goal, files edited, compiler errors, key decisions, and remaining work.",
+        );
+
+    let Some((first_kept, transcript)) = conversation.compactable_transcript(COMPACT_KEEP_RECENT)
+    else {
+        println!(
+            "{}",
+            style("Not enough history to compact. Continue the conversation first.").dim()
+        );
+        return Ok(());
+    };
+
+    let before_tokens = conversation.estimate_context_tokens();
+    let mut spinner = ui::SpinnerGuard::new("compact");
+    let summary_request = vec![
+        Message {
+            role: "system".to_string(),
+            content: Some(
+                "You summarize coding-agent conversation history for context compaction. \
+                 Output a dense bullet summary only. Preserve exact file paths, error codes, \
+                 symbol names, commands run, decisions made, and unfinished tasks. \
+                 Do not invent details."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Some(format!(
+                "Summarize the conversation transcript below.\n\nFocus: {focus}\n\n---\n{transcript}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let response = client
+        .chat(&summary_request, None)
+        .await
+        .context("Compaction summarization request failed")?;
+    spinner.finish().await;
+
+    let summary = response
+        .content
+        .unwrap_or_else(|| "No summary returned.".to_string());
+    conversation.apply_manual_compaction(&summary, first_kept);
+    let after_tokens = conversation.estimate_context_tokens();
+
+    println!(
+        "{}",
+        style(format!(
+            "Compacted conversation (~{} → ~{} estimated tokens). Recent messages preserved.",
+            before_tokens, after_tokens
+        ))
+        .green()
+    );
+    Ok(())
 }
 

@@ -7,6 +7,7 @@ pub mod project_context;
 pub mod project_docs;
 pub mod project_index;
 pub mod rust_agent_reference;
+pub mod skills;
 pub mod shell;
 pub mod tools;
 pub mod ui;

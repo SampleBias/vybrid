@@ -11,6 +11,11 @@ pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 /// would invalidate the cache on every call.
 const COMPACTION_MARKER: &str = "[Vybrid context summary] Earlier messages were compacted to stay within the model context window. Keep using the visible recent tool results, compiler spans, and file contents as authoritative context.";
 
+pub const MANUAL_COMPACTION_PREFIX: &str = "[Vybrid compaction summary]";
+pub const COMPACT_KEEP_RECENT: usize = 8;
+pub const COMPACT_MIN_TO_SUMMARIZE: usize = 4;
+const COMPACT_TRANSCRIPT_MAX_CHARS: usize = 24_000;
+
 fn compaction_marker_message() -> Message {
     Message {
         role: "user".to_string(),
@@ -199,6 +204,97 @@ impl Conversation {
         self.messages.clear();
     }
 
+    pub fn set_system_prompt(&mut self, prompt: &str) {
+        self.request_floor = 1;
+        if let Some(system) = self.messages.first_mut() {
+            if system.role == "system" {
+                system.content = Some(prompt.to_string());
+                return;
+            }
+        }
+        self.messages.insert(
+            0,
+            Message {
+                role: "system".to_string(),
+                content: Some(prompt.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
+    }
+
+    /// Returns `(first_kept_index, transcript_text)` for manual compaction, or None if
+    /// there is too little history to summarize.
+    pub fn compactable_transcript(&self, keep_recent: usize) -> Option<(usize, String)> {
+        if self.messages.len() <= 1 {
+            return None;
+        }
+
+        let last_idx = self.messages.len().saturating_sub(1);
+        let mut first_kept = last_idx.saturating_sub(keep_recent.saturating_sub(1));
+        if first_kept <= 1 {
+            return None;
+        }
+
+        while first_kept < last_idx && self.messages[first_kept].role == "tool" {
+            first_kept += 1;
+        }
+
+        let to_summarize = first_kept.saturating_sub(1);
+        if to_summarize < COMPACT_MIN_TO_SUMMARIZE {
+            return None;
+        }
+
+        let mut transcript = String::new();
+        for message in &self.messages[1..first_kept] {
+            let role = &message.role;
+            let content = message.content.as_deref().unwrap_or("");
+            let snippet = if content.chars().count() > 2_000 {
+                truncate_middle(content, 2_000, role)
+            } else {
+                content.to_string()
+            };
+            transcript.push_str(&format!("[{role}] {snippet}\n\n"));
+            if transcript.chars().count() > COMPACT_TRANSCRIPT_MAX_CHARS {
+                transcript = truncate_middle(
+                    &transcript,
+                    COMPACT_TRANSCRIPT_MAX_CHARS,
+                    "compaction transcript",
+                );
+                break;
+            }
+        }
+
+        if transcript.trim().is_empty() {
+            return None;
+        }
+
+        Some((first_kept, transcript))
+    }
+
+    pub fn apply_manual_compaction(&mut self, summary: &str, first_kept_index: usize) {
+        if first_kept_index <= 1 || first_kept_index >= self.messages.len() {
+            return;
+        }
+
+        let summary_message = Message {
+            role: "user".to_string(),
+            content: Some(format!("{MANUAL_COMPACTION_PREFIX} {summary}")),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        let system = self.messages.first().cloned();
+        let tail = self.messages[first_kept_index..].to_vec();
+        self.messages.clear();
+        if let Some(system) = system {
+            self.messages.push(system);
+        }
+        self.messages.push(summary_message);
+        self.messages.extend(tail);
+        self.request_floor = 1;
+    }
+
     /// Rough token estimate for the context meter (~4 chars per token for mixed text/code).
     pub fn estimate_context_tokens(&self) -> u32 {
         self.messages
@@ -309,5 +405,67 @@ mod tests {
         let request = conversation.messages_for_request_with_budget(6_000);
         let first_non_marker = request.get(2).map(|m| m.role.clone()).unwrap_or_default();
         assert_ne!(first_non_marker, "tool");
+    }
+
+    #[test]
+    fn compactable_transcript_requires_enough_history() {
+        let mut conversation = Conversation::new("system");
+        for i in 0..3 {
+            conversation.add_user_message(&format!("msg-{i}"));
+        }
+        assert!(conversation.compactable_transcript(COMPACT_KEEP_RECENT).is_none());
+    }
+
+    #[test]
+    fn compactable_transcript_returns_middle_messages() {
+        let mut conversation = Conversation::new("system");
+        for i in 0..20 {
+            conversation.add_user_message(&format!("message-{i}"));
+            conversation.add_tool_result(&format!("call-{i}"), "tool output");
+        }
+
+        let (first_kept, transcript) = conversation
+            .compactable_transcript(COMPACT_KEEP_RECENT)
+            .expect("expected compactable transcript");
+        assert!(first_kept > 1);
+        assert!(transcript.contains("[user]"));
+        assert!(transcript.contains("message-0"));
+    }
+
+    #[test]
+    fn apply_manual_compaction_replaces_middle_and_resets_floor() {
+        let mut conversation = Conversation::new("system");
+        for i in 0..20 {
+            conversation.add_user_message(&format!("message-{i}"));
+        }
+        conversation.request_floor = 5;
+
+        let (first_kept, _) = conversation
+            .compactable_transcript(COMPACT_KEEP_RECENT)
+            .expect("expected compactable transcript");
+        let before = conversation.messages.len();
+        conversation.apply_manual_compaction("summary of earlier work", first_kept);
+
+        assert_eq!(conversation.request_floor, 1);
+        assert!(conversation.messages.len() < before);
+        assert!(conversation.messages[1]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains(MANUAL_COMPACTION_PREFIX));
+        assert!(conversation.messages.last().unwrap().content.as_deref().unwrap_or("").contains("message-19"));
+    }
+
+    #[test]
+    fn set_system_prompt_replaces_system_message() {
+        let mut conversation = Conversation::new("old prompt");
+        conversation.request_floor = 4;
+        conversation.add_user_message("hello");
+        conversation.set_system_prompt("new prompt");
+        assert_eq!(
+            conversation.messages[0].content.as_deref(),
+            Some("new prompt")
+        );
+        assert_eq!(conversation.request_floor, 1);
     }
 }
