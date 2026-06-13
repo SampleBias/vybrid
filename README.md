@@ -12,10 +12,16 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 - **Multi-Provider LLM**: Groq (default), [OpenRouter](https://openrouter.ai/) (400+ cloud models), or local [LM Studio](https://lmstudio.ai/)
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
+- **Agent Skills**: Pi-compatible [Agent Skills](https://agentskills.io/specification) — on-demand `SKILL.md` workflows discovered from `~/.vybrid/skills/`, `.vybrid/skills/`, and shared `~/.agents/skills/` paths
+- **Context Compaction**: `/compact` summarizes older conversation history via the LLM to free context; passive overflow compaction still applies automatically during long sessions
+- **Three-Layer Memory**: Compact `MEMORY.md` index, on-demand topic files, and searchable raw transcripts with optional autoDream consolidation
+- **Project Index**: `index.md` navigation via `/index` and `read_project_index` / `generate_project_index` tools
+- **Project Docs**: Persistent `.vybrid/docs.md` context via `/docs` commands
+- **Thinking Levels**: `/thinking` to show or set GPT-OSS reasoning effort (`low` / `medium` / `high`)
 - **Rust-Aware Diagnostics**: Structured Cargo/rustc summaries for ownership, traits, enums, lifetimes, async, and clippy feedback
 - **Optional Rust LSP**: Connect to `rust-analyzer` for live diagnostics, hover, definitions, references, symbols, completions, code actions, and formatting edits
 - **Persistent Shell**: Interactive shell mode with state persistence and filesystem path autocomplete
-- **Function Calling**: Tools for file operations, code search, Cargo, rustc explanations, Rust project snapshots, and optional LSP queries
+- **Function Calling**: Tools for file operations, code search, Cargo, rustc explanations, Rust project snapshots, memory, and optional LSP queries
 
 ## Requirements
 
@@ -242,6 +248,14 @@ Vybrid starts directly in **Agent Mode** with all tools available.
 
 ### Agent Mode Commands
 
+Run **`/help`** in the REPL for the full list. Example:
+
+<p align="center">
+  <img src="assets/vybrid-help-menu.png" alt="Vybrid /help menu showing general, project docs, skills, and context commands" width="920" />
+</p>
+
+#### General
+
 | Command | Description |
 |---------|-------------|
 | `exit`, `quit` | Exit Vybrid |
@@ -253,7 +267,81 @@ Vybrid starts directly in **Agent Mode** with all tools available.
 | `/new` | Start new conversation |
 | `/help` | Show help |
 | `/menu` | Setup menu: Groq, OpenRouter, LM Studio, SerpAPI, Rust LSP (saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
+| `/index` | Show, refresh, or print path for compact project `index.md` |
+| `/thinking` | Show or set reasoning effort: `/thinking low\|medium\|high\|default` |
 | `clear` | Clear screen |
+
+#### Project docs
+
+| Command | Description |
+|---------|-------------|
+| `/docs` | Show current project docs (`.vybrid/docs.md`) |
+| `/docs add <file>` | Append docs from a file |
+| `/docs read` | Enter docs interactively |
+| `/docs clear` | Clear project docs |
+
+#### Skills
+
+| Command | Description |
+|---------|-------------|
+| `/skills` | List discovered skills |
+| `/skills reload` | Rescan skill directories and refresh the system prompt |
+| `/skills path` | Show skill search paths |
+| `/skill:<name> [args]` | Load a skill into the conversation |
+| `/skills load <name> [args]` | Same as `/skill:<name>` |
+
+#### Context
+
+| Command | Description |
+|---------|-------------|
+| `/compact [focus]` | Summarize older messages to free context (requires a configured LLM) |
+
+### Agent Skills
+
+Vybrid implements the [Agent Skills standard](https://agentskills.io/specification). Skills are directories with a `SKILL.md` file (YAML frontmatter + instructions). At startup, only **names and descriptions** are injected into the system prompt; the agent loads full instructions on demand with `read_file` or when you run `/skill:<name>`.
+
+**Search paths** (first match wins on name collisions):
+
+| Scope | Path |
+|-------|------|
+| Global | `~/.vybrid/skills/` |
+| Global (shared) | `~/.agents/skills/` |
+| Project | `.vybrid/skills/` under the project root |
+| Project (shared) | `.agents/skills/` walking up from the current directory |
+
+Copy the example skill from [`vybrid-rust/skills/rust-compile-fix-loop/`](vybrid-rust/skills/rust-compile-fix-loop/) into one of those directories, then run **`/skills reload`**.
+
+Minimal `SKILL.md` shape:
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when the agent should use it.
+---
+
+# Instructions
+
+Steps, scripts, and references go here.
+```
+
+### Context compaction
+
+Long agent sessions can fill the context window. Vybrid handles this in two ways:
+
+1. **Automatic** — When a request exceeds the token budget, older messages are dropped from the API payload while keeping a stable prefix for Groq prompt caching.
+2. **Manual** — Run **`/compact`** (optional focus text) to LLM-summarize older history in place, preserving the most recent messages. Example: `/compact preserve compiler errors and files still being edited`.
+
+The status line shows estimated context usage before each prompt (`ctx` meter).
+
+### Project memory
+
+Vybrid keeps long-term hints in `.vybrid/memory/` without loading everything every turn:
+
+- **`MEMORY.md`** — Compact index of pointers (injected lightly each turn)
+- **`topics/<name>.md`** — Detailed topic files, read via `read_memory_topic` when relevant
+- **Raw transcripts** — Stored under `~/.vybrid/messages/`; search with `search_memory_transcripts` for specific paths, symbols, or error codes
+
+After enough completed sessions, **autoDream** may consolidate recent transcripts into `topics/autodream.md`. Treat all memory as hints — verify against live project tools before acting.
 
 ### `/menu` setup
 
@@ -282,6 +370,8 @@ The AI can use these tools automatically:
 - **Rust**: `run_cargo`, `cargo_metadata`, `rust_project_snapshot`, `explain_rust_diagnostic`
 - **Rust LSP**: `rust_lsp_query` when `rust-analyzer` is connected
 - **Search**: `enhanced_grep`, `google_search`
+- **Memory**: `list_memory_topics`, `read_memory_topic`, `search_memory_transcripts`
+- **Project index**: `read_project_index`, `generate_project_index`
 - **Project**: `create_project_structure`, `get_current_todo_items`, `mark_todo_complete`
 
 ## Project Structure
@@ -289,11 +379,15 @@ The AI can use these tools automatically:
 ```
 vybrid-rust/
 ├── Cargo.toml          # Dependencies and project config
+├── skills/             # Example Agent Skills (copy to ~/.vybrid/skills/ or .vybrid/skills/)
 ├── src/
-│   ├── main.rs         # Entry point
+│   ├── main.rs         # Entry point and slash commands
 │   ├── menu.rs         # /menu setup (Groq, OpenRouter, LM Studio, SerpAPI, LSP)
 │   ├── config.rs       # Configuration management
-│   ├── conversation.rs # Conversation history and context pruning
+│   ├── conversation.rs # Conversation history, compaction, context pruning
+│   ├── memory.rs       # Three-layer memory and autoDream consolidation
+│   ├── skills.rs       # Agent Skills discovery and loading
+│   ├── project_index.rs # index.md generation
 │   ├── lsp.rs          # Optional rust-analyzer LSP client
 │   ├── project_docs.rs # Project-specific docs context
 │   ├── rust_agent_reference.rs # Rust workflow and diagnostic guidance
@@ -304,6 +398,7 @@ vybrid-rust/
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas
 │   │   ├── executor.rs     # Tool dispatcher
+│   │   ├── memory.rs       # Memory tool handlers
 │   │   ├── cargo.rs        # Structured Cargo and diagnostics
 │   │   ├── rust.rs         # rustc explanations and project snapshots
 │   │   ├── file_ops.rs     # File operations
@@ -348,11 +443,18 @@ cargo clippy -- -D warnings
 
 Vybrid also stores runtime data in `~/.vybrid/`:
 
-- `messages/` - Inter-process communication for daemon mode
-- `daemon_pool/` - Daemon lock files
-- `progress/` - Request progress tracking
+- `messages/` — Session transcripts (searchable via memory tools)
+- `progress/` — Tool result offloads and request progress
+- `cache/` — OpenRouter model catalog cache
+- `skills/` — Optional global Agent Skills (also `.vybrid/skills/` per project)
 
 ## Changelog
+
+### Unreleased
+
+- **Agent Skills**: Pi-compatible `SKILL.md` discovery, progressive system-prompt disclosure, `/skills` management commands, and `/skill:<name>` loading. Example skill: `vybrid-rust/skills/rust-compile-fix-loop/`.
+- **`/compact`**: Manual LLM summarization of older conversation history to free context while preserving recent messages.
+- README: `/help` menu screenshot and expanded command, skills, memory, and compaction documentation.
 
 ### 1.1.0
 
