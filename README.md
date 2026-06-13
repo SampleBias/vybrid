@@ -10,6 +10,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 
 ## Features
 
+- **Multi-Provider LLM**: Groq (default), [OpenRouter](https://openrouter.ai/) (400+ cloud models), or local [LM Studio](https://lmstudio.ai/)
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
 - **Rust-Aware Diagnostics**: Structured Cargo/rustc summaries for ownership, traits, enums, lifetimes, async, and clippy feedback
 - **Optional Rust LSP**: Connect to `rust-analyzer` for live diagnostics, hover, definitions, references, symbols, completions, code actions, and formatting edits
@@ -23,6 +24,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 - Optional: [`rust-analyzer`](https://rust-analyzer.github.io/) for Rust LSP integration
 - One of:
   - **[Groq](https://console.groq.com/)** API key ([`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b)), or
+  - **[OpenRouter](https://openrouter.ai/)** API key (access to hundreds of models via one OpenAI-compatible API), or
   - **[LM Studio](https://lmstudio.ai/)** with the [local server](https://lmstudio.ai/docs/developer/core/server) running and a model loaded (OpenAI-compatible API — see below)
 
 ## Installation
@@ -71,7 +73,7 @@ cp target/release/vybrid ~/.local/bin/
 Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (project wins if both define the same variable). When you save via **`/menu`**, both files are updated so you only configure once and can run Vybrid from **any directory**. Use **`/menu`** or create the files manually:
 
 ```bash
-# LLM backend: groq (default) or lmstudio
+# LLM backend: groq (default), openrouter, or lmstudio
 # VYBRID_LLM_PROVIDER=groq
 
 # --- Groq (cloud) ---
@@ -87,6 +89,10 @@ GROQ_API_KEY=your_api_key_here
 # VYBRID_REASONING_EFFORT=low
 # Optional: Groq service tier auto|on_demand|flex|performance (default auto)
 # VYBRID_GROQ_SERVICE_TIER=auto
+
+# --- OpenRouter (multi-provider cloud) — set VYBRID_LLM_PROVIDER=openrouter ---
+# OPENROUTER_API_KEY=your_openrouter_api_key_here
+# OPENROUTER_MODEL=openai/gpt-4o-mini
 
 # --- LM Studio (local) — set VYBRID_LLM_PROVIDER=lmstudio and fill these ---
 # LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
@@ -104,12 +110,37 @@ SERPAPI_KEY=your_serpapi_key_here
 
 ### Active provider (`VYBRID_LLM_PROVIDER`) and coexisting credentials
 
-- **`VYBRID_LLM_PROVIDER`** is `groq` (default) or `lmstudio`. It selects **which backend handles chat**; only one runs at a time.
-- You can keep **both** Groq settings (`GROQ_API_KEY`, optional `GROQ_MODEL`, optional `GROQ_RATE_LIMIT_FALLBACK_MODEL`) **and** LM Studio settings (`LM_STUDIO_*`) in the same `~/.vybrid/.env` and `vybrid-rust/.env`. They do not overwrite each other. Switching the active provider (via **`/menu`** — e.g. “Configure LM Studio” or “Switch to Groq (cloud)”) or editing **`VYBRID_LLM_PROVIDER`** only changes **which** profile is used, not the stored keys for the other backend.
+- **`VYBRID_LLM_PROVIDER`** is `groq` (default), `openrouter`, or `lmstudio`. It selects **which backend handles chat**; only one runs at a time.
+- You can keep **Groq**, **OpenRouter**, and **LM Studio** settings in the same `~/.vybrid/.env` and `vybrid-rust/.env`. They do not overwrite each other. Switching the active provider (via **`/menu`** or editing **`VYBRID_LLM_PROVIDER`**) only changes **which** profile is used, not the stored keys for the other backends.
 
 If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the `vybrid-rust` directory so Vybrid can find `.env`.
 
-Create a Groq key in the [Groq Console](https://console.groq.com/keys). For LM Studio, use **`/menu`** → “Configure LM Studio” or set the variables above; see [LM Studio (local, offline)](#lm-studio-local-offline).
+Create a Groq key in the [Groq Console](https://console.groq.com/keys). For OpenRouter, get a key at [openrouter.ai/keys](https://openrouter.ai/keys) and pick a model via **`/menu`** (see [OpenRouter (cloud, multi-provider)](#openrouter-cloud-multi-provider)). For LM Studio, use **`/menu`** → **LM Studio** or set the variables above; see [LM Studio (local, offline)](#lm-studio-local-offline).
+
+### OpenRouter (cloud, multi-provider)
+
+Vybrid talks to [OpenRouter](https://openrouter.ai/) through its **OpenAI-compatible** API at `https://openrouter.ai/api/v1/chat/completions` — the same chat flow as Groq and LM Studio, with access to hundreds of models from Anthropic, OpenAI, Google, Meta, DeepSeek, and others.
+
+1. Create an API key at [openrouter.ai/keys](https://openrouter.ai/keys).
+2. Run **`/menu`** → **OpenRouter (multi-provider models)** → **Add or update OpenRouter API key**.
+3. Run **`/menu`** → **OpenRouter** → **Select model** and choose how to browse:
+   - **Recommended for coding** — popular programming models that support tool calling (~30–50 items; best default)
+   - **Search by name** — e.g. `claude`, `gpt-4`, `qwen`
+   - **Browse by provider** — Anthropic, OpenAI, Google, etc.
+   - **Advanced: full catalog** — complete OpenRouter list (models without tool support are marked `[no tools]`)
+4. Run **`/menu`** → **OpenRouter** → **Switch to OpenRouter** (or set **`VYBRID_LLM_PROVIDER=openrouter`**).
+
+Model lists are fetched live from OpenRouter and cached under `~/.vybrid/cache/` for six hours. Use **Refresh model catalog** in the OpenRouter submenu to force a refetch.
+
+Manual `.env` example:
+
+```bash
+VYBRID_LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_MODEL=anthropic/claude-sonnet-4
+```
+
+Vybrid only sends tool calls to models that support the `tools` parameter. The recommended picker filters to tool-capable models automatically.
 
 ### LM Studio (local, offline)
 
@@ -121,13 +152,13 @@ Vybrid talks to LM Studio’s **OpenAI-compatible** HTTP API ([docs](https://lms
 4. Set **`LM_STUDIO_BASE_URL`** if you are not using the default host/port (default in Vybrid is `http://127.0.0.1:1234/v1`).
 5. **API key**: If the server has **Require authentication** off, you can use a placeholder (Vybrid defaults to `lm-studio`). If authentication is on (LM Studio 0.4.0+), create a token under **Developer → Server Settings → Manage Tokens** and set **`LM_STUDIO_API_KEY`**; requests use `Authorization: Bearer` as in the [authentication docs](https://lmstudio.ai/docs/developer/core/authentication).
 
-Use **`/menu`** to save these to `~/.vybrid/.env` and `vybrid-rust/.env`. Use **`/menu`** → “Switch to Groq (cloud)” when you want to return to Groq.
+Use **`/menu`** to save these to `~/.vybrid/.env` and `vybrid-rust/.env`. Use **`/menu`** → **Groq** → **Switch to Groq** when you want to return to Groq.
 
 Keep real keys out of version control: `.env` and `.env.*` are listed in the repo `.gitignore` (only `.env.example` is meant to be committed as a template).
 
 ### Rust LSP (rust-analyzer)
 
-Vybrid can optionally start and talk to **`rust-analyzer`** over the Language Server Protocol (LSP). This is separate from the LLM provider: Groq or LM Studio still handles chat, while `rust-analyzer` provides editor-grade Rust intelligence when enabled.
+Vybrid can optionally start and talk to **`rust-analyzer`** over the Language Server Protocol (LSP). This is separate from the LLM provider: Groq, OpenRouter, or LM Studio still handles chat, while `rust-analyzer` provides editor-grade Rust intelligence when enabled.
 
 The LSP is **off by default**. If `VYBRID_RUST_LSP_ENABLED=true`, Vybrid tries to connect at startup. If `rust-analyzer` is missing or the command is wrong, Vybrid shows an error indicator but keeps the rest of the app working.
 
@@ -221,8 +252,22 @@ Vybrid starts directly in **Agent Mode** with all tools available.
 | `/tools` | List available AI tools |
 | `/new` | Start new conversation |
 | `/help` | Show help |
-| `/menu` | Menu (Groq, LM Studio, SerpAPI, Rust LSP; saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
+| `/menu` | Setup menu: Groq, OpenRouter, LM Studio, SerpAPI, Rust LSP (saved to `~/.vybrid/.env` and `vybrid-rust/.env`) |
 | `clear` | Clear screen |
+
+### `/menu` setup
+
+The setup menu is organized by provider so long model lists stay manageable:
+
+| Submenu | What it configures |
+|---------|-------------------|
+| **Groq** | API key, quick setup with optional SerpAPI, switch active provider |
+| **OpenRouter** | API key, tiered model picker, switch provider, refresh model cache |
+| **LM Studio** | Local server URL, API token, model id |
+| **SerpAPI** | Google search key for the `google_search` tool |
+| **Rust LSP** | `rust-analyzer` connect, auto-connect, workspace root |
+
+OpenRouter’s model picker defaults to **Recommended for coding** (popular, tool-capable programming models). Use search, browse-by-provider, or the full catalog when you need something specific.
 
 ### Persistent Shell Mode
 
@@ -246,6 +291,7 @@ vybrid-rust/
 ├── Cargo.toml          # Dependencies and project config
 ├── src/
 │   ├── main.rs         # Entry point
+│   ├── menu.rs         # /menu setup (Groq, OpenRouter, LM Studio, SerpAPI, LSP)
 │   ├── config.rs       # Configuration management
 │   ├── conversation.rs # Conversation history and context pruning
 │   ├── lsp.rs          # Optional rust-analyzer LSP client
@@ -253,7 +299,8 @@ vybrid-rust/
 │   ├── rust_agent_reference.rs # Rust workflow and diagnostic guidance
 │   ├── ui.rs           # Terminal UI helpers
 │   ├── client/
-│   │   └── groq.rs     # Groq OpenAI-compatible chat client
+│   │   ├── groq.rs     # OpenAI-compatible chat client (Groq, OpenRouter, LM Studio)
+│   │   └── openrouter.rs # OpenRouter models catalog API
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas
 │   │   ├── executor.rs     # Tool dispatcher
@@ -309,9 +356,11 @@ Vybrid also stores runtime data in `~/.vybrid/`:
 
 ### 1.1.0
 
+- **OpenRouter**: Added as a third LLM provider with live model catalog, cached lists, tiered `/menu` picker (recommended, search, provider, full catalog), and `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` env support.
+- **`/menu`**: Reorganized into provider submenus (Groq, OpenRouter, LM Studio, SerpAPI, Rust LSP) with scrollable model selection.
 - Rust LSP: added optional `rust-analyzer` integration through `/menu`, prompt status indicator, persisted LSP settings, and the `rust_lsp_query` tool.
 - README: documented **`VYBRID_LLM_PROVIDER`** and keeping Groq + LM Studio credentials in the same env files.
-- CLI: while waiting for the model, the spinner label is **`local`** when LM Studio is the active provider (still **`groq`** for Groq).
+- CLI: spinner label is **`groq`**, **`openrouter`**, or **`local`** (LM Studio) depending on the active provider.
 
 ## License
 
@@ -319,4 +368,4 @@ MIT License
 
 ## Credits
 
-Default inference uses [Groq](https://groq.com/) with [`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b) ([OpenAI-compatible API](https://console.groq.com/docs/openai)). You can instead use a local model via [LM Studio](https://lmstudio.ai/) ([OpenAI compatibility](https://lmstudio.ai/docs/developer/openai-compat)).
+Default inference uses [Groq](https://groq.com/) with [`openai/gpt-oss-120b`](https://console.groq.com/docs/model/openai/gpt-oss-120b) ([OpenAI-compatible API](https://console.groq.com/docs/openai)). You can instead use [OpenRouter](https://openrouter.ai/) for access to hundreds of cloud models, or a local model via [LM Studio](https://lmstudio.ai/) ([OpenAI compatibility](https://lmstudio.ai/docs/developer/openai-compat)).
