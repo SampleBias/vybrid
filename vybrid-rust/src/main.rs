@@ -3,6 +3,7 @@ mod config;
 mod conversation;
 mod lsp;
 mod memory;
+mod menu;
 mod project_context;
 mod project_docs;
 mod project_index;
@@ -11,9 +12,9 @@ mod shell;
 mod tools;
 mod ui;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::Confirm;
 use futures::StreamExt;
 use std::borrow::Cow;
 use std::io::{self, Write};
@@ -59,14 +60,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     ui::display_mode_header();
     ui::display_cwd();
 
-    let mut client = rebuild_llm_client(&config);
+    let mut client = config.build_chat_client();
     let rust_lsp = RustLspManager::new(
         config.rust_lsp_command.clone(),
         config.rust_lsp_root.clone(),
     );
 
     if config.rust_lsp_enabled {
-        let root = resolve_rust_lsp_root(&config)?;
+        let root = menu::resolve_rust_lsp_root(&config)?;
         if let Err(e) = rust_lsp.connect(&config.rust_lsp_command, root).await {
             ui::print_error(&format!("Rust LSP auto-connect failed: {}", e));
         }
@@ -76,6 +77,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         let tip = match config.llm_provider {
             LlmProvider::Groq => "No Groq API key found. After you add keys once, they are saved to ~/.vybrid/.env and vybrid-rust/.env (kept in sync) so Vybrid works from any directory.",
             LlmProvider::LmStudio => "LM Studio is selected but chat is not configured (set LM_STUDIO_MODEL to your loaded model id, start the local server, and use /menu). Keys are saved to ~/.vybrid/.env and vybrid-rust/.env.",
+            LlmProvider::OpenRouter => "OpenRouter is selected but chat is not configured (add OPENROUTER_API_KEY and pick a model via /menu). Keys are saved to ~/.vybrid/.env and vybrid-rust/.env.",
         };
         println!("{}", style(tip).dim());
         println!();
@@ -84,7 +86,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             .default(true)
             .interact()
         {
-            if let Err(e) = handle_menu(&mut config, &mut client, &rust_lsp).await {
+            if let Err(e) = menu::handle_menu(&mut config, &mut client, &rust_lsp).await {
                 ui::print_error(&format!("{}", e));
             }
         }
@@ -166,7 +168,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
                 continue;
             }
             "/menu" => {
-                if let Err(e) = handle_menu(&mut config, &mut client, &rust_lsp).await {
+                if let Err(e) = menu::handle_menu(&mut config, &mut client, &rust_lsp).await {
                     ui::print_error(&format!("{}", e));
                 }
                 continue;
@@ -236,6 +238,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
                     config.global_env_file_path.display(),
                     config.env_file_path.display()
                 ),
+                LlmProvider::OpenRouter => format!(
+                    "OpenRouter is not ready (API key or model). Use /menu — settings: {} and {}.",
+                    config.global_env_file_path.display(),
+                    config.env_file_path.display()
+                ),
             };
             ui::print_error(&msg);
             continue;
@@ -296,6 +303,7 @@ fn llm_spinner_label(provider: LlmProvider) -> &'static str {
     match provider {
         LlmProvider::Groq => "groq",
         LlmProvider::LmStudio => "local",
+        LlmProvider::OpenRouter => "openrouter",
     }
 }
 
@@ -1443,7 +1451,7 @@ fn show_help() {
     println!("  {}     - Clear screen", style("clear").yellow());
     println!("  {}      - Show this help", style("/help").yellow());
     println!(
-        "  {}     - Menu (Groq / LM Studio / SerpAPI / Rust LSP)",
+        "  {}     - Menu (Groq / OpenRouter / LM Studio / SerpAPI / Rust LSP)",
         style("/menu").yellow()
     );
     println!(
@@ -1617,306 +1625,3 @@ fn handle_docs_command(input: &str, project_docs: &ProjectDocs) {
     }
 }
 
-fn saved_env_locations(config: &Config) -> String {
-    format!(
-        "{}\n  {}",
-        config.global_env_file_path.display(),
-        config.env_file_path.display()
-    )
-}
-
-/// Build the OpenAI-compatible chat client for the active LLM provider.
-fn rebuild_llm_client(config: &Config) -> Option<GroqClient> {
-    config
-        .effective_chat_client_params()
-        .map(|(api_key, base_url, model)| {
-            GroqClient::new(api_key, base_url, model, config.request_tuning())
-        })
-}
-
-fn resolve_rust_lsp_root(config: &Config) -> Result<std::path::PathBuf> {
-    let root = config
-        .rust_lsp_root
-        .clone()
-        .unwrap_or(std::env::current_dir().context("Could not resolve current directory")?);
-    if root.is_absolute() {
-        Ok(root)
-    } else {
-        Ok(std::env::current_dir()
-            .context("Could not resolve current directory")?
-            .join(root))
-    }
-}
-
-/// Interactive menu — keys written to `~/.vybrid/.env` and `vybrid-rust/.env`
-async fn handle_menu(
-    config: &mut Config,
-    client: &mut Option<GroqClient>,
-    rust_lsp: &RustLspManager,
-) -> Result<()> {
-    let items = vec![
-        "Add Groq + optional SerpAPI keys (then save & use chat)",
-        "Add or update Groq API key only",
-        "Configure LM Studio (local server — OpenAI-compatible)",
-        "Add or update SerpAPI key only (Google search)",
-        "Switch to Groq (cloud)",
-        "Rust LSP (rust-analyzer)",
-        "Back",
-    ];
-    let sel = Select::new()
-        .with_prompt("Vybrid menu")
-        .items(&items)
-        .default(0)
-        .interact()
-        .context("Menu cancelled")?;
-
-    match sel {
-        0 => {
-            let key: String = Input::new()
-                .with_prompt("Groq API key")
-                .interact_text()
-                .context("No API key entered")?;
-            let key = key.trim().to_string();
-            if key.is_empty() {
-                ui::print_error("Groq API key was empty.");
-                return Ok(());
-            }
-            config.set_groq_api_key(key)?;
-            *client = rebuild_llm_client(config);
-
-            let serp: String = Input::new()
-                .with_prompt("SerpAPI key (optional — Enter to skip)")
-                .allow_empty(true)
-                .interact_text()
-                .context("SerpAPI prompt failed")?;
-            let serp = serp.trim();
-            if !serp.is_empty() {
-                config.set_serpapi_key(serp.to_string())?;
-            }
-
-            println!(
-                "{}",
-                style(format!(
-                    "Saved key(s) — you can start chatting. Files updated:\n  {}",
-                    saved_env_locations(config)
-                ))
-                .green()
-            );
-        }
-        1 => {
-            let key: String = Input::new()
-                .with_prompt("Groq API key")
-                .interact_text()
-                .context("No API key entered")?;
-            let key = key.trim().to_string();
-            if key.is_empty() {
-                ui::print_error("API key was empty.");
-                return Ok(());
-            }
-            config.set_groq_api_key(key)?;
-            *client = rebuild_llm_client(config);
-            println!(
-                "{}",
-                style(format!(
-                    "Saved GROQ_API_KEY to:\n  {}",
-                    saved_env_locations(config)
-                ))
-                .green()
-            );
-        }
-        2 => {
-            let default_base = crate::config::DEFAULT_LM_STUDIO_BASE_URL;
-            let base_raw: String = Input::new()
-                .with_prompt(format!(
-                    "LM Studio OpenAI base URL (Enter for {})",
-                    default_base
-                ))
-                .allow_empty(true)
-                .interact_text()
-                .context("Base URL prompt failed")?;
-            let base = if base_raw.trim().is_empty() {
-                default_base.to_string()
-            } else {
-                base_raw.trim().to_string()
-            };
-            let api_key: String = Input::new()
-                .with_prompt("LM Studio API key (empty = placeholder when auth is off)")
-                .allow_empty(true)
-                .interact_text()
-                .context("API key prompt failed")?;
-            let model: String = Input::new()
-                .with_prompt("Model id (must match the model loaded in LM Studio)")
-                .interact_text()
-                .context("Model id required")?;
-            let model = model.trim().to_string();
-            if model.is_empty() {
-                ui::print_error("Model id was empty.");
-                return Ok(());
-            }
-            config.apply_lm_studio_profile(base, api_key, model)?;
-            *client = rebuild_llm_client(config);
-            println!(
-                "{}",
-                style(format!(
-                    "Saved LM Studio profile (VYBRID_LLM_PROVIDER=lmstudio) to:\n  {}",
-                    saved_env_locations(config)
-                ))
-                .green()
-            );
-        }
-        3 => {
-            let key: String = Input::new()
-                .with_prompt("SerpAPI key")
-                .interact_text()
-                .context("No API key entered")?;
-            let key = key.trim().to_string();
-            if key.is_empty() {
-                ui::print_error("SerpAPI key was empty.");
-                return Ok(());
-            }
-            config.set_serpapi_key(key)?;
-            println!(
-                "{}",
-                style(format!(
-                    "Saved SERPAPI_KEY to:\n  {}",
-                    saved_env_locations(config)
-                ))
-                .green()
-            );
-        }
-        4 => {
-            config.set_llm_provider(LlmProvider::Groq)?;
-            *client = rebuild_llm_client(config);
-            if client.is_some() {
-                println!(
-                    "{}",
-                    style(format!(
-                        "Switched to Groq. VYBRID_LLM_PROVIDER=groq — settings:\n  {}",
-                        saved_env_locations(config)
-                    ))
-                    .green()
-                );
-            } else {
-                ui::print_error(
-                    "VYBRID_LLM_PROVIDER is now groq, but GROQ_API_KEY is missing. Use \"Add or update Groq API key only\".",
-                );
-            }
-        }
-        5 => {
-            handle_rust_lsp_menu(config, rust_lsp).await?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn handle_rust_lsp_menu(config: &mut Config, rust_lsp: &RustLspManager) -> Result<()> {
-    loop {
-        let status = rust_lsp.status().await;
-        let items = vec![
-            "Connect now",
-            "Disconnect",
-            "Restart",
-            "Show status",
-            if config.rust_lsp_enabled {
-                "Disable auto-connect"
-            } else {
-                "Enable auto-connect"
-            },
-            "Configure rust-analyzer command",
-            "Configure workspace root",
-            "Back",
-        ];
-        let sel = Select::new()
-            .with_prompt(format!(
-                "Rust LSP menu ({})",
-                status.summary().lines().next().unwrap_or("Rust LSP")
-            ))
-            .items(&items)
-            .default(0)
-            .interact()
-            .context("Rust LSP menu cancelled")?;
-
-        match sel {
-            0 => {
-                let root = resolve_rust_lsp_root(config)?;
-                rust_lsp.connect(&config.rust_lsp_command, root).await?;
-                println!("{}", style("Rust LSP connected.").green());
-            }
-            1 => {
-                rust_lsp.disconnect().await?;
-                println!("{}", style("Rust LSP disconnected.").green());
-            }
-            2 => {
-                let root = resolve_rust_lsp_root(config)?;
-                rust_lsp.restart(&config.rust_lsp_command, root).await?;
-                println!("{}", style("Rust LSP restarted.").green());
-            }
-            3 => {
-                println!("{}", style(rust_lsp.status().await.summary()).dim());
-            }
-            4 => {
-                let enabled = !config.rust_lsp_enabled;
-                config.set_rust_lsp_enabled(enabled)?;
-                if enabled {
-                    let root = resolve_rust_lsp_root(config)?;
-                    match rust_lsp.connect(&config.rust_lsp_command, root).await {
-                        Ok(()) => println!("{}", style("Rust LSP auto-connect enabled.").green()),
-                        Err(e) => ui::print_error(&format!(
-                            "Auto-connect enabled, but connection failed: {}",
-                            e
-                        )),
-                    }
-                } else {
-                    rust_lsp.disconnect().await?;
-                    println!("{}", style("Rust LSP auto-connect disabled.").green());
-                }
-            }
-            5 => {
-                let command: String = Input::new()
-                    .with_prompt("Rust LSP command")
-                    .default(config.rust_lsp_command.clone())
-                    .interact_text()
-                    .context("Rust LSP command prompt failed")?;
-                config.set_rust_lsp_command(command)?;
-                println!(
-                    "{}",
-                    style(format!(
-                        "Saved VYBRID_RUST_LSP_COMMAND to:\n  {}",
-                        saved_env_locations(config)
-                    ))
-                    .green()
-                );
-            }
-            6 => {
-                let current = config
-                    .rust_lsp_root
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                let root: String = Input::new()
-                    .with_prompt("Workspace root (empty = current directory at runtime)")
-                    .default(current)
-                    .allow_empty(true)
-                    .interact_text()
-                    .context("Rust LSP root prompt failed")?;
-                let root = root.trim();
-                if root.is_empty() {
-                    config.set_rust_lsp_root(None)?;
-                } else {
-                    config.set_rust_lsp_root(Some(std::path::PathBuf::from(root)))?;
-                }
-                println!(
-                    "{}",
-                    style(format!(
-                        "Saved VYBRID_RUST_LSP_ROOT to:\n  {}",
-                        saved_env_locations(config)
-                    ))
-                    .green()
-                );
-            }
-            _ => break,
-        }
-    }
-    Ok(())
-}

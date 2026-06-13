@@ -12,6 +12,8 @@ pub const DEFAULT_LM_STUDIO_API_KEY: &str = "lm-studio";
 pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4o-mini";
 pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
 pub const DEFAULT_GROQ_COMPOUND_MODEL: &str = "groq/compound";
 pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
@@ -30,14 +32,16 @@ pub const DEFAULT_GROQ_SERVICE_TIER: &str = "auto";
 pub enum LlmProvider {
     Groq,
     LmStudio,
+    OpenRouter,
 }
 
 impl LlmProvider {
-    /// Parse `groq` or `lmstudio` (case-insensitive). Returns `None` if unknown.
+    /// Parse provider slug (case-insensitive). Returns `None` if unknown.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "groq" => Some(Self::Groq),
             "lmstudio" | "lm_studio" | "lm-studio" => Some(Self::LmStudio),
+            "openrouter" | "open-router" | "open_router" => Some(Self::OpenRouter),
             _ => None,
         }
     }
@@ -46,6 +50,7 @@ impl LlmProvider {
         match self {
             LlmProvider::Groq => "groq",
             LlmProvider::LmStudio => "lmstudio",
+            LlmProvider::OpenRouter => "openrouter",
         }
     }
 }
@@ -76,6 +81,8 @@ pub struct Config {
     pub lm_studio_base_url: String,
     pub lm_studio_api_key: Option<String>,
     pub lm_studio_model: Option<String>,
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_model: String,
     /// `vybrid-rust/.env` (see [`project_env_file_path`]).
     pub env_file_path: PathBuf,
     /// `~/.vybrid/.env` — mirror so launches from any directory find keys without `VYBRID_ROOT`.
@@ -168,6 +175,13 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let openrouter_api_key = std::env::var("OPENROUTER_API_KEY").ok();
+        let openrouter_model = std::env::var("OPENROUTER_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.to_string());
+
         let rust_lsp_enabled = std::env::var("VYBRID_RUST_LSP_ENABLED")
             .ok()
             .map(|s| parse_bool_env(&s))
@@ -221,6 +235,8 @@ impl Config {
             lm_studio_base_url,
             lm_studio_api_key,
             lm_studio_model,
+            openrouter_api_key,
+            openrouter_model,
             env_file_path,
             global_env_file_path,
             vybrid_dir,
@@ -273,7 +289,35 @@ impl Config {
                     .unwrap_or_else(|| DEFAULT_LM_STUDIO_API_KEY.to_string());
                 Some((key, self.lm_studio_base_url.clone(), model.to_string()))
             }
+            LlmProvider::OpenRouter => {
+                let key = self.openrouter_api_key.clone()?;
+                if key.trim().is_empty() {
+                    return None;
+                }
+                let model = self.openrouter_model.trim();
+                if model.is_empty() {
+                    return None;
+                }
+                Some((
+                    key,
+                    OPENROUTER_BASE_URL.to_string(),
+                    model.to_string(),
+                ))
+            }
         }
+    }
+
+    /// Build the OpenAI-compatible chat client for the active LLM provider.
+    pub fn build_chat_client(&self) -> Option<crate::client::groq::GroqClient> {
+        self.effective_chat_client_params()
+            .map(|(api_key, base_url, model)| {
+                crate::client::groq::GroqClient::new(
+                    api_key,
+                    base_url,
+                    model,
+                    self.request_tuning(),
+                )
+            })
     }
 
     /// Writes the same key to `~/.vybrid/.env` and `vybrid-rust/.env` so use from any cwd works.
@@ -292,7 +336,7 @@ impl Config {
         Ok(())
     }
 
-    /// Writes or updates `VYBRID_LLM_PROVIDER` (`groq` or `lmstudio`).
+    /// Writes or updates `VYBRID_LLM_PROVIDER` (`groq`, `lmstudio`, or `openrouter`).
     pub fn set_llm_provider(&mut self, provider: LlmProvider) -> Result<()> {
         let v = provider.as_env_value();
         self.persist_env_key("VYBRID_LLM_PROVIDER", v)?;
@@ -364,6 +408,37 @@ impl Config {
         self.lm_studio_model = Some(model_trim);
 
         self.set_llm_provider(LlmProvider::LmStudio)?;
+        Ok(())
+    }
+
+    /// Writes or updates `OPENROUTER_API_KEY` in both env files.
+    pub fn set_openrouter_api_key(&mut self, key: String) -> Result<()> {
+        let trimmed = key.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("OpenRouter API key was empty.");
+        }
+        self.persist_env_key("OPENROUTER_API_KEY", &trimmed)?;
+        std::env::set_var("OPENROUTER_API_KEY", &trimmed);
+        self.openrouter_api_key = Some(trimmed);
+        Ok(())
+    }
+
+    pub fn set_openrouter_model(&mut self, model: String) -> Result<()> {
+        let trimmed = model.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("OpenRouter model id was empty.");
+        }
+        self.persist_env_key("OPENROUTER_MODEL", &trimmed)?;
+        std::env::set_var("OPENROUTER_MODEL", &trimmed);
+        self.openrouter_model = trimmed;
+        Ok(())
+    }
+
+    /// Writes OpenRouter key + model and selects the OpenRouter provider.
+    pub fn apply_openrouter_profile(&mut self, api_key: String, model: String) -> Result<()> {
+        self.set_openrouter_api_key(api_key)?;
+        self.set_openrouter_model(model)?;
+        self.set_llm_provider(LlmProvider::OpenRouter)?;
         Ok(())
     }
 
@@ -499,6 +574,51 @@ mod tests {
         assert_eq!(format_env_value("plain-token"), "plain-token");
         assert_eq!(format_env_value("has space"), "\"has space\"");
         assert_eq!(format_env_value("has#hash"), "\"has#hash\"");
+    }
+
+    #[test]
+    fn llm_provider_parses_openrouter() {
+        assert_eq!(LlmProvider::parse("openrouter"), Some(LlmProvider::OpenRouter));
+        assert_eq!(LlmProvider::parse("Open-Router"), Some(LlmProvider::OpenRouter));
+    }
+
+    #[test]
+    fn effective_chat_client_params_openrouter() {
+        let config = Config {
+            llm_provider: LlmProvider::OpenRouter,
+            groq_api_key: None,
+            groq_model: String::new(),
+            groq_rate_limit_fallback_model: String::new(),
+            groq_compound_model: String::new(),
+            groq_compound_mini_model: String::new(),
+            compound_enabled: true,
+            lm_studio_base_url: String::new(),
+            lm_studio_api_key: None,
+            lm_studio_model: None,
+            openrouter_api_key: Some("or-key".to_string()),
+            openrouter_model: "anthropic/claude-sonnet-4".to_string(),
+            env_file_path: PathBuf::from("/tmp/.env"),
+            global_env_file_path: PathBuf::from("/tmp/global.env"),
+            vybrid_dir: PathBuf::from("/tmp/.vybrid"),
+            messages_dir: PathBuf::from("/tmp/messages"),
+            progress_dir: PathBuf::from("/tmp/progress"),
+            serpapi_key: None,
+            rust_lsp_enabled: false,
+            rust_lsp_command: DEFAULT_RUST_LSP_COMMAND.to_string(),
+            rust_lsp_root: None,
+            context_token_budget: DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET,
+            retry_context_token_budget: DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET,
+            max_completion_tokens: DEFAULT_MAX_COMPLETION_TOKENS,
+            temperature: DEFAULT_TEMPERATURE,
+            reasoning_effort: None,
+            groq_service_tier: DEFAULT_GROQ_SERVICE_TIER.to_string(),
+            max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
+        };
+        let params = config.effective_chat_client_params().unwrap();
+        assert_eq!(params.0, "or-key");
+        assert_eq!(params.1, OPENROUTER_BASE_URL);
+        assert_eq!(params.2, "anthropic/claude-sonnet-4");
+        assert!(config.build_chat_client().is_some());
     }
 
     #[test]

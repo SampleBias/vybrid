@@ -340,6 +340,10 @@ impl GroqClient {
         self.base_url.contains("groq.com")
     }
 
+    fn is_openrouter(&self) -> bool {
+        self.base_url.contains("openrouter.ai")
+    }
+
     fn build_request<'a>(
         &'a self,
         messages: &'a [Message],
@@ -528,6 +532,11 @@ impl GroqClient {
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json");
+        if self.is_openrouter() {
+            builder = builder
+                .header("HTTP-Referer", "https://github.com/SampleBias/vybrid")
+                .header("X-OpenRouter-Title", "Vybrid");
+        }
         if accept_sse {
             builder = builder.header("Accept", "text/event-stream");
         }
