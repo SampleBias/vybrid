@@ -320,6 +320,43 @@ impl Config {
             })
     }
 
+    /// Model id for the active LLM provider (for status display).
+    pub fn active_model_id(&self) -> String {
+        match self.llm_provider {
+            LlmProvider::Groq => self.groq_model.clone(),
+            LlmProvider::LmStudio => self
+                .lm_studio_model
+                .clone()
+                .unwrap_or_else(|| "(not set)".to_string()),
+            LlmProvider::OpenRouter => self.openrouter_model.clone(),
+        }
+    }
+
+    /// Persist `VYBRID_REASONING_EFFORT` (`low`, `medium`, `high`, or clear with `default`).
+    pub fn set_reasoning_effort(&mut self, effort: Option<&str>) -> Result<()> {
+        let normalized = effort
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty() && *s != "default");
+        match normalized.as_deref() {
+            None => {
+                self.persist_env_key("VYBRID_REASONING_EFFORT", "")?;
+                std::env::remove_var("VYBRID_REASONING_EFFORT");
+                self.reasoning_effort = None;
+            }
+            Some(v) if matches!(v, "low" | "medium" | "high") => {
+                self.persist_env_key("VYBRID_REASONING_EFFORT", v)?;
+                std::env::set_var("VYBRID_REASONING_EFFORT", v);
+                self.reasoning_effort = Some(v.to_string());
+            }
+            Some(v) => {
+                anyhow::bail!(
+                    "Invalid thinking level '{v}'. Use low, medium, high, or default."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the same key to `~/.vybrid/.env` and `vybrid-rust/.env` so use from any cwd works.
     fn persist_env_key(&self, key: &str, value: &str) -> Result<()> {
         merge_env_file(&self.global_env_file_path, key, value)?;
@@ -500,6 +537,64 @@ fn parse_u32_env(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// Whether the active model accepts `low` / `medium` / `high` reasoning effort.
+pub fn model_supports_thinking_levels(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if m.contains("gpt-oss") {
+        return true;
+    }
+    if m.contains("qwen3") || m.contains("compound") {
+        return false;
+    }
+    const NEEDLES: &[&str] = &[
+        "o1",
+        "o3",
+        "o4",
+        "deepseek-r1",
+        "deepseek-r",
+        "qwq",
+        "gemini-2.5",
+        "claude-3-7",
+        "claude-sonnet-4",
+        "claude-opus-4",
+        "grok-3",
+        "reasoning",
+        "thinking",
+    ];
+    NEEDLES.iter().any(|needle| m.contains(needle))
+}
+
+/// Resolve configured thinking level to the value sent on the wire, if any.
+pub fn effective_reasoning_effort<'a>(model: &str, configured: Option<&'a str>) -> Option<&'a str> {
+    let effort = configured?.trim();
+    if effort.is_empty() {
+        return None;
+    }
+    let m = model.to_ascii_lowercase();
+    if m.contains("qwen3") {
+        return match effort {
+            "none" | "default" => Some(effort),
+            _ => None,
+        };
+    }
+    if matches!(effort, "low" | "medium" | "high") && model_supports_thinking_levels(model) {
+        return Some(effort);
+    }
+    None
+}
+
+/// Short status label for the prompt line (e.g. `think low`, `think default`, `think high (n/a)`).
+pub fn format_thinking_indicator(model: &str, configured: Option<&str>) -> String {
+    let cfg = configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default");
+    match effective_reasoning_effort(model, cfg) {
+        Some(active) => format!("think {active}"),
+        None if cfg.is_some() => format!("think {} (n/a)", cfg.unwrap()),
+        None => "think default".to_string(),
+    }
+}
+
 fn format_env_value(value: &str) -> String {
     if value.is_empty() {
         return String::new();
@@ -619,6 +714,36 @@ mod tests {
         assert_eq!(params.1, OPENROUTER_BASE_URL);
         assert_eq!(params.2, "anthropic/claude-sonnet-4");
         assert!(config.build_chat_client().is_some());
+    }
+
+    #[test]
+    fn effective_reasoning_effort_gpt_oss_and_openrouter_models() {
+        assert_eq!(
+            effective_reasoning_effort("openai/gpt-oss-120b", Some("medium")),
+            Some("medium")
+        );
+        assert_eq!(
+            effective_reasoning_effort("anthropic/claude-sonnet-4", Some("high")),
+            Some("high")
+        );
+        assert_eq!(
+            effective_reasoning_effort("qwen/qwen3-32b", Some("low")),
+            None
+        );
+        assert_eq!(effective_reasoning_effort("openai/gpt-oss-120b", None), None);
+    }
+
+    #[test]
+    fn format_thinking_indicator_shows_unsupported() {
+        assert_eq!(
+            format_thinking_indicator("qwen/qwen3-32b", Some("low")),
+            "think low (n/a)"
+        );
+        assert_eq!(
+            format_thinking_indicator("openai/gpt-oss-120b", Some("low")),
+            "think low"
+        );
+        assert_eq!(format_thinking_indicator("openai/gpt-oss-120b", None), "think default");
     }
 
     #[test]

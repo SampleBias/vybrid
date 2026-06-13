@@ -361,7 +361,7 @@ impl GroqClient {
             max_completion_tokens: is_groq.then_some(self.tuning.max_completion_tokens),
             max_tokens: (!is_groq).then_some(self.tuning.max_completion_tokens),
             temperature: self.tuning.temperature,
-            reasoning_effort: reasoning_effort_for_model(
+            reasoning_effort: crate::config::effective_reasoning_effort(
                 &self.model,
                 self.tuning.reasoning_effort.as_deref(),
             ),
@@ -706,22 +706,6 @@ impl GroqClient {
     }
 }
 
-/// Gate `reasoning_effort` on per-model support so we never send a value the
-/// provider would reject (`low`/`medium`/`high` → GPT-OSS, `none`/`default` → Qwen3).
-fn reasoning_effort_for_model<'a>(model: &str, configured: Option<&'a str>) -> Option<&'a str> {
-    let effort = configured?.trim();
-    if effort.is_empty() {
-        return None;
-    }
-    let gpt_oss = model.contains("gpt-oss");
-    let qwen3 = model.contains("qwen3");
-    match effort {
-        "low" | "medium" | "high" if gpt_oss => Some(effort),
-        "none" | "default" if qwen3 => Some(effort),
-        _ => None,
-    }
-}
-
 /// Parse Groq reset header durations like `7.66s`, `2m59.56s`, `1h2m`, `454ms`.
 fn parse_reset_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
@@ -857,30 +841,28 @@ mod tests {
 
     #[test]
     fn gates_reasoning_effort_by_model() {
+        use crate::config::effective_reasoning_effort;
         assert_eq!(
-            reasoning_effort_for_model("openai/gpt-oss-120b", Some("low")),
+            effective_reasoning_effort("openai/gpt-oss-120b", Some("low")),
             Some("low")
         );
         assert_eq!(
-            reasoning_effort_for_model("openai/gpt-oss-120b", Some("none")),
+            effective_reasoning_effort("openai/gpt-oss-120b", Some("none")),
             None
         );
         assert_eq!(
-            reasoning_effort_for_model("qwen/qwen3-32b", Some("none")),
+            effective_reasoning_effort("qwen/qwen3-32b", Some("none")),
             Some("none")
         );
         assert_eq!(
-            reasoning_effort_for_model("qwen/qwen3-32b", Some("low")),
+            effective_reasoning_effort("qwen/qwen3-32b", Some("low")),
             None
         );
         assert_eq!(
-            reasoning_effort_for_model("groq/compound", Some("low")),
+            effective_reasoning_effort("groq/compound", Some("low")),
             None
         );
-        assert_eq!(
-            reasoning_effort_for_model("openai/gpt-oss-120b", None),
-            None
-        );
+        assert_eq!(effective_reasoning_effort("openai/gpt-oss-120b", None), None);
     }
 
     #[test]

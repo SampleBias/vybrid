@@ -95,12 +95,16 @@ pub fn print_context_status_line(
     estimated_tokens: u32,
     request_budget: u32,
     max_completion_tokens: u32,
+    model: &str,
+    reasoning_effort: Option<&str>,
     rust_lsp: &RustLspStatus,
 ) {
+    let thinking = crate::config::format_thinking_indicator(model, reasoning_effort);
     let line = format!(
-        "{}  out {}  {}",
+        "{}  out {}  {}  {}",
         format_context_ring(estimated_tokens, request_budget),
         format_tokens_short(max_completion_tokens),
+        thinking,
         format_rust_lsp_indicator(rust_lsp)
     );
     let pct = estimated_tokens as f64 / request_budget.max(1) as f64;

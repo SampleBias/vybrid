@@ -120,6 +120,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             conversation.estimate_context_tokens(),
             config.context_token_budget,
             config.max_completion_tokens,
+            &config.active_model_id(),
+            config.reasoning_effort.as_deref(),
             &rust_lsp_status,
         );
         print!("{} ", style("You>").magenta().bold());
@@ -191,6 +193,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         // Handle /docs command
         if input.starts_with("/docs") {
             handle_docs_command(input, &project_docs);
+            continue;
+        }
+
+        if input.starts_with("/thinking") {
+            handle_thinking_command(input, &mut config, &mut client);
             continue;
         }
 
@@ -1458,6 +1465,10 @@ fn show_help() {
         "  {}      - Show or refresh compact project index",
         style("/index").yellow()
     );
+    println!(
+        "  {}  - Show or set thinking level: /thinking low|medium|high|default",
+        style("/thinking").yellow()
+    );
     println!();
     println!("{}", style("Project Docs Commands:").cyan().bold());
     println!("{}", style("─".repeat(40)).dim());
@@ -1478,6 +1489,82 @@ fn show_help() {
         style("/docs clear").yellow()
     );
     println!();
+}
+
+fn handle_thinking_command(
+    input: &str,
+    config: &mut Config,
+    client: &mut Option<GroqClient>,
+) {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    let model = config.active_model_id();
+
+    match parts.get(1).map(|s| s.to_ascii_lowercase()) {
+        None => {
+            let configured = config
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("default (provider)");
+            let active = crate::config::effective_reasoning_effort(
+                &model,
+                config.reasoning_effort.as_deref(),
+            )
+            .unwrap_or("not sent");
+            let supported = if crate::config::model_supports_thinking_levels(&model) {
+                "yes"
+            } else {
+                "no"
+            };
+            println!();
+            println!("{}", style("Thinking level").cyan().bold());
+            println!("{}", style("─".repeat(40)).dim());
+            println!("  Model:      {}", model);
+            println!("  Configured: {}", configured);
+            println!("  Active:     {}", active);
+            println!("  Supported:  {}", supported);
+            println!(
+                "  {}",
+                style("Use /thinking low|medium|high or /thinking default").dim()
+            );
+            println!();
+        }
+        Some(level) => match level.as_str() {
+            "low" | "medium" | "high" | "default" => {
+                let effort = if level == "default" {
+                    None
+                } else {
+                    Some(level.as_str())
+                };
+                match config.set_reasoning_effort(effort) {
+                    Ok(()) => {
+                        *client = config.build_chat_client();
+                        let indicator =
+                            crate::config::format_thinking_indicator(&model, config.reasoning_effort.as_deref());
+                        println!(
+                            "{}",
+                            style(format!("Thinking level updated — {indicator} (model: {model})"))
+                                .green()
+                        );
+                        if config.reasoning_effort.is_some()
+                            && crate::config::effective_reasoning_effort(
+                                &model,
+                                config.reasoning_effort.as_deref(),
+                            )
+                            .is_none()
+                        {
+                            ui::print_error(
+                                "This model may not support low/medium/high thinking; requests will use the provider default.",
+                            );
+                        }
+                    }
+                    Err(e) => ui::print_error(&format!("{}", e)),
+                }
+            }
+            _ => ui::print_error(
+                "Usage: /thinking [low|medium|high|default] — run /thinking alone to show status",
+            ),
+        },
+    }
 }
 
 fn handle_index_command(input: &str) {
