@@ -129,6 +129,19 @@ impl MemoryStore {
         &self.session_id
     }
 
+    /// Rebind memory to the current project root after the user changes directory.
+    /// Returns true when the project root changed (starts a new transcript session id).
+    pub fn sync_project_root(&mut self) -> bool {
+        let root = crate::project_context::current_project_root();
+        if root == self.project_root {
+            return false;
+        }
+        self.project_root = root.clone();
+        self.memory_dir = root.join(".vybrid").join("memory");
+        self.session_id = uuid::Uuid::new_v4().to_string();
+        true
+    }
+
     pub fn auto_dream_state_path(&self) -> PathBuf {
         self.memory_dir.join("autodream_state.json")
     }

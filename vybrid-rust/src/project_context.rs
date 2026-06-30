@@ -115,6 +115,58 @@ pub fn path_not_found_message(requested: &str, resolved: &Path) -> String {
     ProjectContext::discover().not_found_message(requested, resolved)
 }
 
+/// Human-friendly path for prompts and status lines (`~/…` when under home).
+pub fn format_path_for_display(path: &Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        path.strip_prefix(&home)
+            .map(|rel| format!("~/{}", rel.display()))
+            .unwrap_or_else(|_| path.display().to_string())
+    } else {
+        path.display().to_string()
+    }
+}
+
+/// Short block injected into user turns so the model knows the live session directory.
+pub fn session_location_block() -> String {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ctx = ProjectContext::discover();
+    let root = ctx.root();
+    let pinned = std::env::var("VYBRID_PROJECT_ROOT")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let pin_note = if pinned {
+        "\n- Note: VYBRID_PROJECT_ROOT is set; tool paths resolve relative to project root above."
+    } else {
+        ""
+    };
+    format!(
+        "SESSION LOCATION:\n- Working directory: {}\n- Project root: {}{}\n\nUse these paths for this turn. After `!` shell mode or `!cd`, the working directory changes for Vybrid and all tools.",
+        format_path_for_display(&cwd),
+        format_path_for_display(root),
+        pin_note
+    )
+}
+
+/// Change Vybrid's process working directory (used by `!` shell mode and `!cd`).
+pub fn change_working_directory(path: &str) -> anyhow::Result<PathBuf> {
+    let trimmed = path.trim();
+    let target = if trimmed.is_empty() || trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not resolve home directory"))?
+    } else if let Some(stripped) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not resolve home directory"))?
+            .join(stripped)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    std::env::set_current_dir(&target)
+        .map_err(|e| anyhow::anyhow!("Failed to change directory to `{}`: {e}", target.display()))?;
+
+    Ok(std::env::current_dir().unwrap_or(target))
+}
+
 fn discover_project_root_from(start: &Path) -> PathBuf {
     let start = canonicalize_existing_or_self(start.to_path_buf());
     for ancestor in start.ancestors() {
@@ -183,5 +235,19 @@ mod tests {
             ctx.resolve_path("boltr_view/boltr-view/Cargo.toml"),
             root.join("Cargo.toml")
         );
+    }
+
+    #[test]
+    fn change_working_directory_updates_process_cwd() {
+        let original = std::env::current_dir().unwrap();
+        let nested = original.join(format!("vybrid-cd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&nested);
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let changed = change_working_directory(nested.to_str().unwrap()).unwrap();
+        assert_eq!(changed, nested.canonicalize().unwrap_or(nested.clone()));
+
+        change_working_directory(original.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&nested);
     }
 }

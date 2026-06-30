@@ -225,25 +225,17 @@ pub fn enter_shell_mode() -> Result<()> {
         }
 
         // Handle cd specially to update Vybrid's cwd
-        if let Some(path) = input.strip_prefix("cd ") {
-            let path = path.trim();
-            let new_path = if let Some(stripped) = path.strip_prefix("~/") {
-                if let Some(home) = dirs::home_dir() {
-                    home.join(stripped)
-                } else {
-                    std::path::PathBuf::from(path)
-                }
-            } else if path == "~" {
-                dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
-            } else {
-                std::path::PathBuf::from(path)
-            };
-
-            match std::env::set_current_dir(&new_path) {
-                Ok(_) => {
+        if input == "cd" || input.starts_with("cd ") {
+            let path = input.strip_prefix("cd").unwrap_or("").trim();
+            match crate::project_context::change_working_directory(path) {
+                Ok(new_cwd) => {
                     println!(
                         "{}",
-                        style(format!("Changed to: {}", new_path.display())).dim()
+                        style(format!(
+                            "Changed to: {}",
+                            crate::project_context::format_path_for_display(&new_cwd)
+                        ))
+                        .dim()
                     );
                 }
                 Err(e) => {

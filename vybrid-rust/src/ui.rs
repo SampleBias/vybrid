@@ -186,14 +186,10 @@ pub fn display_mode_header() {
 /// Display current working directory
 pub fn display_cwd() {
     if let Ok(cwd) = std::env::current_dir() {
-        let display_path = if let Some(home) = dirs::home_dir() {
-            cwd.strip_prefix(&home)
-                .map(|p| format!("~/{}", p.display()))
-                .unwrap_or_else(|_| cwd.display().to_string())
-        } else {
-            cwd.display().to_string()
-        };
-        println!("Current directory: {}\n", style(display_path).cyan());
+        println!(
+            "Current directory: {}\n",
+            style(crate::project_context::format_path_for_display(&cwd)).cyan()
+        );
     }
 }
 

@@ -107,10 +107,10 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     }
 
     let project_docs = ProjectDocs::new();
-    let memory_store = MemoryStore::new(config.messages_dir.clone());
+    let mut memory_store = MemoryStore::new(config.messages_dir.clone());
     let mut skill_registry = SkillRegistry::discover();
     let mut conversation = Conversation::new(&build_system_prompt(&skill_registry));
-    let tool_runtime = ToolRuntime {
+    let mut tool_runtime = ToolRuntime {
         rust_lsp: Some(rust_lsp.clone()),
         memory: Some(memory_store.clone()),
         file_read_cache: Default::default(),
@@ -187,6 +187,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
                 if let Err(e) = shell::enter_shell_mode() {
                     ui::print_error(&format!("Shell mode error: {}", e));
                 }
+                sync_session_after_directory_change(&mut memory_store, &mut tool_runtime);
                 ui::display_cwd();
                 continue;
             }
@@ -232,6 +233,25 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         // Handle single shell commands (!command)
         if let Some(cmd) = input.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if let Some(path) = parse_bang_cd_command(cmd) {
+                match project_context::change_working_directory(path) {
+                    Ok(new_cwd) => {
+                        sync_session_after_directory_change(&mut memory_store, &mut tool_runtime);
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Changed to: {}",
+                                project_context::format_path_for_display(&new_cwd)
+                            ))
+                            .dim()
+                        );
+                        ui::display_cwd();
+                    }
+                    Err(e) => ui::print_error(&format!("{}", e)),
+                }
+                continue;
+            }
             match tools::shell::execute_bash(cmd, None, None).await {
                 Ok(output) => println!("{}", output),
                 Err(e) => ui::print_error(&format!("Command failed: {}", e)),
@@ -336,6 +356,28 @@ fn llm_spinner_label(provider: LlmProvider) -> &'static str {
         LlmProvider::LmStudio => "local",
         LlmProvider::OpenRouter => "openrouter",
     }
+}
+
+/// After `!` shell mode or `!cd`, rebind memory to the new project and drop stale file cache.
+fn sync_session_after_directory_change(
+    memory_store: &mut MemoryStore,
+    tool_runtime: &mut ToolRuntime,
+) {
+    if memory_store.sync_project_root() {
+        println!(
+            "{}",
+            style("Project context updated for the new directory.").dim()
+        );
+    }
+    tool_runtime.file_read_cache = Default::default();
+}
+
+fn parse_bang_cd_command(cmd: &str) -> Option<&str> {
+    let cmd = cmd.trim();
+    if cmd == "cd" {
+        return Some("");
+    }
+    cmd.strip_prefix("cd ").map(str::trim)
 }
 
 fn run_autodream_idle_consolidation(memory_store: &MemoryStore) {
@@ -1310,7 +1352,9 @@ fn inject_project_context(
     project_docs: &ProjectDocs,
     memory_store: &MemoryStore,
 ) -> String {
-    let with_docs = inject_project_docs(user_message, project_docs);
+    let location = project_context::session_location_block();
+    let with_location = format!("{location}\n\n---\n\n{user_message}");
+    let with_docs = inject_project_docs(&with_location, project_docs);
     match memory_store.context_block() {
         Ok(Some(memory)) => format!("{with_docs}\n\n---\n\n{memory}"),
         Ok(None) | Err(_) => with_docs,
@@ -1473,6 +1517,10 @@ fn show_help() {
     println!(
         "  {}    - Execute single shell command",
         style("!<cmd>").yellow()
+    );
+    println!(
+        "  {} - Change Vybrid's working directory (syncs tools + AI context)",
+        style("!cd <path>").yellow()
     );
     println!(
         "  {} - Add file to conversation",
