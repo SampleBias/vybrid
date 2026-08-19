@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -102,6 +103,42 @@ struct RateHeaderSnapshot {
 /// How long a header snapshot stays authoritative before we fall back to local estimates.
 const RATE_HEADER_FRESHNESS: Duration = Duration::from_secs(30);
 
+/// Only reuse an observed prompt-cache hit for nearby requests. If Groq evicts
+/// the entry, the estimate falls back to charging the complete prompt.
+const PROMPT_CACHE_OBSERVATION_FRESHNESS: Duration = Duration::from_secs(120);
+/// Leave a 20% safety margin around Groq's last reported cached-token count.
+const PROMPT_CACHE_CREDIT_PERCENT: u32 = 80;
+
+#[derive(Debug, Clone)]
+struct RequestCacheShape {
+    message_hashes: Vec<u64>,
+    tools_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PromptCacheObservation {
+    request: RequestCacheShape,
+    cached_tokens: u32,
+    captured_at: Instant,
+}
+
+fn serialized_hash<T: Serialize + ?Sized>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // The same message/tool values have already serialized successfully into the
+    // request body before this helper is called.
+    serde_json::to_vec(value)
+        .expect("request cache shape must be JSON serializable")
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn request_cache_shape(messages: &[Message], tools: Option<&[Tool]>) -> RequestCacheShape {
+    RequestCacheShape {
+        message_hashes: messages.iter().map(serialized_hash).collect(),
+        tools_hash: serialized_hash(tools.filter(|items| !items.is_empty()).unwrap_or(&[])),
+    }
+}
+
 /// Sliding window of (request instant, estimated tokens) per model.
 type RateWindows = HashMap<String, VecDeque<(Instant, u32)>>;
 
@@ -119,6 +156,9 @@ pub struct GroqClient {
     rate_window: Arc<Mutex<RateWindows>>,
     /// Latest `x-ratelimit-*` header snapshot per model (authoritative when fresh).
     rate_headers: Arc<Mutex<HashMap<String, RateHeaderSnapshot>>>,
+    /// Last provider-confirmed prompt-cache hit per model. This is used only when
+    /// the next request extends the exact same message/tool prefix.
+    prompt_cache: Arc<Mutex<HashMap<String, PromptCacheObservation>>>,
 }
 
 /// Chat completion request (OpenAI-compatible subset). Borrows messages/tools so
@@ -315,6 +355,7 @@ impl GroqClient {
             ),
             rate_window: Arc::new(Mutex::new(HashMap::new())),
             rate_headers: Arc::new(Mutex::new(HashMap::new())),
+            prompt_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -329,6 +370,7 @@ impl GroqClient {
             route_wait_threshold: self.route_wait_threshold,
             rate_window: self.rate_window.clone(),
             rate_headers: self.rate_headers.clone(),
+            prompt_cache: self.prompt_cache.clone(),
         }
     }
 
@@ -410,7 +452,7 @@ impl GroqClient {
     /// Replace the latest local window estimate with the actual billable usage the
     /// API reported. Cached prefix tokens are exempt from TPM limits, so estimates
     /// based on request size dramatically over-count once the cache is warm.
-    fn reconcile_actual_usage(&self, usage: &Usage) {
+    fn reconcile_actual_usage(&self, usage: &Usage, request: &RequestCacheShape) {
         if !self.is_groq() {
             return;
         }
@@ -421,6 +463,48 @@ impl GroqClient {
                 back.1 = billable;
             }
         }
+        drop(windows);
+
+        self.prompt_cache.lock().unwrap().insert(
+            self.model.clone(),
+            PromptCacheObservation {
+                request: request.clone(),
+                cached_tokens: usage.cached_tokens(),
+                captured_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Reduce the worst-case request estimate only after the provider has reported
+    /// a recent cache hit for an exact prefix of this model's next request.
+    fn cache_aware_estimate(&self, full_estimate: u32, request: &RequestCacheShape) -> u32 {
+        if !self.is_groq() {
+            return full_estimate;
+        }
+        let observations = self.prompt_cache.lock().unwrap();
+        let Some(observed) = observations.get(&self.model) else {
+            return full_estimate;
+        };
+        if observed.captured_at.elapsed() >= PROMPT_CACHE_OBSERVATION_FRESHNESS
+            || observed.cached_tokens == 0
+            || observed.request.tools_hash != request.tools_hash
+            || observed.request.message_hashes.len() > request.message_hashes.len()
+            || !observed
+                .request
+                .message_hashes
+                .iter()
+                .zip(&request.message_hashes)
+                .all(|(previous, current)| previous == current)
+        {
+            return full_estimate;
+        }
+
+        let prompt_estimate = full_estimate.saturating_sub(self.tuning.max_completion_tokens);
+        let conservative_credit = observed
+            .cached_tokens
+            .saturating_mul(PROMPT_CACHE_CREDIT_PERCENT)
+            / 100;
+        full_estimate.saturating_sub(conservative_credit.min(prompt_estimate))
     }
 
     async fn throttle_if_needed(&self, requested: u32) -> Result<()> {
@@ -576,7 +660,9 @@ impl GroqClient {
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send>>> {
         let request = self.build_request(messages, tools, true);
         let body = serde_json::to_string(&request).context("Failed to serialize chat request")?;
-        let estimated_tokens = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
+        let cache_shape = request_cache_shape(messages, tools);
+        let full_estimate = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
+        let estimated_tokens = self.cache_aware_estimate(full_estimate, &cache_shape);
 
         self.throttle_if_needed(estimated_tokens).await?;
 
@@ -648,7 +734,7 @@ impl GroqClient {
                                     };
 
                                     if let Some(usage) = chunk.effective_usage() {
-                                        usage_client.reconcile_actual_usage(usage);
+                                        usage_client.reconcile_actual_usage(usage, &cache_shape);
                                     }
 
                                     yield Ok(chunk);
@@ -671,7 +757,9 @@ impl GroqClient {
     pub async fn chat(&self, messages: &[Message], tools: Option<&[Tool]>) -> Result<Message> {
         let request = self.build_request(messages, tools, false);
         let body = serde_json::to_string(&request).context("Failed to serialize chat request")?;
-        let estimated_tokens = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
+        let cache_shape = request_cache_shape(messages, tools);
+        let full_estimate = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
+        let estimated_tokens = self.cache_aware_estimate(full_estimate, &cache_shape);
 
         self.throttle_if_needed(estimated_tokens).await?;
 
@@ -694,7 +782,7 @@ impl GroqClient {
             .context("Failed to parse API response")?;
 
         if let Some(usage) = &chat_response.usage {
-            self.reconcile_actual_usage(usage);
+            self.reconcile_actual_usage(usage, &cache_shape);
         }
 
         chat_response
@@ -878,6 +966,110 @@ mod tests {
 
         assert_eq!(usage.cached_tokens(), 8_000);
         assert_eq!(usage.billable_tokens(), 2_500);
+    }
+
+    #[test]
+    fn preflight_credits_recent_provider_confirmed_cache_for_extended_prefix() {
+        let client = GroqClient::new(
+            "key".to_string(),
+            "https://api.groq.com/openai/v1".to_string(),
+            "openai/gpt-oss-120b".to_string(),
+            RequestTuning::default(),
+        );
+        let previous = vec![Message {
+            role: "system".to_string(),
+            content: Some("stable system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let previous_shape = request_cache_shape(&previous, None);
+        client.reconcile_actual_usage(
+            &Usage {
+                prompt_tokens: Some(10_000),
+                completion_tokens: Some(500),
+                total_tokens: Some(10_500),
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(8_000),
+                }),
+            },
+            &previous_shape,
+        );
+
+        let mut extended = previous;
+        extended.push(Message {
+            role: "user".to_string(),
+            content: Some("next round".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        let estimate = client.cache_aware_estimate(20_000, &request_cache_shape(&extended, None));
+
+        assert_eq!(estimate, 13_600);
+    }
+
+    #[test]
+    fn preflight_does_not_credit_cache_after_prefix_changes() {
+        let client = GroqClient::new(
+            "key".to_string(),
+            "https://api.groq.com/openai/v1".to_string(),
+            "openai/gpt-oss-120b".to_string(),
+            RequestTuning::default(),
+        );
+        let previous = vec![Message {
+            role: "system".to_string(),
+            content: Some("original system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        client.reconcile_actual_usage(
+            &Usage {
+                prompt_tokens: Some(10_000),
+                completion_tokens: None,
+                total_tokens: Some(10_000),
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(8_000),
+                }),
+            },
+            &request_cache_shape(&previous, None),
+        );
+        let changed = vec![Message {
+            role: "system".to_string(),
+            content: Some("changed system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        assert_eq!(
+            client.cache_aware_estimate(20_000, &request_cache_shape(&changed, None)),
+            20_000
+        );
+    }
+
+    #[test]
+    fn preflight_does_not_credit_stale_cache_observation() {
+        let client = GroqClient::new(
+            "key".to_string(),
+            "https://api.groq.com/openai/v1".to_string(),
+            "openai/gpt-oss-120b".to_string(),
+            RequestTuning::default(),
+        );
+        let messages = vec![Message {
+            role: "system".to_string(),
+            content: Some("stable".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let shape = request_cache_shape(&messages, None);
+        client.prompt_cache.lock().unwrap().insert(
+            client.model.clone(),
+            PromptCacheObservation {
+                request: shape.clone(),
+                cached_tokens: 8_000,
+                captured_at: Instant::now() - PROMPT_CACHE_OBSERVATION_FRESHNESS,
+            },
+        );
+
+        assert_eq!(client.cache_aware_estimate(20_000, &shape), 20_000);
     }
 
     #[test]
