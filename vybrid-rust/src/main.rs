@@ -555,6 +555,7 @@ fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
         || s_lower.contains("tool call validation")
         || s_lower.contains("failed to parse tool call arguments as json")
         || s_lower.contains("invalid json in api stream")
+        || s_lower.contains("stream ended before the provider sent data: [done]")
         || is_failed_generation_error(e)
 }
 
@@ -566,7 +567,35 @@ fn is_failed_generation_error(e: &anyhow::Error) -> bool {
 }
 
 fn should_retry_tool_generation_error(e: &anyhow::Error, content_started: bool) -> bool {
-    is_retryable_groq_stream_error(e) && (!content_started || is_failed_generation_error(e))
+    let unexpected_eof = e
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("stream ended before the provider sent data: [done]");
+    is_retryable_groq_stream_error(e)
+        && (!content_started || is_failed_generation_error(e) || unexpected_eof)
+}
+
+/// Explain an invalid terminal state from an otherwise well-formed stream.
+/// A response is complete only when the provider explicitly stopped or returned
+/// usable tool calls. In particular, `length` means the generation was cut off.
+fn incomplete_completion_reason(
+    finish_reason: Option<&str>,
+    has_content: bool,
+    has_tool_calls: bool,
+) -> Option<String> {
+    match finish_reason {
+        Some("length") => {
+            Some("the model exhausted its completion-token budget before finishing".to_string())
+        }
+        Some("tool_calls") if !has_tool_calls => {
+            Some("the provider reported tool_calls but returned no usable tool call".to_string())
+        }
+        Some("stop") if !has_content && !has_tool_calls => {
+            Some("the model stopped without an answer or tool call".to_string())
+        }
+        None => Some("the provider ended the response without a finish reason".to_string()),
+        _ => None,
+    }
 }
 
 fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
@@ -674,6 +703,39 @@ mod retry_tests {
 
         assert!(!should_retry_tool_generation_error(&err, true));
         assert!(should_retry_tool_generation_error(&err, false));
+    }
+
+    #[test]
+    fn retries_unexpected_stream_eof_even_after_partial_content() {
+        let err = anyhow::anyhow!("Stream ended before the provider sent data: [DONE]");
+
+        assert!(should_retry_tool_generation_error(&err, true));
+    }
+
+    #[test]
+    fn token_limit_is_never_a_successful_terminal_state() {
+        let blank = incomplete_completion_reason(Some("length"), false, false);
+        let partial = incomplete_completion_reason(Some("length"), true, false);
+
+        assert!(blank.unwrap().contains("token budget"));
+        assert!(partial.unwrap().contains("token budget"));
+    }
+
+    #[test]
+    fn blank_stop_and_empty_tool_terminal_states_are_incomplete() {
+        assert!(incomplete_completion_reason(Some("stop"), false, false).is_some());
+        assert!(incomplete_completion_reason(Some("tool_calls"), false, false).is_some());
+    }
+
+    #[test]
+    fn normal_answer_and_tool_call_terminal_states_are_complete() {
+        assert!(incomplete_completion_reason(Some("stop"), true, false).is_none());
+        assert!(incomplete_completion_reason(Some("tool_calls"), false, true).is_none());
+    }
+
+    #[test]
+    fn missing_finish_reason_is_incomplete_even_with_content() {
+        assert!(incomplete_completion_reason(None, true, false).is_some());
     }
 
     #[test]
@@ -848,6 +910,7 @@ async fn process_ai_response(
     // cache exactly when rate limits made cached (free) tokens most valuable.
     let mut shrink_context = false;
     let mut last_usage: Option<Usage>;
+    let mut finish_reason: Option<String>;
 
     let mut attempt: u32 = 0;
     'stream: loop {
@@ -859,6 +922,7 @@ async fn process_ai_response(
         tool_calls.clear();
         first_chunk = true;
         last_usage = None;
+        finish_reason = None;
 
         let request_budget = if route_state.mode == RouteMode::Primary && !shrink_context {
             turn.context_token_budget
@@ -961,6 +1025,9 @@ async fn process_ai_response(
                         last_usage = Some(*usage);
                     }
                     if let Some(choice) = chunk.choices.first() {
+                        if let Some(reason) = &choice.finish_reason {
+                            finish_reason = Some(reason.clone());
+                        }
                         // Handle reasoning content (thinking)
                         if let Some(reasoning) = &choice.delta.reasoning_content {
                             if !reasoning_started {
@@ -1082,6 +1149,31 @@ async fn process_ai_response(
 
         if first_chunk {
             spinner.finish().await;
+        }
+
+        if let Some(problem) = incomplete_completion_reason(
+            finish_reason.as_deref(),
+            !final_content.trim().is_empty(),
+            tool_calls
+                .iter()
+                .any(|tc| !tc.function.name.trim().is_empty()),
+        ) {
+            if attempt < MAX_STREAM_ATTEMPTS {
+                conversation.add_user_message(&format!(
+                    "[Vybrid] The prior generation was incomplete because {problem}. Continue the original task now. Do not repeat earlier analysis: make the next necessary tool call immediately, or give a concise final answer if the task is actually complete."
+                ));
+                println!(
+                    "{}",
+                    style(format!(
+                        "Incomplete model response ({problem}) — retrying..."
+                    ))
+                    .yellow()
+                );
+                continue 'stream;
+            }
+            return Err(anyhow::anyhow!(
+                "Model failed to produce a complete response after {MAX_STREAM_ATTEMPTS} attempts: {problem}. Try increasing VYBRID_MAX_COMPLETION_TOKENS or lowering reasoning effort."
+            ));
         }
 
         break 'stream;
@@ -2013,4 +2105,3 @@ async fn handle_compact_command(
     );
     Ok(())
 }
-

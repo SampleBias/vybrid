@@ -19,7 +19,7 @@ pub const DEFAULT_GROQ_COMPOUND_MODEL: &str = "groq/compound";
 pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
 pub const DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 pub const DEFAULT_GROQ_RETRY_CONTEXT_TOKEN_BUDGET: u32 = 18_000;
-pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 4_096;
+pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 8_192;
 /// Low temperature improves tool-call JSON validity for a coding agent.
 pub const DEFAULT_TEMPERATURE: f32 = 0.3;
 /// Tool rounds per turn before Vybrid asks whether to keep going.
@@ -566,11 +566,16 @@ pub fn model_supports_thinking_levels(model: &str) -> bool {
 
 /// Resolve configured thinking level to the value sent on the wire, if any.
 pub fn effective_reasoning_effort<'a>(model: &str, configured: Option<&'a str>) -> Option<&'a str> {
+    let m = model.to_ascii_lowercase();
+    // Tool-heavy agent loops benefit from reaching the next action before the
+    // completion cap. Keep explicit user choices authoritative.
+    if configured.is_none() && m.contains("gpt-oss") {
+        return Some("low");
+    }
     let effort = configured?.trim();
     if effort.is_empty() {
         return None;
     }
-    let m = model.to_ascii_lowercase();
     if m.contains("qwen3") {
         return match effort {
             "none" | "default" => Some(effort),
@@ -730,7 +735,10 @@ mod tests {
             effective_reasoning_effort("qwen/qwen3-32b", Some("low")),
             None
         );
-        assert_eq!(effective_reasoning_effort("openai/gpt-oss-120b", None), None);
+        assert_eq!(
+            effective_reasoning_effort("openai/gpt-oss-120b", None),
+            Some("low")
+        );
     }
 
     #[test]
@@ -743,7 +751,7 @@ mod tests {
             format_thinking_indicator("openai/gpt-oss-120b", Some("low")),
             "think low"
         );
-        assert_eq!(format_thinking_indicator("openai/gpt-oss-120b", None), "think default");
+        assert_eq!(format_thinking_indicator("openai/gpt-oss-120b", None), "think low");
     }
 
     #[test]

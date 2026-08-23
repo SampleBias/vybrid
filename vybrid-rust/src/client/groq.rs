@@ -84,7 +84,7 @@ pub struct RequestTuning {
 impl Default for RequestTuning {
     fn default() -> Self {
         Self {
-            max_completion_tokens: 4_096,
+            max_completion_tokens: 8_192,
             temperature: 0.3,
             reasoning_effort: None,
             service_tier: None,
@@ -681,6 +681,13 @@ impl GroqClient {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
+                        // SSE permits CRLF as well as LF. Normalizing here keeps the
+                        // event parser small and avoids silently buffering an entire
+                        // response from servers that use `\r\n\r\n` delimiters.
+                        if buffer.contains('\r') {
+                            buffer = buffer.replace("\r\n", "\n");
+                        }
+
                         while let Some(pos) = buffer.find("\n\n") {
                             // Drain shifts the remainder in place instead of reallocating
                             // a new String per SSE event.
@@ -748,6 +755,13 @@ impl GroqClient {
                     }
                 }
             }
+
+            // A clean HTTP body EOF is not the same as a completed chat stream.
+            // OpenAI-compatible SSE streams terminate with `data: [DONE]`; without
+            // it, tool arguments or the final answer may have been truncated.
+            yield Err(anyhow::anyhow!(
+                "Stream ended before the provider sent data: [DONE]"
+            ));
         };
 
         Ok(Box::pin(output_stream))
@@ -950,7 +964,10 @@ mod tests {
             effective_reasoning_effort("groq/compound", Some("low")),
             None
         );
-        assert_eq!(effective_reasoning_effort("openai/gpt-oss-120b", None), None);
+        assert_eq!(
+            effective_reasoning_effort("openai/gpt-oss-120b", None),
+            Some("low")
+        );
     }
 
     #[test]
