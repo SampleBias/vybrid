@@ -90,6 +90,11 @@ fn build_all_tools() -> Vec<Tool> {
                             "type": "integer",
                             "description": "Optional 1-based first line to return"
                         },
+                        "start_byte": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Optional UTF-8-aligned byte offset for continuing a large file or very long line. Use the previous result's next_byte value; overrides start_line."
+                        },
                         "line_count": {
                             "type": "integer",
                             "description": "Optional number of lines to return"

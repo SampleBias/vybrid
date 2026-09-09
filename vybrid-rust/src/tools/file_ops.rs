@@ -1,24 +1,59 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-const DEFAULT_READ_FILE_BYTES: usize = 64 * 1024;
-const MIN_READ_FILE_BYTES: usize = 4 * 1024;
+const DEFAULT_READ_FILE_BYTES: usize = 12 * 1024;
+const MIN_READ_FILE_BYTES: usize = 256;
 const MAX_READ_FILE_BYTES: usize = 256 * 1024;
+const MAX_CACHE_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileReadCache {
-    entries: Arc<Mutex<HashMap<PathBuf, CachedFile>>>,
+    entries: Arc<Mutex<CacheState>>,
+}
+
+#[derive(Debug, Default)]
+struct CacheState {
+    files: HashMap<PathBuf, CachedFile>,
+    bytes: usize,
+    clock: u64,
+}
+
+#[derive(Debug)]
+struct FileContents {
+    text: String,
+    starts: Vec<usize>,
+}
+
+impl FileContents {
+    fn new(text: String) -> Self {
+        let mut starts = Vec::new();
+        if !text.is_empty() {
+            starts.push(0);
+        }
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(i, b)| (b == b'\n' && i + 1 < text.len()).then_some(i + 1)),
+        );
+        Self { text, starts }
+    }
+    fn bytes(&self) -> usize {
+        self.text.capacity() + self.starts.capacity() * std::mem::size_of::<usize>()
+    }
 }
 
 #[derive(Debug, Clone)]
 struct CachedFile {
     modified: Option<SystemTime>,
     len: u64,
-    content: String,
+    content: Arc<FileContents>,
+    used: u64,
 }
 
 impl FileReadCache {
@@ -27,35 +62,73 @@ impl FileReadCache {
         path: &Path,
         modified: Option<SystemTime>,
         len: u64,
-    ) -> Result<(String, String)> {
-        let cached = self
-            .entries
-            .lock()
-            .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?
-            .get(path)
-            .cloned();
-
-        if let Some(cached) = cached {
-            if cached.modified == modified && cached.len == len {
-                return Ok((cached.content, "hit".to_string()));
+    ) -> Result<Option<(Arc<FileContents>, String)>> {
+        {
+            let mut cache = self
+                .entries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?;
+            cache.clock += 1;
+            let used = cache.clock;
+            if let Some(cached) = cache.files.get_mut(path) {
+                if modified.is_some() && cached.modified == modified && cached.len == len {
+                    cached.used = used;
+                    return Ok(Some((cached.content.clone(), "hit".to_string())));
+                }
             }
         }
-
-        let content = fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", path.display(), e))?;
-        self.entries
+        let Some(text) = read_cacheable_text(path)? else {
+            return Ok(None);
+        };
+        let content = Arc::new(FileContents::new(text));
+        let mut cache = self
+            .entries
             .lock()
-            .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?
-            .insert(
+            .map_err(|_| anyhow::anyhow!("file read cache lock poisoned"))?;
+        if let Some(old) = cache.files.remove(path) {
+            cache.bytes -= old.content.bytes();
+        }
+        if content.bytes() <= MAX_CACHE_BYTES {
+            while cache.bytes + content.bytes() > MAX_CACHE_BYTES {
+                let Some(oldest) = cache
+                    .files
+                    .iter()
+                    .min_by_key(|(_, file)| file.used)
+                    .map(|(path, _)| path.clone())
+                else {
+                    break;
+                };
+                if let Some(old) = cache.files.remove(&oldest) {
+                    cache.bytes -= old.content.bytes();
+                }
+            }
+            cache.clock += 1;
+            let used = cache.clock;
+            cache.bytes += content.bytes();
+            cache.files.insert(
                 path.to_path_buf(),
                 CachedFile {
                     modified,
                     len,
                     content: content.clone(),
+                    used,
                 },
             );
-        Ok((content, "miss".to_string()))
+        }
+        Ok(Some((content, "miss".to_string())))
     }
+}
+
+/// Stat is only a hint: a file can grow between checking metadata and reading it.
+fn read_cacheable_text(path: &Path) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_CACHE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CACHE_FILE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8(bytes)?))
 }
 
 /// Normalize a file path (expand ~ and make absolute if needed)
@@ -101,34 +174,39 @@ pub fn read_file_with_options_cached(
         .map_err(|e| anyhow::anyhow!("Failed to stat '{}': {}", normalized, e))?;
     let modified = metadata.modified().ok();
     let len = metadata.len();
-    let (content, cache_status) = if let Some(cache) = cache {
+    if len > MAX_CACHE_FILE_BYTES {
+        return read_streamed_range(path, start_line.unwrap_or(1), line_count, max_bytes, None);
+    }
+    let loaded = if let Some(cache) = cache {
         cache.read_or_load(file_path, modified, len)?
     } else {
-        (
-            fs::read_to_string(&normalized)
-                .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", normalized, e))?,
-            "uncached".to_string(),
-        )
+        read_cacheable_text(file_path)?
+            .map(|text| (Arc::new(FileContents::new(text)), "uncached".to_string()))
+    };
+    let Some((content, cache_status)) = loaded else {
+        return read_streamed_range(path, start_line.unwrap_or(1), line_count, max_bytes, None);
     };
 
-    let total_lines = content.lines().count();
-    let total_bytes = content.len();
+    let total_lines = content.starts.len();
+    let total_bytes = content.text.len();
     let start = start_line.unwrap_or(1).max(1);
     let count = line_count.unwrap_or(usize::MAX);
-    let selected = content
-        .lines()
-        .enumerate()
-        .filter_map(|(idx, line)| {
-            let line_no = idx + 1;
-            (line_no >= start && line_no < start.saturating_add(count)).then_some(line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let begin = content
+        .starts
+        .get(start - 1)
+        .copied()
+        .unwrap_or(total_bytes);
+    let end = content
+        .starts
+        .get(start.saturating_sub(1).saturating_add(count))
+        .copied()
+        .unwrap_or(total_bytes);
+    let selected = &content.text[begin..end];
 
     let limit = max_bytes
         .unwrap_or(DEFAULT_READ_FILE_BYTES)
         .clamp(MIN_READ_FILE_BYTES, MAX_READ_FILE_BYTES);
-    let (body, truncated) = truncate_utf8(&selected, limit);
+    let (body, truncated) = truncate_utf8(selected, limit);
     let display_path = crate::project_context::root_relative(file_path);
 
     let mut header = format!(
@@ -141,18 +219,83 @@ pub fn read_file_with_options_cached(
         cache_status
     );
     if start_line.is_some() || line_count.is_some() {
-        let end = start
-            .saturating_add(count)
-            .saturating_sub(1)
-            .min(total_lines);
-        header.push_str(&format!(", returned_lines: {}-{}", start, end));
+        if body.is_empty() {
+            header.push_str(", returned_lines: none");
+        } else {
+            let end = start.saturating_add(body.lines().count()).saturating_sub(1);
+            header.push_str(&format!(", returned_lines: {}-{}", start, end));
+        }
     }
     if truncated {
         header.push_str(", truncated: true");
     }
+    header.push_str(&format!(
+        ", next_byte: {}, more: {}",
+        begin + body.len(),
+        begin + body.len() < total_bytes
+    ));
     header.push_str("):\n\n");
 
     Ok(format!("{header}{body}"))
+}
+
+/// Bounded reads for large files and exact continuation through very long lines.
+pub fn read_streamed_range(
+    path: &str,
+    start_line: usize,
+    line_count: Option<usize>,
+    max_bytes: Option<usize>,
+    start_byte: Option<u64>,
+) -> Result<String> {
+    let normalized = normalize_path(path);
+    let file = fs::File::open(&normalized)?;
+    let total_bytes = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    let mut offset = 0;
+    if let Some(byte) = start_byte {
+        offset = reader.seek(SeekFrom::Start(byte.min(total_bytes)))?;
+    } else {
+        for _ in 1..start_line.max(1) {
+            let skipped = reader.skip_until(b'\n')?;
+            offset += skipped as u64;
+            if skipped == 0 {
+                break;
+            }
+        }
+    }
+    let limit = max_bytes
+        .unwrap_or(DEFAULT_READ_FILE_BYTES)
+        .clamp(MIN_READ_FILE_BYTES, MAX_READ_FILE_BYTES);
+    let mut bytes = Vec::with_capacity(limit + 4);
+    reader.take((limit + 4) as u64).read_to_end(&mut bytes)?;
+    // Byte continuations must start on a UTF-8 boundary; returned next_byte always does.
+    let valid = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(e) if e.error_len().is_none() => std::str::from_utf8(&bytes[..e.valid_up_to()])?,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Invalid UTF-8 or start_byte inside a character: {e}"
+            ))
+        }
+    };
+    let mut end = valid.len().min(limit);
+    while !valid.is_char_boundary(end) {
+        end -= 1;
+    }
+    if let Some(count) = line_count {
+        if count == 0 {
+            end = 0;
+        } else if let Some((i, _)) = valid
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'\n')
+            .nth(count - 1)
+        {
+            end = end.min(i + 1);
+        }
+    }
+    let next = offset + end as u64;
+    Ok(format!("Content of '{}' (total_bytes: {}, returned_bytes: {}, start_byte: {}, next_byte: {}, more: {}, cache: streamed):\n\n{}", path, total_bytes, end, offset, next, next < total_bytes, &valid[..end]))
 }
 
 /// Read multiple files
@@ -164,18 +307,16 @@ pub fn read_multiple_files(paths: &[&str]) -> Result<String> {
 /// Read multiple files through the same metadata-aware cache.
 pub fn read_multiple_files_cached(paths: &[&str], cache: Option<&FileReadCache>) -> Result<String> {
     let mut results = Vec::new();
-
-    for path in paths {
-        match read_file_with_options_cached(
-            path,
-            None,
-            None,
-            Some(DEFAULT_READ_FILE_BYTES / 2),
-            cache,
-        ) {
+    let count = paths.len().min(32);
+    let per_file = (16 * 1024 / count.max(1)).min(DEFAULT_READ_FILE_BYTES / 2);
+    for path in paths.iter().take(count) {
+        match read_file_with_options_cached(path, None, None, Some(per_file), cache) {
             Ok(content) => results.push(content),
             Err(e) => results.push(format!("Error reading '{}': {}", path, e)),
         }
+    }
+    if paths.len() > count {
+        results.push(format!("[Read {count} files. {} additional paths were not read; request the remaining paths in a new batch.]", paths.len() - count));
     }
 
     let separator = format!("\n\n{}\n\n", "=".repeat(50));
@@ -452,6 +593,38 @@ pub fn append_to_file(path: &str, content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_hits_share_the_original_buffer_and_line_index() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-cache-shared-{}", uuid::Uuid::new_v4()));
+        fs::write(&path, "first\nsecond\n").unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let cache = FileReadCache::default();
+        let (first, _) = cache
+            .read_or_load(&path, metadata.modified().ok(), metadata.len())
+            .unwrap()
+            .unwrap();
+        let (second, status) = cache
+            .read_or_load(&path, metadata.modified().ok(), metadata.len())
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(status, "hit");
+        assert_eq!(first.starts, vec![0, 6]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_load_is_bounded_even_when_metadata_understates_file_size() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-cache-growing-{}", uuid::Uuid::new_v4()));
+        fs::write(&path, vec![b'x'; MAX_CACHE_FILE_BYTES as usize + 1]).unwrap();
+        let cache = FileReadCache::default();
+        assert!(cache.read_or_load(&path, None, 1).unwrap().is_none());
+        assert_eq!(cache.entries.lock().unwrap().bytes, 0);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn edit_file_dry_run_does_not_write() {

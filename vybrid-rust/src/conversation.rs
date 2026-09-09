@@ -1,7 +1,7 @@
 use crate::client::groq::Message;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
-const MAX_TOOL_RESULT_CHARS: usize = 48 * 1024;
 #[allow(dead_code)]
 pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
 
@@ -27,6 +27,7 @@ fn compaction_marker_message() -> Message {
 
 /// Keep the head and tail of oversized content. Single forward/backward scan over
 /// char boundaries; avoids intermediate `Vec<char>` allocations.
+#[cfg(test)]
 pub(crate) fn truncate_middle(content: &str, max_chars: usize, label: &str) -> String {
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
@@ -82,6 +83,8 @@ pub struct Conversation {
     /// identical prefix (system prompt + marker + same leading messages), which
     /// maximizes Groq prompt-cache hits.
     request_floor: usize,
+    pinned: BTreeMap<String, Message>,
+    next_task_id: u64,
 }
 
 impl Conversation {
@@ -94,6 +97,8 @@ impl Conversation {
                 tool_call_id: None,
             }],
             request_floor: 1,
+            pinned: BTreeMap::new(),
+            next_task_id: 0,
         }
     }
 
@@ -110,11 +115,80 @@ impl Conversation {
         self.messages.push(message);
     }
 
+    /// User-authored task text survives automatic windowing. Corrective harness
+    /// notes deliberately use add_user_message instead of replacing this anchor.
+    pub fn add_task_message(&mut self, content: &str) {
+        self.add_user_message(content);
+        let message = self.messages.last().unwrap().clone();
+        self.next_task_id += 1;
+        self.pinned.insert(
+            format!("task_history:{:020}", self.next_task_id),
+            message.clone(),
+        );
+        self.pinned
+            .entry("task_origin".into())
+            .or_insert_with(|| message.clone());
+        self.pinned.insert("task_latest".into(), message);
+    }
+
+    /// Append a context revision only when it changes; never rewrite a live prefix.
+    pub fn set_context_snapshot(&mut self, key: &str, content: &str) -> bool {
+        if self.pinned.get(key).and_then(|m| m.content.as_deref()) == Some(content) {
+            return false;
+        }
+        self.add_user_message(content);
+        self.pinned
+            .insert(key.into(), self.messages.last().unwrap().clone());
+        true
+    }
+
+    fn missing_pins(&self, floor: usize) -> Vec<&Message> {
+        let tail = &self.messages[floor.min(self.messages.len())..];
+        let mut missing: Vec<&Message> = Vec::new();
+        for pin in self.pinned.values() {
+            if !tail
+                .iter()
+                .chain(missing.iter().copied())
+                .any(|m| m.role == pin.role && m.content == pin.content)
+            {
+                missing.push(pin);
+            }
+        }
+        missing
+    }
+
+    fn tokens_from(&self, floor: usize) -> u32 {
+        self.messages
+            .first()
+            .map(estimate_message_tokens)
+            .unwrap_or(0)
+            .saturating_add(if floor > 1 { 64 } else { 0 })
+            .saturating_add(
+                self.messages[floor.min(self.messages.len())..]
+                    .iter()
+                    .chain(self.missing_pins(floor))
+                    .map(estimate_message_tokens)
+                    .fold(0, u32::saturating_add),
+            )
+    }
+
+    /// End of an indivisible assistant/tool-result group.
+    fn group_end(&self, start: usize) -> usize {
+        let mut end = start + 1;
+        while end < self.messages.len() && self.messages[end].role == "tool" {
+            end += 1;
+        }
+        end
+    }
+
+    pub fn estimate_active_tokens(&self) -> u32 {
+        self.tokens_from(self.request_floor.max(1))
+    }
+
     pub fn add_tool_result(&mut self, tool_call_id: &str, result: &str) {
-        let result = truncate_middle(result, MAX_TOOL_RESULT_CHARS, "tool result");
         self.messages.push(Message {
             role: "tool".to_string(),
-            content: Some(result),
+            content: Some(result.to_owned()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.to_string()),
         });
@@ -149,52 +223,35 @@ impl Conversation {
             }
         }
         out.push(compaction_marker_message());
+        out.extend(self.missing_pins(self.request_floor).into_iter().cloned());
         out.extend(tail.iter().cloned());
         Cow::Owned(out)
     }
 
     /// Advance the request floor (never backward) until the request fits the budget.
     fn advance_floor_to_fit(&mut self, token_budget: u32) {
-        const MARKER_TOKENS: u32 = 64;
-        if self.request_floor < 1 {
-            self.request_floor = 1;
+        self.request_floor = self.request_floor.max(1);
+        if self.tokens_from(self.request_floor) <= token_budget {
+            return;
         }
-
-        loop {
-            let last_idx = self.messages.len().saturating_sub(1);
-            if self.request_floor > last_idx {
+        let target = token_budget.saturating_mul(3) / 4;
+        while self.request_floor < self.messages.len()
+            && self.tokens_from(self.request_floor) > target
+        {
+            let next = self.group_end(self.request_floor);
+            // A context policy budget is soft: keep the newest complete group,
+            // even when it alone exceeds the target, instead of sending orphans.
+            if next >= self.messages.len() {
                 break;
             }
-
-            let mut used: u32 = self
-                .messages
-                .first()
-                .filter(|m| m.role == "system")
-                .map(estimate_message_tokens)
-                .unwrap_or(0);
-            if self.request_floor > 1 {
-                used = used.saturating_add(MARKER_TOKENS);
-            }
-            for message in &self.messages[self.request_floor..] {
-                used = used.saturating_add(estimate_message_tokens(message));
-            }
-
-            if used <= token_budget || self.request_floor >= last_idx {
-                break;
-            }
-
-            self.request_floor += 1;
-            // OpenAI-compatible APIs reject orphan tool messages whose matching
-            // assistant call fell outside the window; skip past them.
-            while self.request_floor < last_idx && self.messages[self.request_floor].role == "tool"
-            {
-                self.request_floor += 1;
-            }
+            self.request_floor = next;
         }
     }
 
     pub fn clear_keeping_system(&mut self) {
         self.request_floor = 1;
+        self.pinned.clear();
+        self.next_task_id = 0;
         if let Some(system_msg) = self.messages.first().cloned() {
             if system_msg.role == "system" {
                 self.messages = vec![system_msg];
@@ -246,35 +303,52 @@ impl Conversation {
         }
 
         let mut transcript = String::new();
-        for message in &self.messages[1..first_kept] {
-            let role = &message.role;
-            let content = message.content.as_deref().unwrap_or("");
-            let snippet = if content.chars().count() > 2_000 {
-                truncate_middle(content, 2_000, role)
-            } else {
-                content.to_string()
-            };
-            transcript.push_str(&format!("[{role}] {snippet}\n\n"));
-            if transcript.chars().count() > COMPACT_TRANSCRIPT_MAX_CHARS {
-                transcript = truncate_middle(
-                    &transcript,
-                    COMPACT_TRANSCRIPT_MAX_CHARS,
-                    "compaction transcript",
-                );
+        let mut covered = 1;
+        while covered < first_kept {
+            let end = self.group_end(covered);
+            if end > first_kept {
                 break;
             }
+            let mut group = String::new();
+            for message in &self.messages[covered..end] {
+                group.push_str(&format!(
+                    "[{}] {}\n",
+                    message.role,
+                    message.content.as_deref().unwrap_or("")
+                ));
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        group.push_str(&format!(
+                            "[tool call {}] {} {}\n",
+                            call.id, call.function.name, call.function.arguments
+                        ));
+                    }
+                }
+                group.push('\n');
+            }
+            // Never delete a group whose complete text was not provided.
+            if transcript.len() + group.len() > COMPACT_TRANSCRIPT_MAX_CHARS {
+                break;
+            }
+            transcript.push_str(&group);
+            covered = end;
         }
+        first_kept = covered;
 
-        if transcript.trim().is_empty() {
+        if transcript.trim().is_empty() || first_kept.saturating_sub(1) < COMPACT_MIN_TO_SUMMARIZE {
             return None;
         }
 
         Some((first_kept, transcript))
     }
 
-    pub fn apply_manual_compaction(&mut self, summary: &str, first_kept_index: usize) {
-        if first_kept_index <= 1 || first_kept_index >= self.messages.len() {
-            return;
+    pub fn apply_manual_compaction(&mut self, summary: &str, first_kept_index: usize) -> bool {
+        if summary.trim().is_empty()
+            || first_kept_index <= 1
+            || first_kept_index >= self.messages.len()
+            || self.messages[first_kept_index].role == "tool"
+        {
+            return false;
         }
 
         let summary_message = Message {
@@ -284,15 +358,50 @@ impl Conversation {
             tool_call_id: None,
         };
 
-        let system = self.messages.first().cloned();
-        let tail = self.messages[first_kept_index..].to_vec();
-        self.messages.clear();
-        if let Some(system) = system {
-            self.messages.push(system);
+        let mut next = vec![self.messages[0].clone(), summary_message.clone()];
+        let covered_tasks: Vec<_> = self
+            .pinned
+            .iter()
+            .filter(|(key, message)| {
+                key.starts_with("task_history:")
+                    && self.messages[1..first_kept_index]
+                        .iter()
+                        .any(|m| m.content == message.content)
+            })
+            .map(|(key, message)| (key.clone(), message.content.clone()))
+            .collect();
+        let mut pins = self.missing_pins(first_kept_index);
+        pins.retain(|message| {
+            self.pinned
+                .get("task_origin")
+                .is_some_and(|m| m.content == message.content)
+                || self
+                    .pinned
+                    .get("task_latest")
+                    .is_some_and(|m| m.content == message.content)
+                || !covered_tasks
+                    .iter()
+                    .any(|(_, content)| *content == message.content)
+        });
+        if let Some(old_summary) = self.pinned.get("summary") {
+            pins.retain(|m| m.content != old_summary.content);
         }
-        self.messages.push(summary_message);
-        self.messages.extend(tail);
+        next.extend(pins.into_iter().cloned());
+        next.extend_from_slice(&self.messages[first_kept_index..]);
+        let next_tokens = next
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0, u32::saturating_add);
+        if next_tokens >= self.estimate_context_tokens() {
+            return false;
+        }
+        self.messages = next;
+        for (key, _) in covered_tasks {
+            self.pinned.remove(&key);
+        }
+        self.pinned.insert("summary".into(), summary_message);
         self.request_floor = 1;
+        true
     }
 
     /// Rough token estimate for the context meter (~4 chars per token for mixed text/code).
@@ -309,9 +418,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_results_are_truncated_before_storage() {
+    fn tool_results_preserve_the_presented_range() {
         let mut conversation = Conversation::new("system");
-        let large = "x".repeat(MAX_TOOL_RESULT_CHARS + 1024);
+        let large = "x".repeat(64 * 1024);
         conversation.add_tool_result("call-1", &large);
 
         let stored = conversation
@@ -321,8 +430,7 @@ mod tests {
             .content
             .as_ref()
             .unwrap();
-        assert!(stored.contains("tool result"));
-        assert!(stored.len() < large.len());
+        assert_eq!(stored, &large);
     }
 
     #[test]
@@ -413,7 +521,9 @@ mod tests {
         for i in 0..3 {
             conversation.add_user_message(&format!("msg-{i}"));
         }
-        assert!(conversation.compactable_transcript(COMPACT_KEEP_RECENT).is_none());
+        assert!(conversation
+            .compactable_transcript(COMPACT_KEEP_RECENT)
+            .is_none());
     }
 
     #[test]
@@ -453,7 +563,14 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains(MANUAL_COMPACTION_PREFIX));
-        assert!(conversation.messages.last().unwrap().content.as_deref().unwrap_or("").contains("message-19"));
+        assert!(conversation
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("message-19"));
     }
 
     #[test]

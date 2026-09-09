@@ -10,20 +10,9 @@ use tokio::time::timeout;
 use super::file_ops::normalize_path;
 
 const MAX_RUST_HELP_BYTES: usize = 64 * 1024;
-const MAX_METADATA_BYTES: usize = 256 * 1024;
 
 fn truncate_text(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let half = max_bytes / 2;
-    let head = &text[..half.min(text.len())];
-    let tail_start = text.len().saturating_sub(half);
-    let tail = &text[tail_start..];
-    format!(
-        "{head}\n\n[Output truncated: {} bytes omitted]\n\n{tail}",
-        text.len().saturating_sub(head.len() + tail.len())
-    )
+    super::output::truncate_utf8_middle(text, max_bytes, "Output")
 }
 
 fn concept_hint(code_or_topic: &str) -> Option<&'static str> {
@@ -138,10 +127,8 @@ pub async fn cargo_metadata(
         ));
     }
 
-    Ok(truncate_text(
-        &String::from_utf8_lossy(&output.stdout),
-        MAX_METADATA_BYTES,
-    ))
+    // Parse/inspect complete metadata before the presentation layer offloads it.
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 /// Summarize the current Rust package/workspace from Cargo metadata.

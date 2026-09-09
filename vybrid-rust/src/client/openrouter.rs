@@ -118,7 +118,13 @@ fn cache_dir() -> Result<PathBuf> {
 fn cache_path(query_key: &str) -> Result<PathBuf> {
     let safe: String = query_key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Ok(cache_dir()?.join(format!("openrouter_{safe}.json")))
 }
@@ -174,10 +180,7 @@ fn parse_models(data: Vec<ApiModel>) -> Vec<OpenRouterModel> {
 /// Apply query-specific filters that cannot be expressed as combined API params.
 fn post_filter(models: Vec<OpenRouterModel>, query: &ModelQuery) -> Vec<OpenRouterModel> {
     match query {
-        ModelQuery::Recommended => models
-            .into_iter()
-            .filter(|m| m.supports_tools)
-            .collect(),
+        ModelQuery::Recommended => models.into_iter().filter(|m| m.supports_tools).collect(),
         _ => models,
     }
 }
@@ -358,11 +361,12 @@ mod tests {
 
     #[test]
     fn recommended_query_omits_supported_parameters_with_category() {
-        let params: std::collections::HashMap<_, _> = ModelQuery::Recommended
-            .query_params()
-            .into_iter()
-            .collect();
-        assert_eq!(params.get("category").map(String::as_str), Some("programming"));
+        let params: std::collections::HashMap<_, _> =
+            ModelQuery::Recommended.query_params().into_iter().collect();
+        assert_eq!(
+            params.get("category").map(String::as_str),
+            Some("programming")
+        );
         assert!(!params.contains_key("supported_parameters"));
     }
 

@@ -3,23 +3,14 @@
 use anyhow::Result;
 use glob::glob;
 use regex::RegexBuilder;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
 const MAX_GREP_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn truncate_output(output: &str, max_bytes: usize) -> String {
-    if output.len() <= max_bytes {
-        return output.to_string();
-    }
-    let half = max_bytes / 2;
-    let head = &output[..half.min(output.len())];
-    let tail_start = output.len().saturating_sub(half);
-    let tail = &output[tail_start..];
-    format!(
-        "{head}\n\n[Grep output truncated: {} bytes omitted]\n\n{tail}",
-        output.len().saturating_sub(head.len() + tail.len())
-    )
+    super::output::truncate_utf8_middle(output, max_bytes, "Grep output")
 }
 
 /// Enhanced grep functionality with context and formatting
@@ -39,8 +30,9 @@ pub fn enhanced_grep(
     let mut results = Vec::new();
     let mut total_matches = 0;
 
-    // Expand all file paths (including globs)
+    // Traverse globs lazily so the match limit also bounds directory traversal.
     let expanded_paths = expand_paths(file_paths)?;
+    let mut visited = HashSet::new();
 
     let max_matches = max_matches.max(1);
     for path in expanded_paths {
@@ -51,6 +43,9 @@ pub fn enhanced_grep(
 
         // Skip non-files
         if !path.is_file() {
+            continue;
+        }
+        if !visited.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
             continue;
         }
 
@@ -66,21 +61,29 @@ pub fn enhanced_grep(
         let lines: Vec<&str> = content.lines().collect();
         let mut file_matches = Vec::new();
         let mut matched_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut actual_matches = std::collections::HashSet::new();
 
         // Find all matching lines
         for (line_num, line) in lines.iter().enumerate() {
             if regex.is_match(line) {
-                if total_matches + matched_lines.len() >= max_matches {
+                if total_matches + actual_matches.len() >= max_matches {
                     break;
                 }
                 matched_lines.insert(line_num);
+                actual_matches.insert(line_num);
 
                 // Add context lines
                 let start = line_num.saturating_sub(context_lines);
-                let end = (line_num + context_lines + 1).min(lines.len());
+                let end = line_num
+                    .saturating_add(context_lines)
+                    .saturating_add(1)
+                    .min(lines.len());
 
                 for ctx_num in start..end {
                     matched_lines.insert(ctx_num);
+                }
+                if total_matches + actual_matches.len() >= max_matches {
+                    break;
                 }
             }
         }
@@ -101,7 +104,7 @@ pub fn enhanced_grep(
                 }
 
                 let line = lines[line_num];
-                let is_match = regex.is_match(line);
+                let is_match = actual_matches.contains(&line_num);
                 let prefix = if is_match { ">" } else { " " };
 
                 file_result.push_str(&format!("{} {:4}: {}\n", prefix, line_num + 1, line));
@@ -124,10 +127,16 @@ pub fn enhanced_grep(
     if results.is_empty() {
         Ok(format!("No matches found for pattern '{}'", pattern))
     } else {
+        let limit_note = if total_matches >= max_matches {
+            "\n[Match limit reached; narrow the scope or increase max_matches for more.]"
+        } else {
+            ""
+        };
         let header = format!(
-            "Found {} match(es) for pattern '{}'\n{}\n",
+            "Found {} match(es) for pattern '{}'{}\n{}\n",
             total_matches,
             pattern,
+            limit_note,
             "-".repeat(50)
         );
         Ok(truncate_output(
@@ -138,28 +147,29 @@ pub fn enhanced_grep(
 }
 
 /// Expand file paths including glob patterns
-fn expand_paths(paths: &[&str]) -> Result<Vec<PathBuf>> {
-    let mut expanded = Vec::new();
+fn expand_paths(paths: &[&str]) -> Result<impl Iterator<Item = PathBuf>> {
+    let mut expanded: Vec<Box<dyn Iterator<Item = PathBuf>>> = Vec::new();
 
     for path in paths {
         let normalized = super::file_ops::normalize_path(path);
 
         // Check if it contains glob characters
         if normalized.contains('*') || normalized.contains('?') || normalized.contains('[') {
-            for entry in glob(&normalized)
-                .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", path, e))?
-            {
-                match entry {
-                    Ok(p) => expanded.push(p),
-                    Err(e) => eprintln!("Glob error for '{}': {}", path, e),
+            let entries = glob(&normalized)
+                .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", path, e))?;
+            expanded.push(Box::new(entries.filter_map(move |entry| match entry {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    eprintln!("Glob error for '{}': {}", normalized, e);
+                    None
                 }
-            }
+            })));
         } else {
-            expanded.push(PathBuf::from(normalized));
+            expanded.push(Box::new(std::iter::once(PathBuf::from(normalized))));
         }
     }
 
-    Ok(expanded)
+    Ok(expanded.into_iter().flatten())
 }
 
 /// Simple grep for quick searches (no context)

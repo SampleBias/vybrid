@@ -328,16 +328,28 @@ Steps, scripts, and references go here.
 
 Long agent sessions can fill the context window. Vybrid handles this in two ways:
 
-1. **Automatic** — When a request exceeds the token budget, older messages are dropped from the API payload while keeping a stable prefix for Groq prompt caching.
-2. **Manual** — Run **`/compact`** (optional focus text) to LLM-summarize older history in place, preserving the most recent messages. Example: `/compact preserve compiler errors and files still being edited`.
+1. **Automatic** — At the request budget, Vybrid tries up to three bounded summaries of older history, aiming to leave 25% headroom. The original task, latest user request, loaded skills, and current project context remain available. If summarization is unavailable, a window of complete tool-call/result groups is used. A group is never split to satisfy the soft history budget.
+2. **Manual** — Run **`/compact`** (optional focus text) to summarize a complete older range while preserving recent messages. Only the range supplied to the model is removed, and empty, incomplete, or expanding summaries leave history unchanged. Large histories may require another `/compact`. Example: `/compact preserve compiler errors and files still being edited`.
 
-The status line shows estimated context usage before each prompt (`ctx` meter).
+The `ctx` meter shows estimated active history, including retained task/context anchors. It is not an exact provider token count or the total stored transcript size. Tools and output reservations also consume the model's context window.
+
+### Tool performance and local metrics
+
+Project documentation and the memory index are injected as snapshots: unchanged content is reused, and revisions are appended when it changes. Read-only filesystem work uses up to four blocking workers; mutating tool batches retain their execution order.
+
+File reads default to 12 KiB, support line ranges and `start_byte` continuation, and share cached contents and line offsets. The cache has a 32 MiB allocation budget and skips files larger than 1 MiB. Large files are read through bounded buffers. Multi-file reads budget each file separately and handle up to 32 paths per call, explicitly reporting additional paths that need a later batch.
+
+Large command logs stream to `~/.vybrid/progress/tool-results/`. The model receives a head/tail preview with the exit status and exact log paths. Cargo JSON mode returns compiler summaries and program output, retaining raw events in a file. Requested file ranges are not shortened again based on tool-round depth.
+
+Groq fallback preserves local-tool access while a coding task is active. Compound routes are only eligible for an explicitly tool-free wrap-up. Open Rust LSP documents are synchronized after edits before further queries.
+
+Set `VYBRID_METRICS_FILE=/absolute/path/to/metrics.jsonl` to enable an optional local log. It records every request attempt, reported prompt/cached/completion tokens, compaction calls, elapsed times, and task/tool identifiers. Missing provider usage is recorded as unknown, not zero. Prompts, responses, API keys, and tool arguments are excluded. Metrics are disabled by default; see [the evaluation procedure](vybrid-rust/evals/efficiency.md) for comparisons.
 
 ### Project memory
 
 Vybrid keeps long-term hints in `.vybrid/memory/` without loading everything every turn:
 
-- **`MEMORY.md`** — Compact index of pointers (injected lightly each turn)
+- **`MEMORY.md`** — Compact index of pointers (snapshot refreshed when it changes)
 - **`topics/<name>.md`** — Detailed topic files, read via `read_memory_topic` when relevant
 - **Raw transcripts** — Stored under `~/.vybrid/messages/`; search with `search_memory_transcripts` for specific paths, symbols, or error codes
 
@@ -451,6 +463,8 @@ Vybrid also stores runtime data in `~/.vybrid/`:
 ## Changelog
 
 ### Unreleased
+
+- **Harness efficiency and correctness**: Task-preserving compaction, project-context snapshots, UTF-8-safe streaming and previews, bounded file/log handling, corrected grep limits, synchronized LSP edits, capability-preserving fallback, and optional local attempt/usage metrics.
 
 - **Agent Skills**: Pi-compatible `SKILL.md` discovery, progressive system-prompt disclosure, `/skills` management commands, and `/skill:<name>` loading. Example skill: `vybrid-rust/skills/rust-compile-fix-loop/`.
 - **`/compact`**: Manual LLM summarization of older conversation history to free context while preserving recent messages.

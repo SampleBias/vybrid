@@ -2,6 +2,10 @@
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
+use std::sync::{Arc, LazyLock};
+
+static BLOCKING_WORKERS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 use crate::lsp::{RustLspManager, RustLspOperation, RustLspQuery};
 use crate::memory::MemoryStore;
@@ -14,6 +18,7 @@ pub struct ToolRuntime {
     pub memory: Option<MemoryStore>,
     pub file_read_cache: file_ops::FileReadCache,
     pub output_store: output::ToolOutputStore,
+    pub task_id: Option<String>,
 }
 
 /// Tools that never mutate project or session state. Rounds consisting solely of
@@ -48,6 +53,47 @@ pub async fn execute_tool_with_context(
     arguments: &str,
     runtime: &ToolRuntime,
 ) -> Result<String> {
+    let started = std::time::Instant::now();
+    let result = execute_tool_scheduled(name, arguments, runtime).await;
+    crate::metrics::tool(
+        runtime.task_id.as_deref(),
+        name,
+        started,
+        result.is_ok(),
+        result.as_ref().map(|s| s.len()).unwrap_or(0),
+    );
+    result
+}
+
+async fn execute_tool_scheduled(
+    name: &str,
+    arguments: &str,
+    runtime: &ToolRuntime,
+) -> Result<String> {
+    if !matches!(
+        name,
+        "execute_bash_command"
+            | "run_cargo"
+            | "cargo_metadata"
+            | "rust_project_snapshot"
+            | "explain_rust_diagnostic"
+            | "rust_lsp_query"
+            | "google_search"
+    ) {
+        let permit = BLOCKING_WORKERS.clone().acquire_owned().await?;
+        let name = name.to_owned();
+        let arguments = arguments.to_owned();
+        let runtime = runtime.clone();
+        return tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            futures::executor::block_on(execute_tool_inner(&name, &arguments, &runtime))
+        })
+        .await?;
+    }
+    execute_tool_inner(name, arguments, runtime).await
+}
+
+async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) -> Result<String> {
     // Tool arguments arrive as a JSON string from the model. Treat malformed
     // JSON as recoverable feedback instead of silently executing with `{}`.
     let args: Value = serde_json::from_str(arguments).map_err(|e| {
@@ -65,6 +111,15 @@ pub async fn execute_tool_with_context(
             let start_line = args["start_line"].as_u64().map(|n| n as usize);
             let line_count = args["line_count"].as_u64().map(|n| n as usize);
             let max_bytes = args["max_bytes"].as_u64().map(|n| n as usize);
+            if let Some(start_byte) = args["start_byte"].as_u64() {
+                return file_ops::read_streamed_range(
+                    path,
+                    1,
+                    line_count,
+                    max_bytes,
+                    Some(start_byte),
+                );
+            }
             file_ops::read_file_with_options_cached(
                 path,
                 start_line,
@@ -163,7 +218,8 @@ pub async fn execute_tool_with_context(
             let command = args["command"].as_str().unwrap_or("");
             let description = args["description"].as_str();
             let working_dir = args["working_directory"].as_str();
-            shell::execute_bash(command, description, working_dir).await
+            shell::execute_bash_with_store(command, description, working_dir, &runtime.output_store)
+                .await
         }
 
         "run_cargo" => {
@@ -190,7 +246,7 @@ pub async fn execute_tool_with_context(
                 })
                 .unwrap_or_default();
             let working_dir = args["working_directory"].as_str();
-            cargo::run_cargo(
+            cargo::run_cargo_with_store(
                 subcommand,
                 release,
                 package,
@@ -198,6 +254,7 @@ pub async fn execute_tool_with_context(
                 &extra,
                 working_dir,
                 diagnostic_format,
+                &runtime.output_store,
             )
             .await
         }
@@ -333,7 +390,13 @@ pub async fn execute_tool_with_context(
         _ => Ok(format!("Unknown tool: {}", name)),
     };
 
-    result.and_then(|output| runtime.output_store.maybe_offload(name, output))
+    // Explicit file ranges are already bounded and carry their source location.
+    // Preserve them intact, including when retrieving a saved tool result.
+    if name == "read_file" || name == "read_multiple_files" {
+        result
+    } else {
+        result.and_then(|output| runtime.output_store.maybe_offload(name, output))
+    }
 }
 
 /// Execute a tool synchronously

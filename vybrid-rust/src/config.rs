@@ -298,11 +298,7 @@ impl Config {
                 if model.is_empty() {
                     return None;
                 }
-                Some((
-                    key,
-                    OPENROUTER_BASE_URL.to_string(),
-                    model.to_string(),
-                ))
+                Some((key, OPENROUTER_BASE_URL.to_string(), model.to_string()))
             }
         }
     }
@@ -349,9 +345,7 @@ impl Config {
                 self.reasoning_effort = Some(v.to_string());
             }
             Some(v) => {
-                anyhow::bail!(
-                    "Invalid thinking level '{v}'. Use low, medium, high, or default."
-                );
+                anyhow::bail!("Invalid thinking level '{v}'. Use low, medium, high, or default.");
             }
         }
         Ok(())
@@ -678,8 +672,14 @@ mod tests {
 
     #[test]
     fn llm_provider_parses_openrouter() {
-        assert_eq!(LlmProvider::parse("openrouter"), Some(LlmProvider::OpenRouter));
-        assert_eq!(LlmProvider::parse("Open-Router"), Some(LlmProvider::OpenRouter));
+        assert_eq!(
+            LlmProvider::parse("openrouter"),
+            Some(LlmProvider::OpenRouter)
+        );
+        assert_eq!(
+            LlmProvider::parse("Open-Router"),
+            Some(LlmProvider::OpenRouter)
+        );
     }
 
     #[test]
@@ -751,7 +751,10 @@ mod tests {
             format_thinking_indicator("openai/gpt-oss-120b", Some("low")),
             "think low"
         );
-        assert_eq!(format_thinking_indicator("openai/gpt-oss-120b", None), "think low");
+        assert_eq!(
+            format_thinking_indicator("openai/gpt-oss-120b", None),
+            "think low"
+        );
     }
 
     #[test]

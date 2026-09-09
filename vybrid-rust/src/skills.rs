@@ -92,9 +92,9 @@ impl SkillRegistry {
     }
 
     pub fn load_body(&self, name: &str, user_args: Option<&str>) -> Result<String> {
-        let skill = self
-            .get(name)
-            .ok_or_else(|| anyhow!("Skill '{name}' not found. Use /skills to list available skills."))?;
+        let skill = self.get(name).ok_or_else(|| {
+            anyhow!("Skill '{name}' not found. Use /skills to list available skills.")
+        })?;
         let raw = fs::read_to_string(&skill.path)
             .with_context(|| format!("Failed to read skill at {}", skill.path.display()))?;
         let body = skill_body_from_content(&raw);
@@ -197,9 +197,7 @@ fn parse_skill_file(path: &Path, skill_dir: Option<&Path>) -> Option<SkillMeta> 
         .unwrap_or("skill")
         .to_string();
 
-    let name = parsed
-        .name
-        .unwrap_or_else(|| fallback_name.clone());
+    let name = parsed.name.unwrap_or_else(|| fallback_name.clone());
     let description = parsed.description?;
 
     if !is_valid_skill_name(&name) {
@@ -243,7 +241,10 @@ fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
         };
     }
 
-    let rest = trimmed.strip_prefix("---").unwrap_or("").trim_start_matches('\n');
+    let rest = trimmed
+        .strip_prefix("---")
+        .unwrap_or("")
+        .trim_start_matches('\n');
     let Some(end_idx) = rest.find("\n---") else {
         return ParsedFrontmatter {
             name: None,
@@ -264,7 +265,11 @@ fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
         }
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().trim_matches('"').trim_matches('\'').to_string();
+            let value = value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             match key.as_str() {
                 "name" if !value.is_empty() => name = Some(value),
                 "description" if !value.is_empty() => description = Some(value),
@@ -287,7 +292,10 @@ fn parse_frontmatter(content: &str) -> ParsedFrontmatter {
 fn skill_body_from_content(content: &str) -> String {
     let trimmed = content.trim_start();
     if trimmed.starts_with("---") {
-        let rest = trimmed.strip_prefix("---").unwrap_or("").trim_start_matches('\n');
+        let rest = trimmed
+            .strip_prefix("---")
+            .unwrap_or("")
+            .trim_start_matches('\n');
         if let Some(end_idx) = rest.find("\n---") {
             let after = rest[end_idx + 4..].trim_start_matches('\n');
             return after.to_string();
@@ -353,10 +361,7 @@ disable-model-invocation: true
     fn skips_skill_without_description() {
         let dir = std::env::temp_dir().join(format!("vybrid-skill-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        write_skill_dir(
-            &dir.join("no-desc"),
-            "---\nname: no-desc\n---\n\nbody\n",
-        );
+        write_skill_dir(&dir.join("no-desc"), "---\nname: no-desc\n---\n\nbody\n");
         let skill = parse_skill_file(&dir.join("no-desc").join("SKILL.md"), None);
         assert!(skill.is_none());
         let _ = fs::remove_dir_all(&dir);

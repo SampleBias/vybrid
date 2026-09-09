@@ -1,5 +1,8 @@
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
+pub(crate) static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Project-level filesystem context used by tools that accept paths from the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectContext {
@@ -161,8 +164,9 @@ pub fn change_working_directory(path: &str) -> anyhow::Result<PathBuf> {
         PathBuf::from(trimmed)
     };
 
-    std::env::set_current_dir(&target)
-        .map_err(|e| anyhow::anyhow!("Failed to change directory to `{}`: {e}", target.display()))?;
+    std::env::set_current_dir(&target).map_err(|e| {
+        anyhow::anyhow!("Failed to change directory to `{}`: {e}", target.display())
+    })?;
 
     Ok(std::env::current_dir().unwrap_or(target))
 }
@@ -239,8 +243,9 @@ mod tests {
 
     #[test]
     fn change_working_directory_updates_process_cwd() {
+        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let original = std::env::current_dir().unwrap();
-        let nested = original.join(format!("vybrid-cd-test-{}", std::process::id()));
+        let nested = std::env::temp_dir().join(format!("vybrid-cd-test-{}", uuid::Uuid::new_v4()));
         let _ = std::fs::remove_dir_all(&nested);
         std::fs::create_dir_all(&nested).unwrap();
 

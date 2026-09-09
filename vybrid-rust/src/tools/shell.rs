@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -10,34 +9,7 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 300;
 const MAX_SHELL_OUTPUT_BYTES: usize = 96 * 1024;
 
 fn truncate_output(output: &str, max_bytes: usize) -> String {
-    if output.len() <= max_bytes {
-        return output.to_string();
-    }
-    let half = max_bytes / 2;
-    let head = &output[..half.min(output.len())];
-    let tail_start = output.len().saturating_sub(half);
-    let tail = &output[tail_start..];
-    format!(
-        "{head}\n\n[Shell output truncated: {} bytes omitted]\n\n{tail}",
-        output.len().saturating_sub(head.len() + tail.len())
-    )
-}
-
-async fn read_pipe<R>(reader: R, name: &'static str) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(reader).lines();
-    let mut output = String::new();
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to read {name}: {e}"))?
-    {
-        output.push_str(&line);
-        output.push('\n');
-    }
-    Ok(output)
+    super::output::truncate_utf8_middle(output, max_bytes, "Shell output")
 }
 
 /// Execute a bash command
@@ -45,6 +17,21 @@ pub async fn execute_bash(
     command: &str,
     description: Option<&str>,
     working_directory: Option<&str>,
+) -> Result<String> {
+    execute_bash_with_store(
+        command,
+        description,
+        working_directory,
+        &super::output::ToolOutputStore::default(),
+    )
+    .await
+}
+
+pub async fn execute_bash_with_store(
+    command: &str,
+    description: Option<&str>,
+    working_directory: Option<&str>,
+    store: &super::output::ToolOutputStore,
 ) -> Result<String> {
     if let Some(desc) = description {
         eprintln!("Executing: {} ({})", command, desc);
@@ -80,20 +67,12 @@ pub async fn execute_bash(
             .take()
             .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr"))?;
 
-        let stdout_task = tokio::spawn(read_pipe(stdout, "stdout"));
-        let stderr_task = tokio::spawn(read_pipe(stderr, "stderr"));
-
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to wait for command: {}", e))?;
-        let output = stdout_task
-            .await
-            .map_err(|e| anyhow::anyhow!("stdout task failed: {}", e))??;
-        let error_output = stderr_task
-            .await
-            .map_err(|e| anyhow::anyhow!("stderr task failed: {}", e))??;
-        Ok::<_, anyhow::Error>((output, error_output, status))
+        let (output, error_output, status) = tokio::try_join!(
+            super::output::capture_pipe(stdout, store.clone(), "stdout", false),
+            super::output::capture_pipe(stderr, store.clone(), "stderr", false),
+            async { child.wait().await.map_err(anyhow::Error::from) }
+        )?;
+        Ok::<_, anyhow::Error>((output.text, error_output.text, status))
     };
 
     let (output, error_output, status) =
@@ -135,7 +114,7 @@ pub async fn execute_bash(
         result = format!("Command failed (exit code {})\n{}", exit_code, result);
     }
 
-    Ok(truncate_output(&result, MAX_SHELL_OUTPUT_BYTES))
+    Ok(result)
 }
 
 /// Execute a simple command synchronously (for quick operations)

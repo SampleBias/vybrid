@@ -8,7 +8,7 @@ use crate::client::groq::GroqClient;
 use crate::client::openrouter::{
     clear_model_cache, fetch_models, format_model_label, ModelQuery, POPULAR_PROVIDERS,
 };
-use crate::config::{Config, DEFAULT_LM_STUDIO_BASE_URL, LlmProvider};
+use crate::config::{Config, LlmProvider, DEFAULT_LM_STUDIO_BASE_URL};
 use crate::lsp::RustLspManager;
 use crate::ui;
 
@@ -177,10 +177,7 @@ async fn handle_openrouter_menu(
             "Back",
         ];
         let sel = Select::new()
-            .with_prompt(format!(
-                "OpenRouter (current: {})",
-                config.openrouter_model
-            ))
+            .with_prompt(format!("OpenRouter (current: {})", config.openrouter_model))
             .items(&items)
             .max_length(MENU_PAGE_SIZE)
             .default(0)
@@ -208,7 +205,11 @@ async fn handle_openrouter_menu(
                 );
             }
             1 => {
-                if config.openrouter_api_key.as_deref().is_none_or(|k| k.trim().is_empty()) {
+                if config
+                    .openrouter_api_key
+                    .as_deref()
+                    .is_none_or(|k| k.trim().is_empty())
+                {
                     ui::print_error("Add an OpenRouter API key first.");
                     continue;
                 }
@@ -356,10 +357,7 @@ async fn pick_model_from_query(api_key: &str, query: &ModelQuery) -> Result<Opti
     Ok(Some(models[sel].id.clone()))
 }
 
-async fn handle_lm_studio_menu(
-    config: &mut Config,
-    client: &mut Option<GroqClient>,
-) -> Result<()> {
+async fn handle_lm_studio_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
     let default_base = DEFAULT_LM_STUDIO_BASE_URL;
     let base_raw: String = Input::new()
         .with_prompt(format!(

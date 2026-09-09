@@ -338,14 +338,15 @@ The system provides these tools to the AI:
 
 ### Conversation Management
 - System prompt is first message, never cleared
-- User messages added with `conversation.add_user_message()`
+- User tasks use `conversation.add_task_message()`; harness notes use `add_user_message()`. Context/skill revisions use `set_context_snapshot()` and are only appended when changed.
 - Assistant messages added with `conversation.add_assistant_message()`
 - Tool results added with `conversation.add_tool_result()`
 - `conversation.clear_keeping_system()` clears everything except system prompt
 
 ### Tool Result Efficiency
-- `read_file` and `read_multiple_files` use a session metadata cache through `ToolRuntime`. If the file length and modification time match the previous read, the cached content is reused and the tool header reports `cache: hit`.
-- Oversized successful tool outputs are written to `~/.vybrid/progress/tool-results/` (or the configured progress dir). The model receives a preview plus a `Full result` path that can be read with `read_file` when exact omitted content is needed.
+- `read_file` and `read_multiple_files` share cached buffers and line offsets through `ToolRuntime`, with a 32 MiB allocation budget and 1 MiB per-file cutoff. Larger files use bounded reads. `start_byte` supports exact continuation of very long lines. Do not reintroduce depth-based truncation of fresh file ranges.
+- Shell/Cargo pipe capture spools large raw logs to the configured progress directory. Cargo JSON mode exposes summaries and raw-log references. Other oversized outputs receive a UTF-8-safe head/tail preview. Preserve exit status, per-file labels, and exact retrieval paths.
+- Synchronous tools execute in a bounded blocking pool; keep mutations ordered. Optional `VYBRID_METRICS_FILE` logs metadata/usage for every attempt without content or credentials.
 
 ## API Integration
 
@@ -357,7 +358,7 @@ The system provides these tools to the AI:
   - `Content-Type: application/json`
   - `Accept: text/event-stream` (for streaming)
 - Default model: `openai/gpt-oss-120b` (optional override: env `GROQ_MODEL`)
-- Max completion tokens: 4096 default (`VYBRID_MAX_COMPLETION_TOKENS`); sent as `max_completion_tokens` to Groq (its `max_tokens` is deprecated) and as `max_tokens` to other OpenAI-compatible servers (LM Studio)
+- Max completion tokens: 8192 default (`VYBRID_MAX_COMPLETION_TOKENS`); compaction requests use 2048. Sent as `max_completion_tokens` to Groq and `max_tokens` to other compatible servers.
 - Temperature: 0.3 default (`VYBRID_TEMPERATURE`); low temperature reduces malformed tool-call JSON
 - Optional `reasoning_effort` (`VYBRID_REASONING_EFFORT`): `low`/`medium`/`high` for GPT-OSS, `none`/`default` for Qwen3 — only sent when the active model supports the configured value
 - Groq `service_tier` (`VYBRID_GROQ_SERVICE_TIER`, default `auto`) — Groq-only request field
@@ -498,7 +499,7 @@ When you send a message to the AI, project docs are automatically appended to yo
 
 Vybrid uses a skeptical three-layer memory system to keep active context small:
 
-1. **Core index**: `.vybrid/memory/MEMORY.md` is loaded into each user turn as a compact pointer list. Each non-empty line is capped at 150 characters.
+1. **Core index**: `.vybrid/memory/MEMORY.md` is checked each user turn and its snapshot is appended only when changed. Each non-empty line is capped at 150 characters.
 2. **Topic files**: `.vybrid/memory/topics/<topic>.md` stores detailed knowledge and is fetched only through `read_memory_topic` when the index suggests it is relevant.
 3. **Raw transcripts**: Session messages are appended under `~/.vybrid/messages/<project-key>/<session>.jsonl` and are searchable only through `search_memory_transcripts` for specific identifiers.
 

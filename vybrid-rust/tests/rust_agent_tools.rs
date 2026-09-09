@@ -1,6 +1,6 @@
 use std::fs;
 
-use vybrid::tools::cargo::{run_cargo, DiagnosticFormat};
+use vybrid::tools::cargo::{run_cargo_with_store, DiagnosticFormat};
 use vybrid::tools::rust::{explain_rust_diagnostic, rust_project_snapshot};
 
 fn temp_crate(name: &str, lib_rs: &str) -> std::path::PathBuf {
@@ -25,7 +25,7 @@ async fn run_cargo_json_diagnostics_find_trait_bound_errors() {
          pub fn demo() { let _ = needs_display(NoDisplay); }\n",
     );
 
-    let output = run_cargo(
+    let output = run_cargo_with_store(
         "check",
         false,
         None,
@@ -33,6 +33,7 @@ async fn run_cargo_json_diagnostics_find_trait_bound_errors() {
         &[],
         Some(root.to_str().unwrap()),
         DiagnosticFormat::Json,
+        &vybrid::tools::output::ToolOutputStore::new(&root),
     )
     .await
     .unwrap();

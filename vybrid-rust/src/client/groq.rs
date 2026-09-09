@@ -142,6 +142,43 @@ fn request_cache_shape(messages: &[Message], tools: Option<&[Tool]>) -> RequestC
 /// Sliding window of (request instant, estimated tokens) per model.
 type RateWindows = HashMap<String, VecDeque<(Instant, u32)>>;
 
+/// Decode only complete SSE events: transport chunks may split UTF-8 and CRLF.
+fn take_sse_event(buffer: &mut Vec<u8>) -> Result<Option<String>> {
+    let boundary = buffer
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|p| (p, 2))
+        .into_iter()
+        .chain(
+            buffer
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| (p, 4)),
+        )
+        .min_by_key(|(p, _)| *p);
+    let Some((end, delimiter)) = boundary else {
+        anyhow::ensure!(buffer.len() <= 8 * 1024 * 1024, "SSE event exceeds 8 MiB");
+        return Ok(None);
+    };
+    anyhow::ensure!(end <= 8 * 1024 * 1024, "SSE event exceeds 8 MiB");
+    let event = std::str::from_utf8(&buffer[..end])
+        .context("Invalid UTF-8 in API stream")?
+        .to_owned();
+    buffer.drain(..end + delimiter);
+    Ok(Some(event))
+}
+
+fn sse_data(event: &str) -> String {
+    event
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("data:")
+                .map(|s| s.strip_prefix(' ').unwrap_or(s))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Groq OpenAI-compatible Chat Completions client (`https://api.groq.com/openai/v1`).
 #[derive(Debug, Clone)]
 pub struct GroqClient {
@@ -159,6 +196,7 @@ pub struct GroqClient {
     /// Last provider-confirmed prompt-cache hit per model. This is used only when
     /// the next request extends the exact same message/tool prefix.
     prompt_cache: Arc<Mutex<HashMap<String, PromptCacheObservation>>>,
+    task_id: Option<String>,
 }
 
 /// Chat completion request (OpenAI-compatible subset). Borrows messages/tools so
@@ -356,6 +394,7 @@ impl GroqClient {
             rate_window: Arc::new(Mutex::new(HashMap::new())),
             rate_headers: Arc::new(Mutex::new(HashMap::new())),
             prompt_cache: Arc::new(Mutex::new(HashMap::new())),
+            task_id: None,
         }
     }
 
@@ -371,11 +410,30 @@ impl GroqClient {
             rate_window: self.rate_window.clone(),
             rate_headers: self.rate_headers.clone(),
             prompt_cache: self.prompt_cache.clone(),
+            task_id: self.task_id.clone(),
         }
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn with_task_id(&self, task_id: &str) -> Self {
+        let mut client = self.clone();
+        client.task_id = Some(task_id.into());
+        client
+    }
+
+    pub fn with_completion_limit(&self, limit: u32) -> Self {
+        let mut client = self.clone();
+        client.tuning.max_completion_tokens = limit;
+        client
+    }
+
+    pub fn with_rate_limit_wait(&self) -> Self {
+        let mut client = self.clone();
+        client.route_wait_threshold = Duration::from_secs(60);
+        client
     }
 
     fn is_groq(&self) -> bool {
@@ -663,7 +721,12 @@ impl GroqClient {
         let cache_shape = request_cache_shape(messages, tools);
         let full_estimate = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
         let estimated_tokens = self.cache_aware_estimate(full_estimate, &cache_shape);
-
+        let mut metrics = crate::metrics::RequestMetrics::new(
+            &self.model,
+            self.task_id.as_deref(),
+            estimated_tokens,
+            "generation",
+        );
         self.throttle_if_needed(estimated_tokens).await?;
 
         let response = self.send_request(body, true).await?;
@@ -672,31 +735,26 @@ impl GroqClient {
         let usage_client = self.clone();
 
         let output_stream = async_stream::stream! {
-            let mut buffer = String::new();
+            let mut buffer = Vec::new();
 
             futures::pin_mut!(stream);
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        buffer.extend_from_slice(&bytes);
+                        loop {
+                            let event = match take_sse_event(&mut buffer) {
+                                Ok(Some(event)) => event,
+                                Ok(None) => break,
+                                Err(e) => { yield Err(e); return; }
+                            };
 
-                        // SSE permits CRLF as well as LF. Normalizing here keeps the
-                        // event parser small and avoids silently buffering an entire
-                        // response from servers that use `\r\n\r\n` delimiters.
-                        if buffer.contains('\r') {
-                            buffer = buffer.replace("\r\n", "\n");
-                        }
-
-                        while let Some(pos) = buffer.find("\n\n") {
-                            // Drain shifts the remainder in place instead of reallocating
-                            // a new String per SSE event.
-                            let event: String = buffer.drain(..pos + 2).collect();
-
-                            for line in event.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
+                            let data = sse_data(&event);
+                            if !data.is_empty() {
                                     let data_trim = data.trim();
                                     if data_trim == "[DONE]" {
+                                        metrics.complete();
                                         return;
                                     }
 
@@ -713,12 +771,8 @@ impl GroqClient {
                                                 ));
                                                 return;
                                             }
-                                            eprintln!(
-                                                "Parse warning: invalid JSON in SSE ({}): {}",
-                                                e,
-                                                data_trim.chars().take(200).collect::<String>()
-                                            );
-                                            continue;
+                                            yield Err(anyhow::anyhow!("Invalid JSON in API stream: {e}"));
+                                            return;
                                         }
                                     };
 
@@ -731,21 +785,17 @@ impl GroqClient {
                                     let chunk: StreamChunk = match serde_json::from_value(v) {
                                         Ok(c) => c,
                                         Err(e) => {
-                                            eprintln!(
-                                                "Parse warning: unexpected SSE shape ({}): {}",
-                                                e,
-                                                data_trim.chars().take(200).collect::<String>()
-                                            );
-                                            continue;
+                                            yield Err(anyhow::anyhow!("Unexpected API stream shape: {e}"));
+                                            return;
                                         }
                                     };
 
                                     if let Some(usage) = chunk.effective_usage() {
                                         usage_client.reconcile_actual_usage(usage, &cache_shape);
                                     }
+                                    metrics.chunk(chunk.effective_usage().copied(), chunk.choices.first().and_then(|c| c.finish_reason.as_deref()));
 
                                     yield Ok(chunk);
-                                }
                             }
                         }
                     }
@@ -774,7 +824,12 @@ impl GroqClient {
         let cache_shape = request_cache_shape(messages, tools);
         let full_estimate = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
         let estimated_tokens = self.cache_aware_estimate(full_estimate, &cache_shape);
-
+        let mut metrics = crate::metrics::RequestMetrics::new(
+            &self.model,
+            self.task_id.as_deref(),
+            estimated_tokens,
+            "compaction",
+        );
         self.throttle_if_needed(estimated_tokens).await?;
 
         let response = self.send_request(body, false).await?;
@@ -788,6 +843,7 @@ impl GroqClient {
         #[derive(Deserialize)]
         struct ChatChoice {
             message: Message,
+            finish_reason: Option<String>,
         }
 
         let chat_response: ChatResponse = response
@@ -799,12 +855,25 @@ impl GroqClient {
             self.reconcile_actual_usage(usage, &cache_shape);
         }
 
-        chat_response
+        metrics.chunk(
+            chat_response.usage,
+            chat_response
+                .choices
+                .first()
+                .and_then(|c| c.finish_reason.as_deref()),
+        );
+        let choice = chat_response
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message)
-            .context("No response from API")
+            .context("No response from API")?;
+        metrics.complete();
+        anyhow::ensure!(
+            choice.finish_reason.as_deref() == Some("stop"),
+            "Incomplete summary response ({:?}); history preserved",
+            choice.finish_reason
+        );
+        Ok(choice.message)
     }
 }
 
@@ -899,6 +968,31 @@ fn number_after(body: &str, marker: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_preserves_unicode_and_delimiters_at_every_byte_split() {
+        for delimiter in ["\n\n", "\r\n\r\n"] {
+            let event = format!("data: {{\"text\":\"café 🦀\"}}{delimiter}");
+            for split in 0..=event.len() {
+                let mut buffer = event.as_bytes()[..split].to_vec();
+                let mut parsed = take_sse_event(&mut buffer).unwrap();
+                buffer.extend_from_slice(&event.as_bytes()[split..]);
+                if parsed.is_none() {
+                    parsed = take_sse_event(&mut buffer).unwrap();
+                }
+                let value: Value = serde_json::from_str(&sse_data(&parsed.unwrap())).unwrap();
+                assert_eq!(value["text"], "café 🦀");
+                assert!(buffer.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn sse_combines_multiline_data_and_rejects_invalid_utf8() {
+        let data = sse_data(": heartbeat\ndata:{\ndata: \"value\":1\ndata:}");
+        assert_eq!(serde_json::from_str::<Value>(&data).unwrap()["value"], 1);
+        assert!(take_sse_event(&mut b"data: \xff\n\n".to_vec()).is_err());
+    }
 
     #[test]
     fn enriches_groq_tpm_errors_with_budget_hint() {

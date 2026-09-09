@@ -25,10 +25,8 @@ impl ProjectDocs {
             return Ok(None);
         }
 
-        let content = fs::read_to_string(&docs_path).context(format!(
-            "Failed to read project docs from {:?}",
-            docs_path
-        ))?;
+        let content = fs::read_to_string(&docs_path)
+            .context(format!("Failed to read project docs from {:?}", docs_path))?;
 
         if content.trim().is_empty() {
             Ok(None)
@@ -58,10 +56,8 @@ impl ProjectDocs {
             format!("{}\n\n---\n\n{}", existing_content.trim(), content)
         };
 
-        fs::write(&docs_path, new_content).context(format!(
-            "Failed to write project docs to {:?}",
-            docs_path
-        ))?;
+        fs::write(&docs_path, new_content)
+            .context(format!("Failed to write project docs to {:?}", docs_path))?;
 
         Ok(())
     }
@@ -70,10 +66,8 @@ impl ProjectDocs {
     pub fn clear(&self) -> Result<()> {
         let docs_path = self.docs_path();
         if docs_path.exists() {
-            fs::remove_file(&docs_path).context(format!(
-                "Failed to remove project docs at {:?}",
-                docs_path
-            ))?;
+            fs::remove_file(&docs_path)
+                .context(format!("Failed to remove project docs at {:?}", docs_path))?;
         }
         Ok(())
     }
@@ -101,6 +95,7 @@ mod tests {
 
     #[test]
     fn test_project_docs_operations() {
+        let _guard = crate::project_context::CWD_TEST_LOCK.lock().unwrap();
         let original_dir = std::env::current_dir().unwrap();
         let root = std::env::temp_dir().join(format!("vybrid-project-docs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

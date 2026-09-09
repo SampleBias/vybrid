@@ -4,12 +4,13 @@ mod conversation;
 mod lsp;
 mod memory;
 mod menu;
+mod metrics;
 mod project_context;
 mod project_docs;
 mod project_index;
 mod rust_agent_reference;
-mod skills;
 mod shell;
+mod skills;
 mod tools;
 mod ui;
 
@@ -115,12 +116,13 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         memory: Some(memory_store.clone()),
         file_read_cache: Default::default(),
         output_store: tools::output::ToolOutputStore::new(config.progress_dir.clone()),
+        task_id: None,
     };
 
     loop {
         let rust_lsp_status = rust_lsp.status().await;
         ui::print_context_status_line(
-            conversation.estimate_context_tokens(),
+            conversation.estimate_active_tokens(),
             config.context_token_budget,
             config.max_completion_tokens,
             &config.active_model_id(),
@@ -226,7 +228,9 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
                     ui::print_error(&format!("Compact failed: {}", e));
                 }
             } else {
-                ui::print_error("Compact requires a configured LLM provider. Use /menu to set up API keys.");
+                ui::print_error(
+                    "Compact requires a configured LLM provider. Use /menu to set up API keys.",
+                );
             }
             continue;
         }
@@ -300,8 +304,14 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         };
 
         // Add user message with lightweight project context and the memory index only.
-        let user_message_with_context = inject_project_context(input, &project_docs, &memory_store);
-        conversation.add_user_message(&user_message_with_context);
+        let context = inject_project_context("", &project_docs, &memory_store);
+        if conversation.set_context_snapshot(
+            "project",
+            &format!("[Vybrid project context snapshot]\n{context}"),
+        ) {
+            record_latest_memory_message(&memory_store, &conversation);
+        }
+        conversation.add_task_message(input);
         record_latest_memory_message(&memory_store, &conversation);
 
         // Process with AI
@@ -314,8 +324,11 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             config.compound_enabled,
         );
         let mut turn_state = TurnState::new(&config);
-        if let Err(e) = process_ai_response(
-            c,
+        let task_metrics = metrics::TaskMetrics::new();
+        tool_runtime.task_id = Some(task_metrics.id.clone());
+        let task_client = c.with_task_id(&task_metrics.id);
+        let outcome = process_ai_response(
+            &task_client,
             &mut conversation,
             &tool_runtime,
             0,
@@ -323,8 +336,9 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             &mut route_state,
             &mut turn_state,
         )
-        .await
-        {
+        .await;
+        task_metrics.finish(outcome.is_ok());
+        if let Err(e) = outcome {
             ui::print_error(&format!("AI error: {}", e));
         }
 
@@ -461,6 +475,7 @@ struct RouteState {
     compound_model: String,
     compound_mini_model: String,
     compound_enabled: bool,
+    tools_required: bool,
     mode: RouteMode,
 }
 
@@ -479,6 +494,7 @@ impl RouteState {
             compound_model,
             compound_mini_model,
             compound_enabled,
+            tools_required: true,
             mode: RouteMode::Primary,
         }
     }
@@ -489,7 +505,14 @@ impl RouteState {
         }
         match self.mode {
             RouteMode::Primary => primary.clone(),
-            RouteMode::Fallback => primary.with_model(self.fallback_model.clone()),
+            RouteMode::Fallback => {
+                let client = primary.with_model(self.fallback_model.clone());
+                if self.tools_required {
+                    client.with_rate_limit_wait()
+                } else {
+                    client
+                }
+            }
             RouteMode::Compound => primary.with_model(self.compound_model.clone()),
             RouteMode::CompoundMini => primary.with_model(self.compound_mini_model.clone()),
         }
@@ -524,8 +547,14 @@ impl RouteState {
     fn advance_route(&mut self) -> bool {
         let next = match self.mode {
             RouteMode::Primary => RouteMode::Fallback,
-            RouteMode::Fallback if self.compound_enabled => RouteMode::Compound,
-            RouteMode::Compound if self.compound_enabled => RouteMode::CompoundMini,
+            // A local coding turn must keep access to local tools. Wait on the
+            // fallback instead of ending the task with a tool-free planner.
+            RouteMode::Fallback if !self.tools_required && self.compound_enabled => {
+                RouteMode::Compound
+            }
+            RouteMode::Compound if !self.tools_required && self.compound_enabled => {
+                RouteMode::CompoundMini
+            }
             _ => return false,
         };
         self.mode = next;
@@ -645,193 +674,6 @@ fn rate_limit_resume_prompt(attempt: u32, max_attempts: u32) -> String {
     )
 }
 
-#[cfg(test)]
-mod retry_tests {
-    use super::*;
-
-    #[test]
-    fn parses_groq_retry_after_seconds() {
-        let message = r#"API error (429 Too Many Requests): {"error":{"message":"Rate limit reached for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 250000, Used 224739, Requested 88828. Please try again in 15.256079999s. ","type":"tokens","code":"rate_limit_exceeded"}}"#;
-
-        assert_eq!(parse_retry_after_seconds(message), Some(15.256079999));
-    }
-
-    #[test]
-    fn recognizes_rate_limit_errors() {
-        let err = anyhow::anyhow!("API error (429 Too Many Requests): rate_limit_exceeded");
-
-        assert!(is_rate_limit_error(&err));
-    }
-
-    #[test]
-    fn recognizes_failed_generation_errors() {
-        let err = anyhow::anyhow!(
-            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
-        );
-
-        assert!(is_failed_generation_error(&err));
-        assert!(is_retryable_groq_stream_error(&err));
-    }
-
-    #[test]
-    fn failed_generation_prompt_prefers_smaller_tool_calls() {
-        let err = anyhow::anyhow!(
-            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
-        );
-        let prompt = corrective_tool_prompt(&err, 2, 5);
-
-        assert!(prompt.contains("failed to generate a valid tool call"));
-        assert!(prompt.contains("read_file"));
-        assert!(prompt.contains("edit_file"));
-        assert!(prompt.contains("create_multiple_files"));
-    }
-
-    #[test]
-    fn retries_failed_generation_after_content_started() {
-        let err = anyhow::anyhow!(
-            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
-        );
-
-        assert!(should_retry_tool_generation_error(&err, true));
-    }
-
-    #[test]
-    fn does_not_retry_schema_error_after_content_started() {
-        let err = anyhow::anyhow!(
-            "Tool call validation failed: parameters for tool read_file did not match schema"
-        );
-
-        assert!(!should_retry_tool_generation_error(&err, true));
-        assert!(should_retry_tool_generation_error(&err, false));
-    }
-
-    #[test]
-    fn retries_unexpected_stream_eof_even_after_partial_content() {
-        let err = anyhow::anyhow!("Stream ended before the provider sent data: [DONE]");
-
-        assert!(should_retry_tool_generation_error(&err, true));
-    }
-
-    #[test]
-    fn token_limit_is_never_a_successful_terminal_state() {
-        let blank = incomplete_completion_reason(Some("length"), false, false);
-        let partial = incomplete_completion_reason(Some("length"), true, false);
-
-        assert!(blank.unwrap().contains("token budget"));
-        assert!(partial.unwrap().contains("token budget"));
-    }
-
-    #[test]
-    fn blank_stop_and_empty_tool_terminal_states_are_incomplete() {
-        assert!(incomplete_completion_reason(Some("stop"), false, false).is_some());
-        assert!(incomplete_completion_reason(Some("tool_calls"), false, false).is_some());
-    }
-
-    #[test]
-    fn normal_answer_and_tool_call_terminal_states_are_complete() {
-        assert!(incomplete_completion_reason(Some("stop"), true, false).is_none());
-        assert!(incomplete_completion_reason(Some("tool_calls"), false, true).is_none());
-    }
-
-    #[test]
-    fn missing_finish_reason_is_incomplete_even_with_content() {
-        assert!(incomplete_completion_reason(None, true, false).is_some());
-    }
-
-    #[test]
-    fn repeated_read_only_calls_get_a_nudge_on_third_run() {
-        let mut seen = std::collections::HashMap::new();
-        let args = r#"{"file_path":"src/main.rs"}"#;
-
-        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
-        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
-        let nudge = record_tool_call_repetition(&mut seen, "read_file", args);
-
-        assert!(nudge.is_some());
-        assert!(nudge.unwrap().contains("Do not repeat"));
-    }
-
-    #[test]
-    fn different_arguments_are_not_repetitions() {
-        let mut seen = std::collections::HashMap::new();
-
-        for i in 0..5 {
-            let args = format!(r#"{{"file_path":"src/file{i}.rs"}}"#);
-            assert!(record_tool_call_repetition(&mut seen, "read_file", &args).is_none());
-        }
-    }
-
-    #[test]
-    fn mutating_calls_reset_repetition_tracking() {
-        let mut seen = std::collections::HashMap::new();
-        let args = r#"{"subcommand":"check"}"#;
-
-        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
-        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
-        // run_cargo is mutating, so the map is cleared every time and a third
-        // identical invocation (a legitimate compile/fix loop) is never flagged.
-        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
-        assert!(seen.is_empty());
-
-        let read_args = r#"{"file_path":"src/main.rs"}"#;
-        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
-        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
-        // A mutation between reads makes a re-read legitimate again.
-        assert!(record_tool_call_repetition(&mut seen, "edit_file", "{}").is_none());
-        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
-    }
-
-    #[test]
-    fn compound_messages_end_with_user_and_drop_tool_roles() {
-        let mut conversation = Conversation::new("system");
-        conversation.add_user_message("please inspect");
-        conversation.add_tool_result("call-1", "tool output");
-
-        let messages = compound_messages_for_request(&mut conversation, 8_000);
-
-        assert_eq!(messages.last().unwrap().role, "user");
-        assert!(!messages.iter().any(|m| m.role == "tool"));
-    }
-
-    #[test]
-    fn project_context_injects_memory_index_without_topic_or_transcript_contents() {
-        let root = std::env::temp_dir().join(format!(
-            "vybrid-main-memory-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let memory_dir = root.join(".vybrid").join("memory");
-        std::fs::create_dir_all(memory_dir.join("topics")).unwrap();
-        std::fs::write(
-            memory_dir.join("MEMORY.md"),
-            "- routing => topics/routing.md\n",
-        )
-        .unwrap();
-        std::fs::write(memory_dir.join("topics").join("routing.md"), "topic secret").unwrap();
-
-        let memory_store =
-            MemoryStore::with_project_root(&root, root.join("messages"), "test-session");
-        memory_store
-            .append_transcript_message(&Message {
-                role: "assistant".to_string(),
-                content: Some("transcript secret".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            })
-            .unwrap();
-
-        let context = inject_project_context("inspect routing", &ProjectDocs::new(), &memory_store);
-
-        assert!(context.contains("MEMORY INDEX"));
-        assert!(context.contains("topics/routing.md"));
-        assert!(!context.contains("topic secret"));
-        assert!(!context.contains("transcript secret"));
-
-        let _ = std::fs::remove_dir_all(root);
-    }
-}
-
 fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) -> String {
     if is_failed_generation_error(e) {
         format!(
@@ -894,6 +736,7 @@ async fn process_ai_response(
             );
         }
     }
+    route_state.tools_required = !final_answer_only;
 
     /// If the API rejects a tool call, retry with a corrective user note. Some providers stream
     /// reasoning before reporting malformed tool JSON, so retry after thinking but before content.
@@ -909,6 +752,7 @@ async fn process_ai_response(
     // every retry used to rewrite the message prefix, invalidating Groq's prompt
     // cache exactly when rate limits made cached (free) tokens most valuable.
     let mut shrink_context = false;
+    let mut compaction_budget_handled = None;
     let mut last_usage: Option<Usage>;
     let mut finish_reason: Option<String>;
 
@@ -937,6 +781,21 @@ async fn process_ai_response(
         } else {
             route_state.tools_for_request()
         };
+        if compaction_budget_handled != Some(request_budget)
+            && conversation.estimate_active_tokens() > request_budget
+        {
+            compaction_budget_handled = Some(request_budget);
+            // Bounded summaries, at a compaction boundary only. If a provider is
+            // unavailable, the synchronous window still preserves task anchors
+            // and complete tool groups.
+            for _ in 0..3 {
+                match summarize_conversation(&request_client, conversation, "Preserve the task, constraints, decisions, exact paths, verification results and remaining work.").await {
+                    Ok(true) if conversation.estimate_active_tokens() > request_budget * 3 / 4 => continue,
+                    Ok(_) => break,
+                    Err(e) => { eprintln!("Compaction deferred: {e}"); break; }
+                }
+            }
+        }
         let stream = {
             let request_messages =
                 request_messages_for_route(conversation, request_budget, route_state);
@@ -1288,8 +1147,9 @@ async fn process_ai_response(
             // Add compacted tool result to conversation. The terminal still shows previews, but
             // the model should not carry large repeated tool payloads across every follow-up turn.
             let result_str = result.unwrap_or_else(|e| format!("Error: {}", e));
-            let mut history_result =
-                compact_tool_result_for_history(&tool_call.function.name, &result_str, depth);
+            // The tool result already has a bounded presentation and exact
+            // retrieval location. Do not shorten fresh evidence a second time.
+            let mut history_result = result_str;
             if let Some(nudge) = record_tool_call_repetition(
                 &mut turn.repeated_tool_calls,
                 &tool_call.function.name,
@@ -1318,32 +1178,6 @@ async fn process_ai_response(
     }
 
     Ok(())
-}
-
-fn compact_tool_result_for_history(tool_name: &str, result: &str, depth: u32) -> String {
-    let max_chars = match tool_name {
-        "read_file" => 12_000,
-        "read_multiple_files" => 10_000,
-        "enhanced_grep" => 8_000,
-        "run_cargo" => 16_000,
-        "execute_bash_command" => 10_000,
-        _ => 8_000,
-    };
-    let max_chars = if depth >= 2 {
-        (max_chars / 2).max(4_000)
-    } else {
-        max_chars
-    };
-
-    let total_chars = result.chars().count();
-    if total_chars <= max_chars {
-        return result.to_string();
-    }
-
-    let truncated = conversation::truncate_middle(result, max_chars, "omitted middle of");
-    format!(
-        "[Vybrid compacted `{tool_name}` result for history: original {total_chars} chars, kept ~{max_chars} chars. Re-read a narrower range if exact omitted content is needed.]\n\n{truncated}"
-    )
 }
 
 fn request_messages_for_route<'a>(
@@ -1696,11 +1530,7 @@ fn show_help() {
     println!();
 }
 
-fn handle_thinking_command(
-    input: &str,
-    config: &mut Config,
-    client: &mut Option<GroqClient>,
-) {
+fn handle_thinking_command(input: &str, config: &mut Config, client: &mut Option<GroqClient>) {
     let parts: Vec<&str> = input.split_whitespace().collect();
     let model = config.active_model_id();
 
@@ -1743,12 +1573,16 @@ fn handle_thinking_command(
                 match config.set_reasoning_effort(effort) {
                     Ok(()) => {
                         *client = config.build_chat_client();
-                        let indicator =
-                            crate::config::format_thinking_indicator(&model, config.reasoning_effort.as_deref());
+                        let indicator = crate::config::format_thinking_indicator(
+                            &model,
+                            config.reasoning_effort.as_deref(),
+                        );
                         println!(
                             "{}",
-                            style(format!("Thinking level updated — {indicator} (model: {model})"))
-                                .green()
+                            style(format!(
+                                "Thinking level updated — {indicator} (model: {model})"
+                            ))
+                            .green()
                         );
                         if config.reasoning_effort.is_some()
                             && crate::config::effective_reasoning_effort(
@@ -1972,11 +1806,7 @@ fn handle_skills_command(
             println!("{}", style("─".repeat(40)).dim());
             for path in SkillRegistry::discovery_paths() {
                 let status = if path.exists() { "exists" } else { "missing" };
-                println!(
-                    "  {} ({})",
-                    path.display(),
-                    style(status).dim()
-                );
+                println!("  {} ({})", path.display(), style(status).dim());
             }
             println!(
                 "{}",
@@ -2026,7 +1856,10 @@ fn handle_skill_load_by_name(
 ) {
     match skill_registry.load_body(name, user_args) {
         Ok(body) => {
-            conversation.add_user_message(&format!("[Skill: {name}]\n\n{body}"));
+            conversation.set_context_snapshot(
+                &format!("skill:{name}"),
+                &format!("[Skill: {name}]\n\n{body}"),
+            );
             println!(
                 "{}",
                 style(format!("Loaded skill '{name}' into the conversation.")).green()
@@ -2049,17 +1882,31 @@ async fn handle_compact_command(
             "Preserve task goal, files edited, compiler errors, key decisions, and remaining work.",
         );
 
-    let Some((first_kept, transcript)) = conversation.compactable_transcript(COMPACT_KEEP_RECENT)
-    else {
-        println!(
-            "{}",
-            style("Not enough history to compact. Continue the conversation first.").dim()
-        );
-        return Ok(());
-    };
-
     let before_tokens = conversation.estimate_context_tokens();
     let mut spinner = ui::SpinnerGuard::new("compact");
+    let result = summarize_conversation(client, conversation, focus).await;
+    spinner.finish().await;
+    if !result? {
+        println!("No complete history range could be reduced; the conversation was preserved.");
+        return Ok(());
+    }
+    println!(
+        "Compacted conversation (~{} → ~{} estimated tokens). Recent messages preserved.",
+        before_tokens,
+        conversation.estimate_context_tokens()
+    );
+    Ok(())
+}
+
+async fn summarize_conversation(
+    client: &GroqClient,
+    conversation: &mut Conversation,
+    focus: &str,
+) -> Result<bool> {
+    let Some((first_kept, transcript)) = conversation.compactable_transcript(COMPACT_KEEP_RECENT)
+    else {
+        return Ok(false);
+    };
     let summary_request = vec![
         Message {
             role: "system".to_string(),
@@ -2084,24 +1931,219 @@ async fn handle_compact_command(
     ];
 
     let response = client
+        .with_completion_limit(2_048)
         .chat(&summary_request, None)
         .await
         .context("Compaction summarization request failed")?;
-    spinner.finish().await;
-
     let summary = response
         .content
-        .unwrap_or_else(|| "No summary returned.".to_string());
-    conversation.apply_manual_compaction(&summary, first_kept);
-    let after_tokens = conversation.estimate_context_tokens();
+        .filter(|s| !s.trim().is_empty())
+        .context("Compaction returned an empty summary; history preserved")?;
+    Ok(conversation.apply_manual_compaction(&summary, first_kept))
+}
 
-    println!(
-        "{}",
-        style(format!(
-            "Compacted conversation (~{} → ~{} estimated tokens). Recent messages preserved.",
-            before_tokens, after_tokens
-        ))
-        .green()
-    );
-    Ok(())
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn local_tool_turns_never_fall_back_to_a_tool_free_route() {
+        let mut route = RouteState::new(
+            true,
+            "fallback".into(),
+            "compound".into(),
+            "mini".into(),
+            true,
+        );
+        assert!(route.advance_route());
+        assert_eq!(route.mode, RouteMode::Fallback);
+        assert!(!route.advance_route());
+        assert!(route.tools_for_request().is_some());
+        route.tools_required = false;
+        assert!(route.advance_route());
+        assert_eq!(route.mode, RouteMode::Compound);
+        assert!(route.tools_for_request().is_none());
+    }
+
+    #[test]
+    fn parses_groq_retry_after_seconds() {
+        let message = r#"API error (429 Too Many Requests): {"error":{"message":"Rate limit reached for model `openai/gpt-oss-120b` on tokens per minute (TPM): Limit 250000, Used 224739, Requested 88828. Please try again in 15.256079999s. ","type":"tokens","code":"rate_limit_exceeded"}}"#;
+
+        assert_eq!(parse_retry_after_seconds(message), Some(15.256079999));
+    }
+
+    #[test]
+    fn recognizes_rate_limit_errors() {
+        let err = anyhow::anyhow!("API error (429 Too Many Requests): rate_limit_exceeded");
+
+        assert!(is_rate_limit_error(&err));
+    }
+
+    #[test]
+    fn recognizes_failed_generation_errors() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+
+        assert!(is_failed_generation_error(&err));
+        assert!(is_retryable_groq_stream_error(&err));
+    }
+
+    #[test]
+    fn failed_generation_prompt_prefers_smaller_tool_calls() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+        let prompt = corrective_tool_prompt(&err, 2, 5);
+
+        assert!(prompt.contains("failed to generate a valid tool call"));
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("edit_file"));
+        assert!(prompt.contains("create_multiple_files"));
+    }
+
+    #[test]
+    fn retries_failed_generation_after_content_started() {
+        let err = anyhow::anyhow!(
+            "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details."
+        );
+
+        assert!(should_retry_tool_generation_error(&err, true));
+    }
+
+    #[test]
+    fn does_not_retry_schema_error_after_content_started() {
+        let err = anyhow::anyhow!(
+            "Tool call validation failed: parameters for tool read_file did not match schema"
+        );
+
+        assert!(!should_retry_tool_generation_error(&err, true));
+        assert!(should_retry_tool_generation_error(&err, false));
+    }
+
+    #[test]
+    fn retries_unexpected_stream_eof_even_after_partial_content() {
+        let err = anyhow::anyhow!("Stream ended before the provider sent data: [DONE]");
+
+        assert!(should_retry_tool_generation_error(&err, true));
+    }
+
+    #[test]
+    fn token_limit_is_never_a_successful_terminal_state() {
+        let blank = incomplete_completion_reason(Some("length"), false, false);
+        let partial = incomplete_completion_reason(Some("length"), true, false);
+
+        assert!(blank.unwrap().contains("token budget"));
+        assert!(partial.unwrap().contains("token budget"));
+    }
+
+    #[test]
+    fn blank_stop_and_empty_tool_terminal_states_are_incomplete() {
+        assert!(incomplete_completion_reason(Some("stop"), false, false).is_some());
+        assert!(incomplete_completion_reason(Some("tool_calls"), false, false).is_some());
+    }
+
+    #[test]
+    fn normal_answer_and_tool_call_terminal_states_are_complete() {
+        assert!(incomplete_completion_reason(Some("stop"), true, false).is_none());
+        assert!(incomplete_completion_reason(Some("tool_calls"), false, true).is_none());
+    }
+
+    #[test]
+    fn missing_finish_reason_is_incomplete_even_with_content() {
+        assert!(incomplete_completion_reason(None, true, false).is_some());
+    }
+
+    #[test]
+    fn repeated_read_only_calls_get_a_nudge_on_third_run() {
+        let mut seen = std::collections::HashMap::new();
+        let args = r#"{"file_path":"src/main.rs"}"#;
+
+        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", args).is_none());
+        let nudge = record_tool_call_repetition(&mut seen, "read_file", args);
+
+        assert!(nudge.is_some());
+        assert!(nudge.unwrap().contains("Do not repeat"));
+    }
+
+    #[test]
+    fn different_arguments_are_not_repetitions() {
+        let mut seen = std::collections::HashMap::new();
+
+        for i in 0..5 {
+            let args = format!(r#"{{"file_path":"src/file{i}.rs"}}"#);
+            assert!(record_tool_call_repetition(&mut seen, "read_file", &args).is_none());
+        }
+    }
+
+    #[test]
+    fn mutating_calls_reset_repetition_tracking() {
+        let mut seen = std::collections::HashMap::new();
+        let args = r#"{"subcommand":"check"}"#;
+
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        // run_cargo is mutating, so the map is cleared every time and a third
+        // identical invocation (a legitimate compile/fix loop) is never flagged.
+        assert!(record_tool_call_repetition(&mut seen, "run_cargo", args).is_none());
+        assert!(seen.is_empty());
+
+        let read_args = r#"{"file_path":"src/main.rs"}"#;
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+        // A mutation between reads makes a re-read legitimate again.
+        assert!(record_tool_call_repetition(&mut seen, "edit_file", "{}").is_none());
+        assert!(record_tool_call_repetition(&mut seen, "read_file", read_args).is_none());
+    }
+
+    #[test]
+    fn compound_messages_end_with_user_and_drop_tool_roles() {
+        let mut conversation = Conversation::new("system");
+        conversation.add_user_message("please inspect");
+        conversation.add_tool_result("call-1", "tool output");
+
+        let messages = compound_messages_for_request(&mut conversation, 8_000);
+
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert!(!messages.iter().any(|m| m.role == "tool"));
+    }
+
+    #[test]
+    fn project_context_injects_memory_index_without_topic_or_transcript_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "vybrid-main-memory-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let memory_dir = root.join(".vybrid").join("memory");
+        std::fs::create_dir_all(memory_dir.join("topics")).unwrap();
+        std::fs::write(
+            memory_dir.join("MEMORY.md"),
+            "- routing => topics/routing.md\n",
+        )
+        .unwrap();
+        std::fs::write(memory_dir.join("topics").join("routing.md"), "topic secret").unwrap();
+
+        let memory_store =
+            MemoryStore::with_project_root(&root, root.join("messages"), "test-session");
+        memory_store
+            .append_transcript_message(&Message {
+                role: "assistant".to_string(),
+                content: Some("transcript secret".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .unwrap();
+
+        let context = inject_project_context("inspect routing", &ProjectDocs::new(), &memory_store);
+
+        assert!(context.contains("MEMORY INDEX"));
+        assert!(context.contains("topics/routing.md"));
+        assert!(!context.contains("topic secret"));
+        assert!(!context.contains("transcript secret"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

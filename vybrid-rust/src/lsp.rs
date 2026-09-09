@@ -2,7 +2,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +18,8 @@ use tokio::time::timeout;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_LSP_OUTPUT_BYTES: usize = 96 * 1024;
+type LspReply = oneshot::Sender<Result<Value, String>>;
+type PendingRequests = Arc<Mutex<HashMap<u64, LspReply>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustLspState {
@@ -78,9 +81,9 @@ struct RustLspProcess {
 struct RustLspInner {
     status: Arc<Mutex<RustLspStatus>>,
     process: Mutex<Option<RustLspProcess>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Value>>>,
-    opened_documents: Mutex<HashSet<String>>,
+    opened_documents: Mutex<HashMap<String, (i32, u64)>>,
     next_id: AtomicU64,
 }
 
@@ -138,7 +141,7 @@ impl RustLspManager {
                 process: Mutex::new(None),
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 diagnostics: Arc::new(Mutex::new(HashMap::new())),
-                opened_documents: Mutex::new(HashSet::new()),
+                opened_documents: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
         }
@@ -416,12 +419,30 @@ impl RustLspManager {
     async fn open_document(&self, file_path: &str) -> Result<String> {
         let path = normalize_path(file_path);
         let uri = path_to_file_uri(&path)?;
-        if self.inner.opened_documents.lock().await.contains(&uri) {
-            return Ok(uri);
-        }
+        let mut opened = self.inner.opened_documents.lock().await;
         let text = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("rust_lsp_query: failed to read {}", path.display()))?;
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        if let Some((version, previous)) = opened.get(&uri).copied() {
+            if previous == fingerprint {
+                return Ok(uri);
+            }
+            let version = version.saturating_add(1);
+            self.inner.diagnostics.lock().await.remove(&uri);
+            self.notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": { "uri": uri, "version": version },
+                    "contentChanges": [{ "text": text }]
+                }),
+            )
+            .await?;
+            opened.insert(uri.clone(), (version, fingerprint));
+            return Ok(uri);
+        }
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -434,7 +455,7 @@ impl RustLspManager {
             }),
         )
         .await?;
-        self.inner.opened_documents.lock().await.insert(uri.clone());
+        opened.insert(uri.clone(), (1, fingerprint));
         Ok(uri)
     }
 
@@ -538,7 +559,7 @@ impl RustLspManager {
 
 fn spawn_reader<R>(
     stdout: R,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingRequests,
     diagnostics: Arc<Mutex<HashMap<String, Value>>>,
     status: Arc<Mutex<RustLspStatus>>,
 ) -> JoinHandle<()>
@@ -646,19 +667,72 @@ fn percent_encode_path(path: &str) -> String {
 
 fn truncate_json(label: &str, value: &Value) -> String {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
-    if text.len() <= MAX_LSP_OUTPUT_BYTES {
-        return format!("Rust LSP {label}:\n{text}");
-    }
-    let head = text
-        .char_indices()
-        .take_while(|(idx, _)| *idx < MAX_LSP_OUTPUT_BYTES / 2)
-        .last()
-        .map(|(idx, ch)| &text[..idx + ch.len_utf8()])
-        .unwrap_or("");
-    let tail_start = text.len().saturating_sub(MAX_LSP_OUTPUT_BYTES / 2);
-    let tail = &text[tail_start..];
     format!(
-        "Rust LSP {label}:\n{head}\n\n[LSP output truncated: {} bytes omitted]\n\n{tail}",
-        text.len().saturating_sub(head.len() + tail.len())
+        "Rust LSP {label}:\n{}",
+        crate::tools::output::truncate_utf8_middle(&text, MAX_LSP_OUTPUT_BYTES, "LSP output")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn editing_an_open_document_sends_a_versioned_change() {
+        let path =
+            std::env::temp_dir().join(format!("vybrid-lsp-sync-{}.rs", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, "fn before() {}\n").await.unwrap();
+        let manager = RustLspManager::new("cat", None);
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut echoed = BufReader::new(child.stdout.take().unwrap());
+        let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        *manager.inner.process.lock().await = Some(RustLspProcess {
+            stdin,
+            child,
+            reader_task: tokio::spawn(async {}),
+            stderr_task: tokio::spawn(async {}),
+        });
+        let uri = manager.open_document(path.to_str().unwrap()).await.unwrap();
+        let opened = timeout(Duration::from_secs(2), read_lsp_message(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        assert_eq!(opened["params"]["textDocument"]["version"], 1);
+        manager
+            .inner
+            .diagnostics
+            .lock()
+            .await
+            .insert(uri.clone(), json!({"diagnostics": ["old"]}));
+        tokio::fs::write(&path, "fn after() {}\n").await.unwrap();
+        manager.open_document(path.to_str().unwrap()).await.unwrap();
+        let changed = timeout(Duration::from_secs(2), read_lsp_message(&mut echoed))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed["method"], "textDocument/didChange");
+        assert_eq!(changed["params"]["textDocument"]["version"], 2);
+        assert_eq!(
+            changed["params"]["contentChanges"][0]["text"],
+            "fn after() {}\n"
+        );
+        assert!(!manager.inner.diagnostics.lock().await.contains_key(&uri));
+        manager.open_document(path.to_str().unwrap()).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(20), read_lsp_message(&mut echoed))
+                .await
+                .is_err()
+        );
+        let mut process = manager.inner.process.lock().await.take().unwrap();
+        process.child.kill().await.unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
+    }
 }

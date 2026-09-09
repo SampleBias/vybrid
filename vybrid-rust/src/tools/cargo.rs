@@ -1,18 +1,14 @@
 //! Structured `cargo` invocation for the agent (argv only; no shell).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use super::file_ops::normalize_path;
-
-/// Maximum combined stdout+stderr returned to the model (bytes).
-pub const MAX_CARGO_OUTPUT_BYTES: usize = 128 * 1024;
 
 /// How `run_cargo` should ask Cargo/rustc to format compiler diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,45 +108,9 @@ fn default_timeout(subcommand: &str) -> Duration {
     }
 }
 
+#[cfg(test)]
 fn truncate_combined_output(combined: &str, max_bytes: usize) -> String {
-    if combined.len() <= max_bytes {
-        return combined.to_string();
-    }
-    let half = max_bytes / 2;
-    let head = combined
-        .char_indices()
-        .take_while(|(idx, _)| *idx < half)
-        .last()
-        .map(|(idx, ch)| &combined[..idx + ch.len_utf8()])
-        .unwrap_or("");
-    let tail_start = combined.len().saturating_sub(half);
-    let tail_slice = &combined[tail_start..];
-    let tail = if let Some(pos) = tail_slice.find('\n') {
-        &tail_slice[pos + 1..]
-    } else {
-        tail_slice
-    };
-    let omitted = combined.len().saturating_sub(head.len() + tail.len());
-    format!(
-        "{head}\n\n[Output truncated: {omitted} bytes omitted; showing head and tail]\n\n{tail}",
-    )
-}
-
-async fn read_pipe<R>(reader: R, stream_name: &'static str) -> Result<String>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut reader = BufReader::new(reader).lines();
-    let mut out = String::new();
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .with_context(|| format!("run_cargo: read {stream_name}"))?
-    {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    Ok(out)
+    super::output::truncate_utf8_middle(combined, max_bytes, "Output")
 }
 
 fn summarize_json_diagnostics(json_lines: &str) -> Option<String> {
@@ -266,6 +226,7 @@ fn summarize_json_diagnostics(json_lines: &str) -> Option<String> {
 }
 
 /// Run `cargo` with structured arguments; captures stdout and stderr, waits for exit.
+#[allow(dead_code)] // Public library convenience API; CLI supplies its configured output store.
 pub async fn run_cargo(
     subcommand: &str,
     release: bool,
@@ -274,6 +235,30 @@ pub async fn run_cargo(
     extra_args: &[String],
     working_directory: Option<&str>,
     diagnostic_format: DiagnosticFormat,
+) -> Result<String> {
+    run_cargo_with_store(
+        subcommand,
+        release,
+        package,
+        manifest_path,
+        extra_args,
+        working_directory,
+        diagnostic_format,
+        &super::output::ToolOutputStore::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_cargo_with_store(
+    subcommand: &str,
+    release: bool,
+    package: Option<&str>,
+    manifest_path: Option<&str>,
+    extra_args: &[String],
+    working_directory: Option<&str>,
+    diagnostic_format: DiagnosticFormat,
+    store: &super::output::ToolOutputStore,
 ) -> Result<String> {
     if subcommand.trim().is_empty() {
         return Err(anyhow!(
@@ -325,19 +310,16 @@ pub async fn run_cargo(
             .take()
             .ok_or_else(|| anyhow!("run_cargo: stderr was not piped"))?;
 
-        let stdout_task = tokio::spawn(read_pipe(stdout, "stdout"));
-        let stderr_task = tokio::spawn(read_pipe(stderr, "stderr"));
-
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| anyhow!("run_cargo: wait: {}", e))?;
-        let out = stdout_task
-            .await
-            .map_err(|e| anyhow!("run_cargo: stdout task failed: {}", e))??;
-        let err = stderr_task
-            .await
-            .map_err(|e| anyhow!("run_cargo: stderr task failed: {}", e))??;
+        let (out, err, status) = tokio::try_join!(
+            super::output::capture_pipe(
+                stdout,
+                store.clone(),
+                "cargo-stdout",
+                diagnostic_format == DiagnosticFormat::Json
+            ),
+            super::output::capture_pipe(stderr, store.clone(), "cargo-stderr", false),
+            async { child.wait().await.map_err(anyhow::Error::from) }
+        )?;
 
         Ok::<_, anyhow::Error>((out, err, status))
     };
@@ -359,7 +341,7 @@ pub async fn run_cargo(
     let exit_code = status.code().unwrap_or(-1);
     let mut combined = String::new();
     let diagnostic_summary = if diagnostic_format == DiagnosticFormat::Json {
-        summarize_json_diagnostics(&output)
+        summarize_json_diagnostics(&output.diagnostic_lines)
     } else {
         None
     };
@@ -367,24 +349,38 @@ pub async fn run_cargo(
         combined.push_str(&summary);
         combined.push('\n');
     }
-    if !output.is_empty() {
+    let stdout_text = if diagnostic_format == DiagnosticFormat::Json {
+        let mut text = output.plain_text;
+        if let Some(path) = &output.artifact {
+            text.push_str(&format!(
+                "\nRaw Cargo output: `{}` ({} bytes; use read_file ranges)\n",
+                path.display(),
+                output.bytes
+            ));
+        }
+        if output.diagnostics_omitted {
+            text.push_str("[Diagnostic collection was bounded; inspect the raw Cargo output for omitted diagnostics.]\n");
+        }
+        text
+    } else {
+        output.text
+    };
+    if !stdout_text.is_empty() {
         combined.push_str("Stdout:\n");
-        combined.push_str(&output);
+        combined.push_str(&stdout_text);
     }
-    if !error_output.is_empty() {
+    if !error_output.text.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
         }
         combined.push_str("Stderr:\n");
-        combined.push_str(&error_output);
+        combined.push_str(&error_output.text);
     }
     if combined.is_empty() {
         combined = format!("Command completed with exit code {}", exit_code);
     } else {
         combined.push_str(&format!("\nExit code: {}", exit_code));
     }
-
-    combined = truncate_combined_output(&combined, MAX_CARGO_OUTPUT_BYTES);
 
     if !status.success() {
         combined = format!("Command failed (exit code {})\n{}", exit_code, combined);
@@ -482,7 +478,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = run_cargo(
+        let output = run_cargo_with_store(
             "check",
             false,
             None,
@@ -490,6 +486,7 @@ mod tests {
             &[],
             Some(root.to_str().unwrap()),
             DiagnosticFormat::Json,
+            &super::super::output::ToolOutputStore::new(&root),
         )
         .await
         .unwrap();
