@@ -3,41 +3,68 @@
 use console::{style, Term};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::lsp::{RustLspState, RustLspStatus};
 
 /// Approximate `openai/gpt-oss-120b` context window (tokens). Used only for the CLI meter.
 pub const CONTEXT_WINDOW_TOKENS: u32 = 131_072;
 
-/// Rotating circle spinner on stderr until [`SpinnerGuard::finish`] — shows activity while the LLM
-/// connects and before the first streamed chunk (thinking / TTFB). Label is e.g. `groq` or `local`.
+/// Crush-style activity line. Scrambled glyphs mean the model is working and has
+/// not produced visible text yet. A tool run uses a plain label and elapsed time.
+const SPINNER_RUNES: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'A', 'B', 'C',
+    'D', 'E', 'F', '~', '!', '@', '#', '$', '£', '€', '%', '^', '&', '*', '(', ')', '+', '=', '_',
+];
+const SPINNER_GLYPHS: usize = 10;
+const SPINNER_FRAME: std::time::Duration = std::time::Duration::from_millis(50);
+
+enum SpinnerKind {
+    Thinking,
+    Running(String),
+    Status(String),
+}
+
 pub struct SpinnerGuard {
     stop: Arc<AtomicBool>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SpinnerGuard {
-    pub fn new(label: impl Into<String>) -> Self {
-        let label = label.into();
+    /// Scrambled glyph row plus `Thinking...`, until the model prints something.
+    pub fn thinking() -> Self {
+        Self::spawn(SpinnerKind::Thinking)
+    }
+
+    /// `Running {tool}... 12s` while a tool executes. No scrambled glyphs.
+    pub fn running(tool: impl Into<String>) -> Self {
+        Self::spawn(SpinnerKind::Running(tool.into()))
+    }
+
+    /// `{label}... 2s` for short non-model waits such as Jev, compaction, or a rate limit.
+    pub fn status(label: impl Into<String>) -> Self {
+        Self::spawn(SpinnerKind::Status(label.into()))
+    }
+
+    fn spawn(kind: SpinnerKind) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let handle = tokio::spawn(async move {
-            let frames = ["◐", "◓", "◑", "◒"];
-            let mut i = 0u32;
-            while !stop_clone.load(Ordering::Relaxed) {
-                eprint!(
-                    "\r\x1b[2K{} {} {}",
-                    style(&label).dim(),
-                    style("·").dim(),
-                    style(frames[(i % 4) as usize]).cyan()
-                );
-                let _ = std::io::stderr().flush();
-                i += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let started = std::time::Instant::now();
+            let mut tick = 0u32;
+            loop {
+                let frame = render_spinner_frame(&kind, tick, started.elapsed().as_secs());
+                {
+                    let _guard = lock_activity();
+                    if stop_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    eprint!("\r\x1b[2K{frame}");
+                    let _ = std::io::stderr().flush();
+                }
+                tick = tick.wrapping_add(1);
+                tokio::time::sleep(SPINNER_FRAME).await;
             }
-            eprint!("\r\x1b[2K");
-            let _ = std::io::stderr().flush();
         });
         Self {
             stop,
@@ -46,11 +73,93 @@ impl SpinnerGuard {
     }
 
     pub async fn finish(&mut self) {
-        if let Some(h) = self.handle.take() {
+        if let Some(handle) = self.handle.take() {
             self.stop.store(true, Ordering::Relaxed);
-            let _ = h.await;
+            let _ = handle.await;
+            clear_activity_line();
         }
     }
+}
+
+impl Drop for SpinnerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            clear_activity_line();
+        }
+    }
+}
+
+/// Print a full stderr line without appending it to the spinner's current row.
+pub fn eprintln_status(line: impl std::fmt::Display) {
+    let _guard = lock_activity();
+    eprintln!("\r\x1b[2K{line}");
+}
+
+fn activity_draw() -> &'static Mutex<()> {
+    static DRAW: Mutex<()> = Mutex::new(());
+    &DRAW
+}
+
+fn lock_activity() -> std::sync::MutexGuard<'static, ()> {
+    activity_draw()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn clear_activity_line() {
+    let _guard = lock_activity();
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
+}
+
+fn render_spinner_frame(kind: &SpinnerKind, tick: u32, elapsed_secs: u64) -> String {
+    let dots = ellipsis(tick);
+    match kind {
+        SpinnerKind::Thinking => {
+            format!("{}\x1b[2m Thinking{dots}\x1b[0m", colored_glyphs(tick))
+        }
+        SpinnerKind::Running(tool) => format!("Running {tool}{dots} {elapsed_secs}s"),
+        SpinnerKind::Status(label) => format!("{label}{dots} {elapsed_secs}s"),
+    }
+}
+
+/// Width-3 ellipsis so the elapsed-seconds column does not jump as the dots grow.
+fn ellipsis(tick: u32) -> &'static str {
+    match (tick / 8) % 4 {
+        0 => ".  ",
+        1 => ".. ",
+        2 => "...",
+        _ => "   ",
+    }
+}
+
+fn colored_glyphs(tick: u32) -> String {
+    let mut out = String::with_capacity(SPINNER_GLYPHS * 16);
+    for (index, glyph) in glyph_frame(tick).into_iter().enumerate() {
+        let (red, green, blue) = glyph_color(index);
+        out.push_str(&format!("\x1b[38;2;{red};{green};{blue}m{glyph}"));
+    }
+    out.push_str("\x1b[0m");
+    out
+}
+
+fn glyph_frame(tick: u32) -> [char; SPINNER_GLYPHS] {
+    let mut state = 0xA5A5_u32.wrapping_add(tick.wrapping_mul(0x9E37_79B9));
+    let mut glyphs = [' '; SPINNER_GLYPHS];
+    for glyph in &mut glyphs {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let index = (state >> 16) as usize % SPINNER_RUNES.len();
+        *glyph = SPINNER_RUNES[index];
+    }
+    glyphs
+}
+
+fn glyph_color(index: usize) -> (u8, u8, u8) {
+    let span = SPINNER_GLYPHS.saturating_sub(1).max(1);
+    let blue = (index * 255 / span) as u8;
+    (255 - blue, 0, blue)
 }
 
 /// Eight filled/empty circles as a discrete ring plus rough token counts.
@@ -304,7 +413,10 @@ impl Default for TerminalWriter {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalWriter;
+    use super::{
+        ellipsis, glyph_color, glyph_frame, render_spinner_frame, SpinnerKind, TerminalWriter,
+        SPINNER_GLYPHS, SPINNER_RUNES,
+    };
 
     #[test]
     fn line_breaks_return_to_column_zero() {
@@ -325,5 +437,41 @@ mod tests {
         assert_eq!(writer.push("left\r"), "left");
         assert_eq!(writer.push("\nright"), "\r\nright");
         assert_eq!(writer.finish(), "");
+    }
+
+    #[test]
+    fn spinner_frames_match_the_crush_loader() {
+        assert_eq!(ellipsis(0), ".  ");
+        assert_eq!(ellipsis(8), ".. ");
+        assert_eq!(ellipsis(16), "...");
+        assert_eq!(ellipsis(24), "   ");
+
+        let glyphs = glyph_frame(0);
+        assert_eq!(glyphs.len(), SPINNER_GLYPHS);
+        assert!(glyphs.iter().all(|glyph| SPINNER_RUNES.contains(glyph)));
+        assert_ne!(glyph_frame(0), glyph_frame(1));
+        assert_eq!(glyph_color(0), (255, 0, 0));
+        assert_eq!(glyph_color(SPINNER_GLYPHS - 1), (0, 0, 255));
+
+        let thinking = render_spinner_frame(&SpinnerKind::Thinking, 16, 4);
+        assert!(thinking.contains("\x1b[38;2;"));
+        assert!(thinking.contains("\x1b[2m Thinking...\x1b[0m"));
+        assert!(!thinking.contains("4s"));
+
+        assert_eq!(
+            render_spinner_frame(&SpinnerKind::Running("run_cargo".into()), 16, 12),
+            "Running run_cargo... 12s"
+        );
+        assert_eq!(
+            render_spinner_frame(&SpinnerKind::Status("jev".into()), 0, 2),
+            "jev.   2s"
+        );
+    }
+
+    #[tokio::test]
+    async fn spinner_finish_returns_after_the_frame_task_stops() {
+        let mut spinner = super::SpinnerGuard::running("run_cargo");
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        spinner.finish().await;
     }
 }

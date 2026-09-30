@@ -594,11 +594,11 @@ impl GroqClient {
                     wait.as_secs().max(1)
                 );
             }
-            eprintln!(
+            crate::ui::eprintln_status(format!(
                 "Groq TPM preflight: waiting {}s for token window reset before sending estimated {} token request",
                 wait.as_secs().max(1),
                 requested
-            );
+            ));
             tokio::time::sleep(wait).await;
             self.push_window_estimate(requested);
             return Ok(());
@@ -642,11 +642,11 @@ impl GroqClient {
                         self.tpm_limit
                     );
                 }
-                eprintln!(
+                crate::ui::eprintln_status(format!(
                     "Groq TPM preflight: waiting {}s before sending estimated {} token request",
                     wait.as_secs().max(1),
                     requested
-                );
+                ));
                 tokio::time::sleep(wait).await;
             }
             self.push_window_estimate(requested);

@@ -34,9 +34,9 @@ pub async fn execute_bash_with_store(
     store: &super::output::ToolOutputStore,
 ) -> Result<String> {
     if let Some(desc) = description {
-        eprintln!("Executing: {} ({})", command, desc);
+        crate::ui::eprintln_status(format!("Executing: {command} ({desc})"));
     } else {
-        eprintln!("Executing: {}", command);
+        crate::ui::eprintln_status(format!("Executing: {command}"));
     }
 
     let mut cmd = Command::new("bash");

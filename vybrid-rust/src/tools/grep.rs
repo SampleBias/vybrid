@@ -160,7 +160,7 @@ fn expand_paths(paths: &[&str]) -> Result<impl Iterator<Item = PathBuf>> {
             expanded.push(Box::new(entries.filter_map(move |entry| match entry {
                 Ok(path) => Some(path),
                 Err(e) => {
-                    eprintln!("Glob error for '{}': {}", normalized, e);
+                    crate::ui::eprintln_status(format!("Glob error for '{normalized}': {e}"));
                     None
                 }
             })));

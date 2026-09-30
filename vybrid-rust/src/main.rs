@@ -374,7 +374,7 @@ async fn route_openrouter_turn(
     conversation: &Conversation,
     client: GroqClient,
 ) -> GroqClient {
-    let mut spinner = ui::SpinnerGuard::new("jev");
+    let mut spinner = ui::SpinnerGuard::status("jev");
     let latest = conversation.latest_task_text().unwrap_or_default();
     let previous = conversation.previous_task_text();
     let routed = jev::route_turn(
@@ -737,6 +737,16 @@ fn corrective_tool_prompt(e: &anyhow::Error, attempt: u32, max_attempts: u32) ->
     }
 }
 
+fn has_visible_text(text: &Option<String>) -> bool {
+    text.as_ref().is_some_and(|text| !text.is_empty())
+}
+
+async fn dismiss_spinner(spinner: &mut Option<ui::SpinnerGuard>) {
+    if let Some(mut spinner) = spinner.take() {
+        spinner.finish().await;
+    }
+}
+
 /// Process AI response with streaming and tool calls
 async fn process_ai_response(
     client: &GroqClient,
@@ -794,7 +804,6 @@ async fn process_ai_response(
     let mut terminal_out = ui::TerminalWriter::new();
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut first_chunk: bool;
     let mut rate_limit_note_added = false;
     // Only shrink the request after a genuine context-length rejection. Shrinking on
     // every retry used to rewrite the message prefix, invalidating Groq's prompt
@@ -813,7 +822,6 @@ async fn process_ai_response(
         terminal_out.reset();
         final_content.clear();
         tool_calls.clear();
-        first_chunk = true;
         last_usage = None;
         finish_reason = None;
 
@@ -823,7 +831,6 @@ async fn process_ai_response(
             turn.retry_context_token_budget
         };
 
-        let mut spinner = ui::SpinnerGuard::new(spinner_label);
         let request_client = route_state.client_for_request(client);
         let request_tools = if final_answer_only {
             None
@@ -837,14 +844,21 @@ async fn process_ai_response(
             // Bounded summaries, at a compaction boundary only. If a provider is
             // unavailable, the synchronous window still preserves task anchors
             // and complete tool groups.
+            let mut compact_spinner = Some(ui::SpinnerGuard::status("compact"));
             for _ in 0..3 {
                 match summarize_conversation(&request_client, conversation, "Preserve the task, constraints, decisions, exact paths, verification results and remaining work.").await {
                     Ok(true) if conversation.estimate_active_tokens() > request_budget * 3 / 4 => continue,
                     Ok(_) => break,
-                    Err(e) => { eprintln!("Compaction deferred: {e}"); break; }
+                    Err(e) => {
+                        dismiss_spinner(&mut compact_spinner).await;
+                        eprintln!("Compaction deferred: {e}");
+                        break;
+                    }
                 }
             }
+            dismiss_spinner(&mut compact_spinner).await;
         }
+        let mut spinner = Some(ui::SpinnerGuard::thinking());
         let stream = {
             let request_messages =
                 request_messages_for_route(conversation, request_budget, route_state);
@@ -855,7 +869,7 @@ async fn process_ai_response(
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
-                spinner.finish().await;
+                dismiss_spinner(&mut spinner).await;
                 if is_preflight_route_error(&e) {
                     if route_state.route_preflight_wait() {
                         println!(
@@ -899,7 +913,7 @@ async fn process_ai_response(
                         );
                         continue 'stream;
                     }
-                    let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
+                    let mut wait_spinner = ui::SpinnerGuard::status("rate limit");
                     tokio::time::sleep(delay).await;
                     wait_spinner.finish().await;
                     continue 'stream;
@@ -923,10 +937,6 @@ async fn process_ai_response(
         futures::pin_mut!(stream);
 
         while let Some(chunk_result) = stream.next().await {
-            if first_chunk {
-                spinner.finish().await;
-                first_chunk = false;
-            }
             match chunk_result {
                 Ok(chunk) => {
                     if let Some(usage) = chunk.effective_usage() {
@@ -936,8 +946,18 @@ async fn process_ai_response(
                         if let Some(reason) = &choice.finish_reason {
                             finish_reason = Some(reason.clone());
                         }
+                        if has_visible_text(&choice.delta.reasoning_content)
+                            || has_visible_text(&choice.delta.content)
+                        {
+                            dismiss_spinner(&mut spinner).await;
+                        }
                         // Handle reasoning content (thinking)
-                        if let Some(reasoning) = &choice.delta.reasoning_content {
+                        if let Some(reasoning) = choice
+                            .delta
+                            .reasoning_content
+                            .as_deref()
+                            .filter(|text| !text.is_empty())
+                        {
                             if !reasoning_started {
                                 println!();
                                 println!("{}", style("Thinking:").blue().dim());
@@ -948,7 +968,12 @@ async fn process_ai_response(
                         }
 
                         // Handle content
-                        if let Some(content) = &choice.delta.content {
+                        if let Some(content) = choice
+                            .delta
+                            .content
+                            .as_deref()
+                            .filter(|text| !text.is_empty())
+                        {
                             if !content_started {
                                 if reasoning_started {
                                     print!("\r\n\r\n");
@@ -994,10 +1019,10 @@ async fn process_ai_response(
                     }
                 }
                 Err(e) => {
+                    dismiss_spinner(&mut spinner).await;
                     println!();
                     if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) && !content_started
                     {
-                        spinner.finish().await;
                         let delay = rate_limit_retry_delay(&e);
                         let switched_route = route_state.record_rate_limit_wait();
                         if !rate_limit_note_added {
@@ -1026,7 +1051,7 @@ async fn process_ai_response(
                             );
                             continue 'stream;
                         }
-                        let mut wait_spinner = ui::SpinnerGuard::new("rate limit");
+                        let mut wait_spinner = ui::SpinnerGuard::status("rate limit");
                         tokio::time::sleep(delay).await;
                         wait_spinner.finish().await;
                         continue 'stream;
@@ -1045,18 +1070,14 @@ async fn process_ai_response(
                             "Tool call validation failed — retrying with a corrective prompt..."
                         };
                         println!("{}", style(retry_message).yellow());
-                        spinner.finish().await;
                         continue 'stream;
                     }
-                    spinner.finish().await;
                     return Err(e);
                 }
             }
         }
 
-        if first_chunk {
-            spinner.finish().await;
-        }
+        dismiss_spinner(&mut spinner).await;
 
         if let Some(problem) = incomplete_completion_reason(
             finish_reason.as_deref(),
@@ -1153,22 +1174,26 @@ async fn process_ai_response(
             for tool_call in &executable {
                 ui::print_tool_call(&tool_call.function.name);
             }
-            futures::future::join_all(executable.iter().map(|tc| {
+            let mut spinner = ui::SpinnerGuard::running(format!("{} tools", executable.len()));
+            let results = futures::future::join_all(executable.iter().map(|tc| {
                 execute_tool_with_context(&tc.function.name, &tc.function.arguments, tool_runtime)
             }))
-            .await
+            .await;
+            spinner.finish().await;
+            results
         } else {
             let mut results = Vec::with_capacity(executable.len());
             for tool_call in &executable {
                 ui::print_tool_call(&tool_call.function.name);
-                results.push(
-                    execute_tool_with_context(
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                        tool_runtime,
-                    )
-                    .await,
-                );
+                let mut spinner = ui::SpinnerGuard::running(tool_call.function.name.clone());
+                let result = execute_tool_with_context(
+                    &tool_call.function.name,
+                    &tool_call.function.arguments,
+                    tool_runtime,
+                )
+                .await;
+                spinner.finish().await;
+                results.push(result);
             }
             results
         };
@@ -1932,7 +1957,7 @@ async fn handle_compact_command(
         );
 
     let before_tokens = conversation.estimate_context_tokens();
-    let mut spinner = ui::SpinnerGuard::new("compact");
+    let mut spinner = ui::SpinnerGuard::status("compact");
     let result = summarize_conversation(client, conversation, focus).await;
     spinner.finish().await;
     if !result? {
