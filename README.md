@@ -11,6 +11,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 ## Features
 
 - **Multi-Provider LLM**: Groq (default), [OpenRouter](https://openrouter.ai/) (400+ cloud models), or local [LM Studio](https://lmstudio.ai/)
+- **Jev model routing**: Optional OpenRouter path that asks [Jev](https://openrouter.ai/docs/guides/community/jev) what kind of task you sent, then runs that turn on a prep, coding, or cheap chat model. See [Jev model routing](#jev-model-routing)
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
 - **Agent Skills**: Pi-compatible [Agent Skills](https://agentskills.io/specification) — on-demand `SKILL.md` workflows discovered from `~/.vybrid/skills/`, `.vybrid/skills/`, and shared `~/.agents/skills/` paths
 - **Context Compaction**: `/compact` summarizes older conversation history via the LLM to free context; passive overflow compaction still applies automatically during long sessions
@@ -155,18 +156,99 @@ OPENROUTER_MODEL=anthropic/claude-sonnet-4
 
 Vybrid only sends tool calls to models that support the `tools` parameter. The recommended picker filters to tool-capable models automatically.
 
-### Jev routing (OpenRouter)
+### Jev model routing
 
-Jev routing is off until you turn it on. With **`VYBRID_LLM_PROVIDER=openrouter`** and **`VYBRID_JEV_ROUTING=on`**, each user message sends the task to Jev on the [OpenRouter Decisions API](https://openrouter.ai/docs/guides/community/jev) (`~typesafe/jev-latest`). Jev returns a task kind, a difficulty score, and probabilities for deep preparation and high consequence. Vybrid then picks one tool-capable chat model and keeps it for that turn's tool loop:
+Jev routing is an optional OpenRouter feature. It is off until you turn it on. Groq and LM Studio never use it.
 
-- **Prep** (`VYBRID_JEV_MODEL_PREP`, default `~anthropic/claude-opus-latest`) — planning, review, research, or a hard explanation
-- **Code** (`VYBRID_JEV_MODEL_CODE`, default `moonshotai/kimi-k2.7-code`) — routine implement, debug, or refactor work
-- **Code-hard** (`VYBRID_JEV_MODEL_CODE_HARD`, default `openai/gpt-5.3-codex`) — involved or architectural coding, high-risk changes, or coding that still needs deep preparation
-- **Quick** (`VYBRID_JEV_MODEL_QUICK`, default `~google/gemini-flash-latest`) — chat and simple explanations
+[Jev](https://openrouter.ai/docs/guides/community/jev) (`~typesafe/jev-latest`) is a decision model, not the model that writes code. Vybrid sends it the user task and four typed questions through the OpenRouter Decisions API (`POST https://openrouter.ai/api/alpha/decisions`), using the same `OPENROUTER_API_KEY`. Jev returns a task kind, a difficulty score, and probabilities. Vybrid's own rules then pick one tool-capable chat model and keep that model for the whole turn, including tool rounds, retries, and compaction. The judgment is printed in the terminal and is not added to the conversation, so it does not spend chat-model context.
 
-`OPENROUTER_MODEL` stays the fallback when Jev's confidence is low, the decision request fails, or a concrete tier id is missing from the OpenRouter catalog or cannot take tools. Aliases that start with `~` are accepted without a catalog match. Turn routing on from **`/menu`** → **OpenRouter** → **Turn Jev routing on**, and edit the four tier ids from **Set Jev tier models**. Groq and LM Studio are unchanged.
+#### Turn it on
 
-The decision uses the latest user task, plus the previous user task when the new message is a short follow-up. It is not called again on tool rounds, and the judgment is printed in the terminal rather than added to the conversation.
+1. Select OpenRouter and set `OPENROUTER_MODEL`. That pinned model is the fallback.
+2. Run **`/menu`** → **OpenRouter** → **Turn Jev routing on**, or set **`VYBRID_JEV_ROUTING=on`**.
+3. Optional: **`/menu`** → **OpenRouter** → **Set Jev tier models**, or set the four `VYBRID_JEV_MODEL_*` variables below.
+
+```bash
+VYBRID_LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+OPENROUTER_MODEL=anthropic/claude-sonnet-4
+VYBRID_JEV_ROUTING=on
+```
+
+#### Where a prompt goes
+
+```mermaid
+flowchart TD
+  prompt[You send a task]
+  provider{Active provider}
+  groq[Groq chat model]
+  localModel[LM Studio model]
+  jevOn{Jev routing on?}
+  pinned[Pinned OPENROUTER_MODEL]
+  decisions["Jev: one Decisions API call"]
+  policy[Vybrid maps the judgment to a tier]
+  loop[Agent tool loop stays on that model]
+
+  prompt --> provider
+  provider -->|Groq| groq --> loop
+  provider -->|LM Studio| localModel --> loop
+  provider -->|OpenRouter| jevOn
+  jevOn -->|"off, timeout, or low confidence"| pinned --> loop
+  jevOn -->|on| decisions --> policy --> loop
+```
+
+The `You>` prompt still shows before Jev runs, so it does not name the routed model. After you press Enter, Vybrid prints one line:
+
+```text
+jev → code-hard openai/gpt-5.3-codex
+```
+
+A fallback is yellow, for example `jev → pinned anthropic/claude-sonnet-4 (low confidence)`. After the reply, the token line ends with the same model id.
+
+#### What Jev is asked
+
+One request, four questions, about the latest user message. If that message is 80 characters or shorter, the previous user task is included so a follow-up such as "do it" can be classified. Longer messages are classified on their own. The task text sent to Jev is capped at 6,000 characters, and the previous task at 2,000. The decision times out after 8 seconds.
+
+| Question | Kind | What it measures |
+| --- | --- | --- |
+| `task_kind` | choice | plan, implement, debug, refactor, review, research, explain, or chat |
+| `complexity` | score | trivial, routine, involved, or architectural |
+| `deep_preparation` | yes/no probability | the approach, root cause, or design still has to be discovered |
+| `consequence` | yes/no probability | a wrong change could cause broad regressions, breakage, security issues, or data loss |
+
+#### Which model is selected
+
+```mermaid
+flowchart TD
+  kind{Task kind}
+  prep[Prep model]
+  codeCheck{Hard coding work?}
+  codeModel[Code model]
+  codeHard[Code-hard model]
+  explainCheck{Hard to explain?}
+  quick[Quick model]
+  pinnedModel[Pinned OPENROUTER_MODEL]
+
+  kind -->|"plan, review, or research"| prep
+  kind -->|"implement, debug, or refactor"| codeCheck
+  codeCheck -->|routine| codeModel
+  codeCheck -->|"involved, deep preparation, or high risk"| codeHard
+  kind -->|explain or chat| explainCheck
+  explainCheck -->|simple| quick
+  explainCheck -->|complex or deep preparation| prep
+  kind -->|"confidence below 0.45 or unrecognized"| pinnedModel
+```
+
+Coding work is hard when complexity is at least halfway from routine toward involved (score 1.5 or higher), deep preparation is at least 0.65, or consequence is at least 0.70. Explain and chat escalate to the prep model only for that complexity or deep-preparation bar. High consequence alone does not move a chat or explanation off the quick model. Plan, review, and research always use the prep model.
+
+| Tier | Env variable | Default model | Used for |
+| --- | --- | --- | --- |
+| Prep | `VYBRID_JEV_MODEL_PREP` | `~anthropic/claude-opus-latest` | Planning, review, research, and hard explanations |
+| Code | `VYBRID_JEV_MODEL_CODE` | `moonshotai/kimi-k2.7-code` | Routine implement, debug, and refactor work |
+| Code-hard | `VYBRID_JEV_MODEL_CODE_HARD` | `openai/gpt-5.3-codex` | Involved or architectural coding, high-risk changes, or coding that still needs deep preparation |
+| Quick | `VYBRID_JEV_MODEL_QUICK` | `~google/gemini-flash-latest` | Chat and simple explanations |
+
+A concrete model id is checked against the cached OpenRouter catalog. If it is missing, or it cannot take tools, Vybrid uses `OPENROUTER_MODEL` instead. Ids that start with `~` are OpenRouter aliases and are accepted without that catalog check. If the catalog request itself fails, the tier model is still used. Any Jev error, timeout, task-kind confidence below 0.45, or an unrecognized task kind also stays on `OPENROUTER_MODEL`.
 
 ### LM Studio (local, offline)
 
