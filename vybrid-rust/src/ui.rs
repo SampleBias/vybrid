@@ -235,3 +235,95 @@ pub fn clear_screen() {
     let term = Term::stdout();
     let _ = term.clear_screen();
 }
+
+/// Turns model text into terminal output whose line breaks return to column 0.
+///
+/// A bare line feed, Unicode line separator, or next-line character moves the
+/// cursor down but leaves it at the current column. That draws each following
+/// line further to the right. Emitting CR LF keeps every line on the left edge,
+/// including when a break is split across two stream chunks.
+pub struct TerminalWriter {
+    pending_cr: bool,
+}
+
+impl TerminalWriter {
+    pub fn new() -> Self {
+        Self { pending_cr: false }
+    }
+
+    pub fn reset(&mut self) {
+        self.pending_cr = false;
+    }
+
+    pub fn push(&mut self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        if self.pending_cr {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push_str("\r\n");
+            self.pending_cr = false;
+        }
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                        out.push_str("\r\n");
+                    } else if chars.peek().is_some() {
+                        out.push_str("\r\n");
+                    } else {
+                        self.pending_cr = true;
+                    }
+                }
+                '\n' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}' => {
+                    out.push_str("\r\n");
+                }
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    pub fn finish(&mut self) -> &'static str {
+        if self.pending_cr {
+            self.pending_cr = false;
+            "\r\n"
+        } else {
+            ""
+        }
+    }
+}
+
+impl Default for TerminalWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalWriter;
+
+    #[test]
+    fn line_breaks_return_to_column_zero() {
+        let mut writer = TerminalWriter::new();
+        assert_eq!(writer.push("a\nb"), "a\r\nb");
+        assert_eq!(writer.push("a\r\nb"), "a\r\nb");
+        assert_eq!(writer.push("a\rb"), "a\r\nb");
+        assert_eq!(writer.push("a\u{2028}b"), "a\r\nb");
+        assert_eq!(writer.push("a\u{2029}b"), "a\r\nb");
+        assert_eq!(writer.push("a\u{0085}b"), "a\r\nb");
+        assert_eq!(writer.push("\n\n"), "\r\n\r\n");
+        assert_eq!(writer.finish(), "");
+    }
+
+    #[test]
+    fn carriage_return_split_across_chunks_stays_one_break() {
+        let mut writer = TerminalWriter::new();
+        assert_eq!(writer.push("left\r"), "left");
+        assert_eq!(writer.push("\nright"), "\r\nright");
+        assert_eq!(writer.finish(), "");
+    }
+}

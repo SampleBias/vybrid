@@ -791,6 +791,7 @@ async fn process_ai_response(
 
     let mut reasoning_started: bool;
     let mut content_started: bool;
+    let mut terminal_out = ui::TerminalWriter::new();
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut first_chunk: bool;
@@ -809,6 +810,7 @@ async fn process_ai_response(
 
         reasoning_started = false;
         content_started = false;
+        terminal_out.reset();
         final_content.clear();
         tool_calls.clear();
         first_chunk = true;
@@ -941,7 +943,7 @@ async fn process_ai_response(
                                 println!("{}", style("Thinking:").blue().dim());
                                 reasoning_started = true;
                             }
-                            print!("{}", style(reasoning).dim());
+                            print!("{}", style(terminal_out.push(reasoning)).dim());
                             io::stdout().flush()?;
                         }
 
@@ -949,13 +951,12 @@ async fn process_ai_response(
                         if let Some(content) = &choice.delta.content {
                             if !content_started {
                                 if reasoning_started {
-                                    println!();
-                                    println!();
+                                    print!("\r\n\r\n");
                                 }
                                 print!("{} ", style("Assistant>").cyan().bold());
                                 content_started = true;
                             }
-                            print!("{}", content);
+                            print!("{}", terminal_out.push(content));
                             io::stdout().flush()?;
                             final_content.push_str(content);
                         }
@@ -1086,7 +1087,8 @@ async fn process_ai_response(
     }
 
     if content_started || reasoning_started {
-        println!();
+        print!("{}\r\n", terminal_out.finish());
+        io::stdout().flush()?;
     }
 
     if let Some(usage) = &last_usage {
