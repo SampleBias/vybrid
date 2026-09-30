@@ -99,6 +99,13 @@ GROQ_API_KEY=your_api_key_here
 # --- OpenRouter (multi-provider cloud) — set VYBRID_LLM_PROVIDER=openrouter ---
 # OPENROUTER_API_KEY=your_openrouter_api_key_here
 # OPENROUTER_MODEL=openai/gpt-4o-mini
+# Optional Jev routing (off by default). On OpenRouter turns, Jev picks a tier model.
+# OPENROUTER_MODEL stays the fallback when Jev is unsure, times out, or the tier id is stale.
+# VYBRID_JEV_ROUTING=off
+# VYBRID_JEV_MODEL_PREP=~anthropic/claude-opus-latest
+# VYBRID_JEV_MODEL_CODE=moonshotai/kimi-k2.7-code
+# VYBRID_JEV_MODEL_CODE_HARD=openai/gpt-5.3-codex
+# VYBRID_JEV_MODEL_QUICK=~google/gemini-flash-latest
 
 # --- LM Studio (local) — set VYBRID_LLM_PROVIDER=lmstudio and fill these ---
 # LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
@@ -147,6 +154,19 @@ OPENROUTER_MODEL=anthropic/claude-sonnet-4
 ```
 
 Vybrid only sends tool calls to models that support the `tools` parameter. The recommended picker filters to tool-capable models automatically.
+
+### Jev routing (OpenRouter)
+
+Jev routing is off until you turn it on. With **`VYBRID_LLM_PROVIDER=openrouter`** and **`VYBRID_JEV_ROUTING=on`**, each user message sends the task to Jev on the [OpenRouter Decisions API](https://openrouter.ai/docs/guides/community/jev) (`~typesafe/jev-latest`). Jev returns a task kind, a difficulty score, and probabilities for deep preparation and high consequence. Vybrid then picks one tool-capable chat model and keeps it for that turn's tool loop:
+
+- **Prep** (`VYBRID_JEV_MODEL_PREP`, default `~anthropic/claude-opus-latest`) — planning, review, research, or a hard explanation
+- **Code** (`VYBRID_JEV_MODEL_CODE`, default `moonshotai/kimi-k2.7-code`) — routine implement, debug, or refactor work
+- **Code-hard** (`VYBRID_JEV_MODEL_CODE_HARD`, default `openai/gpt-5.3-codex`) — involved or architectural coding, high-risk changes, or coding that still needs deep preparation
+- **Quick** (`VYBRID_JEV_MODEL_QUICK`, default `~google/gemini-flash-latest`) — chat and simple explanations
+
+`OPENROUTER_MODEL` stays the fallback when Jev's confidence is low, the decision request fails, or a concrete tier id is missing from the OpenRouter catalog or cannot take tools. Aliases that start with `~` are accepted without a catalog match. Turn routing on from **`/menu`** → **OpenRouter** → **Turn Jev routing on**, and edit the four tier ids from **Set Jev tier models**. Groq and LM Studio are unchanged.
+
+The decision uses the latest user task, plus the previous user task when the new message is a short follow-up. It is not called again on tool rounds, and the judgment is printed in the terminal rather than added to the conversation.
 
 ### LM Studio (local, offline)
 

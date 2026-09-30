@@ -14,6 +14,10 @@ pub const DEFAULT_RUST_LSP_COMMAND: &str = "rust-analyzer";
 const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4o-mini";
+pub const DEFAULT_JEV_MODEL_PREP: &str = "~anthropic/claude-opus-latest";
+pub const DEFAULT_JEV_MODEL_CODE: &str = "moonshotai/kimi-k2.7-code";
+pub const DEFAULT_JEV_MODEL_CODE_HARD: &str = "openai/gpt-5.3-codex";
+pub const DEFAULT_JEV_MODEL_QUICK: &str = "~google/gemini-flash-latest";
 pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
 pub const DEFAULT_GROQ_COMPOUND_MODEL: &str = "groq/compound";
 pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
@@ -83,6 +87,12 @@ pub struct Config {
     pub lm_studio_model: Option<String>,
     pub openrouter_api_key: Option<String>,
     pub openrouter_model: String,
+    /// `VYBRID_JEV_ROUTING` — when on, OpenRouter turns ask Jev which tier model to use.
+    pub jev_routing: bool,
+    pub jev_model_prep: String,
+    pub jev_model_code: String,
+    pub jev_model_code_hard: String,
+    pub jev_model_quick: String,
     /// `vybrid-rust/.env` (see [`project_env_file_path`]).
     pub env_file_path: PathBuf,
     /// `~/.vybrid/.env` — mirror so launches from any directory find keys without `VYBRID_ROOT`.
@@ -181,6 +191,15 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_OPENROUTER_MODEL.to_string());
+        let jev_routing = std::env::var("VYBRID_JEV_ROUTING")
+            .ok()
+            .map(|s| parse_bool_env(&s))
+            .unwrap_or(false);
+        let jev_model_prep = env_string_or("VYBRID_JEV_MODEL_PREP", DEFAULT_JEV_MODEL_PREP);
+        let jev_model_code = env_string_or("VYBRID_JEV_MODEL_CODE", DEFAULT_JEV_MODEL_CODE);
+        let jev_model_code_hard =
+            env_string_or("VYBRID_JEV_MODEL_CODE_HARD", DEFAULT_JEV_MODEL_CODE_HARD);
+        let jev_model_quick = env_string_or("VYBRID_JEV_MODEL_QUICK", DEFAULT_JEV_MODEL_QUICK);
 
         let rust_lsp_enabled = std::env::var("VYBRID_RUST_LSP_ENABLED")
             .ok()
@@ -237,6 +256,11 @@ impl Config {
             lm_studio_model,
             openrouter_api_key,
             openrouter_model,
+            jev_routing,
+            jev_model_prep,
+            jev_model_code,
+            jev_model_code_hard,
+            jev_model_quick,
             env_file_path,
             global_env_file_path,
             vybrid_dir,
@@ -514,6 +538,54 @@ impl Config {
         self.rust_lsp_root = root;
         Ok(())
     }
+
+    /// Persist `VYBRID_JEV_ROUTING`. Off leaves each OpenRouter turn on the pinned model.
+    pub fn set_jev_routing(&mut self, enabled: bool) -> Result<()> {
+        let value = if enabled { "on" } else { "off" };
+        self.persist_env_key("VYBRID_JEV_ROUTING", value)?;
+        std::env::set_var("VYBRID_JEV_ROUTING", value);
+        self.jev_routing = enabled;
+        Ok(())
+    }
+
+    pub fn set_jev_model_prep(&mut self, model: String) -> Result<()> {
+        self.jev_model_prep = self.persist_model_slot("VYBRID_JEV_MODEL_PREP", model)?;
+        Ok(())
+    }
+
+    pub fn set_jev_model_code(&mut self, model: String) -> Result<()> {
+        self.jev_model_code = self.persist_model_slot("VYBRID_JEV_MODEL_CODE", model)?;
+        Ok(())
+    }
+
+    pub fn set_jev_model_code_hard(&mut self, model: String) -> Result<()> {
+        self.jev_model_code_hard = self.persist_model_slot("VYBRID_JEV_MODEL_CODE_HARD", model)?;
+        Ok(())
+    }
+
+    pub fn set_jev_model_quick(&mut self, model: String) -> Result<()> {
+        self.jev_model_quick = self.persist_model_slot("VYBRID_JEV_MODEL_QUICK", model)?;
+        Ok(())
+    }
+
+    pub fn jev_tier_models(&self) -> crate::client::jev::TierModels {
+        crate::client::jev::TierModels {
+            prep: self.jev_model_prep.clone(),
+            code: self.jev_model_code.clone(),
+            code_hard: self.jev_model_code_hard.clone(),
+            quick: self.jev_model_quick.clone(),
+        }
+    }
+
+    fn persist_model_slot(&mut self, key: &str, model: String) -> Result<String> {
+        let trimmed = model.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("{key} was empty.");
+        }
+        self.persist_env_key(key, &trimmed)?;
+        std::env::set_var(key, &trimmed);
+        Ok(trimmed)
+    }
 }
 
 fn parse_bool_env(value: &str) -> bool {
@@ -521,6 +593,14 @@ fn parse_bool_env(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn env_string_or(key: &str, default: &str) -> String {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn parse_u32_env(key: &str, default: u32) -> u32 {
@@ -697,6 +777,11 @@ mod tests {
             lm_studio_model: None,
             openrouter_api_key: Some("or-key".to_string()),
             openrouter_model: "anthropic/claude-sonnet-4".to_string(),
+            jev_routing: false,
+            jev_model_prep: DEFAULT_JEV_MODEL_PREP.to_string(),
+            jev_model_code: DEFAULT_JEV_MODEL_CODE.to_string(),
+            jev_model_code_hard: DEFAULT_JEV_MODEL_CODE_HARD.to_string(),
+            jev_model_quick: DEFAULT_JEV_MODEL_QUICK.to_string(),
             env_file_path: PathBuf::from("/tmp/.env"),
             global_env_file_path: PathBuf::from("/tmp/global.env"),
             vybrid_dir: PathBuf::from("/tmp/.vybrid"),

@@ -131,6 +131,23 @@ impl Conversation {
         self.pinned.insert("task_latest".into(), message);
     }
 
+    pub fn latest_task_text(&self) -> Option<String> {
+        self.pinned
+            .get("task_latest")
+            .and_then(|message| message.content.clone())
+    }
+
+    /// The user task before [`Self::latest_task_text`], when one exists.
+    pub fn previous_task_text(&self) -> Option<String> {
+        if self.next_task_id < 2 {
+            return None;
+        }
+        let key = format!("task_history:{:020}", self.next_task_id - 1);
+        self.pinned
+            .get(&key)
+            .and_then(|message| message.content.clone())
+    }
+
     /// Append a context revision only when it changes; never rewrite a live prefix.
     pub fn set_context_snapshot(&mut self, key: &str, content: &str) -> bool {
         if self.pinned.get(key).and_then(|m| m.content.as_deref()) == Some(content) {
@@ -431,6 +448,24 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(stored, &large);
+    }
+
+    #[test]
+    fn previous_task_text_is_the_prior_user_task() {
+        let mut conversation = Conversation::new("system");
+        assert!(conversation.previous_task_text().is_none());
+        conversation.add_task_message("plan the parser");
+        assert_eq!(
+            conversation.latest_task_text().as_deref(),
+            Some("plan the parser")
+        );
+        assert!(conversation.previous_task_text().is_none());
+        conversation.add_task_message("do it");
+        assert_eq!(conversation.latest_task_text().as_deref(), Some("do it"));
+        assert_eq!(
+            conversation.previous_task_text().as_deref(),
+            Some("plan the parser")
+        );
     }
 
     #[test]

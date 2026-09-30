@@ -170,14 +170,24 @@ async fn handle_openrouter_menu(
 ) -> Result<()> {
     loop {
         let items = vec![
-            "Add or update OpenRouter API key",
-            "Select model",
-            "Switch to OpenRouter",
-            "Refresh model catalog",
-            "Back",
+            "Add or update OpenRouter API key".to_string(),
+            "Select model".to_string(),
+            "Switch to OpenRouter".to_string(),
+            if config.jev_routing {
+                "Turn Jev routing off".to_string()
+            } else {
+                "Turn Jev routing on".to_string()
+            },
+            "Set Jev tier models".to_string(),
+            "Refresh model catalog".to_string(),
+            "Back".to_string(),
         ];
         let sel = Select::new()
-            .with_prompt(format!("OpenRouter (current: {})", config.openrouter_model))
+            .with_prompt(format!(
+                "OpenRouter (current: {}, jev {})",
+                config.openrouter_model,
+                if config.jev_routing { "on" } else { "off" }
+            ))
             .items(&items)
             .max_length(MENU_PAGE_SIZE)
             .default(0)
@@ -246,12 +256,86 @@ async fn handle_openrouter_menu(
                 }
             }
             3 => {
+                if config
+                    .openrouter_api_key
+                    .as_deref()
+                    .is_none_or(|key| key.trim().is_empty())
+                {
+                    ui::print_error("Add an OpenRouter API key first.");
+                    continue;
+                }
+                let enabled = !config.jev_routing;
+                config.set_jev_routing(enabled)?;
+                println!(
+                    "{}",
+                    style(format!(
+                        "Jev routing {} — VYBRID_JEV_ROUTING={} — settings:\n  {}",
+                        if enabled { "on" } else { "off" },
+                        if enabled { "on" } else { "off" },
+                        saved_env_locations(config)
+                    ))
+                    .green()
+                );
+                if enabled {
+                    println!(
+                        "{}",
+                        style(format!(
+                            "Each OpenRouter turn asks Jev, then uses a tier model. {} stays the fallback.",
+                            config.openrouter_model
+                        ))
+                        .dim()
+                    );
+                }
+            }
+            4 => {
+                handle_jev_tier_models(config).await?;
+                println!(
+                    "{}",
+                    style(format!(
+                        "Saved Jev tier models — settings:\n  {}",
+                        saved_env_locations(config)
+                    ))
+                    .green()
+                );
+            }
+            5 => {
                 clear_model_cache()?;
                 println!("{}", style("OpenRouter model cache cleared.").green());
             }
             _ => break,
         }
     }
+    Ok(())
+}
+
+async fn handle_jev_tier_models(config: &mut Config) -> Result<()> {
+    let prep: String = Input::new()
+        .with_prompt("Prep model (planning, review, research, deep preparation)")
+        .default(config.jev_model_prep.clone())
+        .interact_text()
+        .context("Prep model prompt cancelled")?;
+    config.set_jev_model_prep(prep)?;
+
+    let code: String = Input::new()
+        .with_prompt("Coding model (routine implement, debug, refactor)")
+        .default(config.jev_model_code.clone())
+        .interact_text()
+        .context("Coding model prompt cancelled")?;
+    config.set_jev_model_code(code)?;
+
+    let code_hard: String = Input::new()
+        .with_prompt("Hard coding model (involved coding, high risk, or deep preparation)")
+        .default(config.jev_model_code_hard.clone())
+        .interact_text()
+        .context("Hard coding model prompt cancelled")?;
+    config.set_jev_model_code_hard(code_hard)?;
+
+    let quick: String = Input::new()
+        .with_prompt("Quick model (chat and simple explanations)")
+        .default(config.jev_model_quick.clone())
+        .interact_text()
+        .context("Quick model prompt cancelled")?;
+    config.set_jev_model_quick(quick)?;
     Ok(())
 }
 

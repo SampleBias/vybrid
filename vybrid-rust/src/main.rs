@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, Tool, ToolCall, Usage};
+use crate::client::jev;
 use crate::config::{Config, LlmProvider};
 use crate::conversation::{Conversation, COMPACT_KEEP_RECENT};
 use crate::lsp::RustLspManager;
@@ -326,7 +327,10 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         let mut turn_state = TurnState::new(&config);
         let task_metrics = metrics::TaskMetrics::new();
         tool_runtime.task_id = Some(task_metrics.id.clone());
-        let task_client = c.with_task_id(&task_metrics.id);
+        let mut task_client = c.with_task_id(&task_metrics.id);
+        if config.jev_routing && matches!(config.llm_provider, LlmProvider::OpenRouter) {
+            task_client = route_openrouter_turn(&config, &conversation, task_client).await;
+        }
         let outcome = process_ai_response(
             &task_client,
             &mut conversation,
@@ -362,6 +366,49 @@ async fn read_stdin_line() -> io::Result<Option<String>> {
     })
     .await
     .unwrap_or_else(|e| Err(io::Error::other(format!("stdin task failed: {e}"))))
+}
+
+/// One Jev decision for this user turn. The returned client is used for the whole tool loop.
+async fn route_openrouter_turn(
+    config: &Config,
+    conversation: &Conversation,
+    client: GroqClient,
+) -> GroqClient {
+    let mut spinner = ui::SpinnerGuard::new("jev");
+    let latest = conversation.latest_task_text().unwrap_or_default();
+    let previous = conversation.previous_task_text();
+    let routed = jev::route_turn(
+        config.openrouter_api_key.as_deref().unwrap_or(""),
+        &latest,
+        previous.as_deref(),
+        &config.jev_tier_models(),
+        config.openrouter_model.trim(),
+    )
+    .await;
+    spinner.finish().await;
+    match routed {
+        Ok(choice) => {
+            let line = style(choice.status_line());
+            if choice.is_fallback() {
+                println!("{}", line.yellow());
+            } else {
+                println!("{}", line.dim());
+            }
+            client.with_model(choice.model)
+        }
+        Err(error) => {
+            println!(
+                "{}",
+                style(format!(
+                    "jev → pinned {} ({})",
+                    client.model(),
+                    jev::brief_error(&error)
+                ))
+                .yellow()
+            );
+            client
+        }
+    }
 }
 
 fn llm_spinner_label(provider: LlmProvider) -> &'static str {
