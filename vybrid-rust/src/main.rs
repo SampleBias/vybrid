@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 use crate::client::groq::{GroqClient, Message, Tool, ToolCall, Usage};
+use crate::client::groq_models::{self, GroqModel};
 use crate::client::jev;
 use crate::config::{Config, LlmProvider};
 use crate::conversation::{Conversation, COMPACT_KEEP_RECENT};
@@ -317,20 +318,50 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
 
         // Process with AI
         let spinner_label = llm_spinner_label(config.llm_provider);
-        let mut route_state = RouteState::new(
-            matches!(config.llm_provider, LlmProvider::Groq),
-            config.groq_rate_limit_fallback_model.clone(),
-            config.groq_compound_model.clone(),
-            config.groq_compound_mini_model.clone(),
-            config.compound_enabled,
-        );
         let mut turn_state = TurnState::new(&config);
         let task_metrics = metrics::TaskMetrics::new();
         tool_runtime.task_id = Some(task_metrics.id.clone());
         let mut task_client = c.with_task_id(&task_metrics.id);
-        if config.jev_routing && matches!(config.llm_provider, LlmProvider::OpenRouter) {
-            task_client = route_openrouter_turn(&config, &conversation, task_client).await;
+        let groq_catalog = if matches!(config.llm_provider, LlmProvider::Groq) {
+            let mut spinner = ui::SpinnerGuard::status("models");
+            let models =
+                groq_models::fetch_models(config.groq_api_key.as_deref().unwrap_or(""), false)
+                    .await;
+            spinner.finish().await;
+            models.ok()
+        } else {
+            None
+        };
+        if config.jev_enabled() {
+            task_client =
+                route_cloud_turn(&config, &conversation, task_client, groq_catalog.as_deref())
+                    .await;
         }
+        let fallback = groq_models::fallback_model(
+            groq_catalog.as_deref(),
+            &config.groq_rate_limit_fallback_model,
+            &config.groq_model,
+            task_client.model(),
+        );
+        let has_alternative = fallback != task_client.model();
+        if matches!(config.llm_provider, LlmProvider::Groq) && !has_alternative {
+            task_client = task_client.with_rate_limit_wait();
+        }
+        let mut route_state = RouteState::new(
+            matches!(config.llm_provider, LlmProvider::Groq) && has_alternative,
+            fallback,
+            config.groq_compound_model.clone(),
+            config.groq_compound_mini_model.clone(),
+            config.compound_enabled
+                && groq_catalog.as_ref().is_some_and(|models| {
+                    [
+                        &config.groq_compound_model,
+                        &config.groq_compound_mini_model,
+                    ]
+                    .iter()
+                    .all(|id| models.iter().any(|m| m.active && &m.id == *id))
+                }),
+        );
         let outcome = process_ai_response(
             &task_client,
             &mut conversation,
@@ -369,22 +400,36 @@ async fn read_stdin_line() -> io::Result<Option<String>> {
 }
 
 /// One Jev decision for this user turn. The returned client is used for the whole tool loop.
-async fn route_openrouter_turn(
+async fn route_cloud_turn(
     config: &Config,
     conversation: &Conversation,
     client: GroqClient,
+    groq_catalog: Option<&[GroqModel]>,
 ) -> GroqClient {
     let mut spinner = ui::SpinnerGuard::status("jev");
     let latest = conversation.latest_task_text().unwrap_or_default();
     let previous = conversation.previous_task_text();
-    let routed = jev::route_turn(
-        config.openrouter_api_key.as_deref().unwrap_or(""),
-        &latest,
-        previous.as_deref(),
-        &config.jev_tier_models(),
-        config.openrouter_model.trim(),
-    )
-    .await;
+    let api_key = config.openrouter_api_key.as_deref().unwrap_or("");
+    let routed = if matches!(config.llm_provider, LlmProvider::Groq) {
+        jev::classify_turn(
+            api_key,
+            &latest,
+            previous.as_deref(),
+            &config.groq_jev_models,
+            client.model(),
+        )
+        .await
+        .map(|choice| jev::apply_groq_catalog(choice, groq_catalog, client.model()))
+    } else {
+        jev::route_turn(
+            api_key,
+            &latest,
+            previous.as_deref(),
+            &config.jev_tier_models(),
+            client.model(),
+        )
+        .await
+    };
     spinner.finish().await;
     match routed {
         Ok(choice) => {
@@ -635,6 +680,19 @@ fn is_retryable_groq_stream_error(e: &anyhow::Error) -> bool {
         || is_failed_generation_error(e)
 }
 
+fn is_unavailable_model_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("model_not_found")
+        || message.contains("model_decommissioned")
+        || message.contains("does not support tool")
+        || (message.contains("model")
+            && (message.contains("decommissioned")
+                || message.contains("does not exist")
+                || message.contains("do not have access")
+                || message.contains("403 forbidden")
+                || message.contains("api error (403)")))
+}
+
 fn is_failed_generation_error(e: &anyhow::Error) -> bool {
     let s = e.to_string().to_ascii_lowercase();
     s.contains("failed_generation")
@@ -870,6 +928,20 @@ async fn process_ai_response(
             Ok(s) => s,
             Err(e) => {
                 dismiss_spinner(&mut spinner).await;
+                if attempt < MAX_STREAM_ATTEMPTS
+                    && is_unavailable_model_error(&e)
+                    && route_state.route_preflight_wait()
+                {
+                    println!(
+                        "{}",
+                        style(format!(
+                            "Groq model unavailable; using {} with local tools.",
+                            route_state.route_label(client)
+                        ))
+                        .yellow()
+                    );
+                    continue 'stream;
+                }
                 if is_preflight_route_error(&e) {
                     if route_state.route_preflight_wait() {
                         println!(
@@ -1021,6 +1093,21 @@ async fn process_ai_response(
                 Err(e) => {
                     dismiss_spinner(&mut spinner).await;
                     println!();
+                    if attempt < MAX_STREAM_ATTEMPTS
+                        && !content_started
+                        && is_unavailable_model_error(&e)
+                        && route_state.route_preflight_wait()
+                    {
+                        println!(
+                            "{}",
+                            style(format!(
+                                "Groq model unavailable; using {} with local tools.",
+                                route_state.route_label(client)
+                            ))
+                            .yellow()
+                        );
+                        continue 'stream;
+                    }
                     if attempt < MAX_STREAM_ATTEMPTS && is_rate_limit_error(&e) && !content_started
                     {
                         let delay = rate_limit_retry_delay(&e);
@@ -2019,6 +2106,28 @@ async fn summarize_conversation(
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn only_model_availability_errors_trigger_model_fallback() {
+        for message in [
+            "API error: model_not_found",
+            "model_decommissioned",
+            "API error (403): model permission denied",
+            "This model does not support tools",
+            "The model has been decommissioned and is no longer supported",
+            "The model does not exist or you do not have access to it",
+        ] {
+            assert!(is_unavailable_model_error(&anyhow::anyhow!(message)));
+        }
+        for message in [
+            "API error (401): invalid API key",
+            "429 rate limit",
+            "invalid tool arguments",
+            "Rate limit on model: used 403 tokens",
+        ] {
+            assert!(!is_unavailable_model_error(&anyhow::anyhow!(message)));
+        }
+    }
 
     #[test]
     fn local_tool_turns_never_fall_back_to_a_tool_free_route() {

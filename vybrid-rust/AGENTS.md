@@ -118,6 +118,12 @@ Use **`/menu`** or create env files manually. Saves go to **`~/.vybrid/.env`** a
 ```bash
 GROQ_API_KEY=your_api_key_here       # Required for AI chat — Groq API key
 # GROQ_MODEL=openai/gpt-oss-120b     # Optional — defaults to openai/gpt-oss-120b
+# VYBRID_GROQ_JEV_ROUTING=off      # Optional — Jev decides, Groq handles chat
+# OPENROUTER_API_KEY=...           # Required only for Jev decisions on Groq
+# VYBRID_GROQ_JEV_MODEL_PREP=openai/gpt-oss-120b
+# VYBRID_GROQ_JEV_MODEL_CODE=openai/gpt-oss-20b
+# VYBRID_GROQ_JEV_MODEL_CODE_HARD=openai/gpt-oss-120b
+# VYBRID_GROQ_JEV_MODEL_QUICK=openai/gpt-oss-20b
 
 # Optional
 SERPAPI_KEY=your_serpapi_key_here    # Optional — Google search (google_search tool)
@@ -351,6 +357,9 @@ The system provides these tools to the AI:
 ## API Integration
 
 ### Groq OpenAI-compatible Chat Completions (`openai/gpt-oss-120b`)
+- Groq model search/picking lives in `menu.rs` and `client/groq_models.rs`. The authenticated catalog is cached for six hours per credential. The list API does not advertise local tool support; update the explicit compatibility registry when verifying a new model. Audio, guard, inactive, and unknown models are not selectable for coding.
+- Groq Jev routing uses independent `VYBRID_GROQ_JEV_*` settings. `OPENROUTER_API_KEY` is only used for the Jev decision; the routed chat client retains Groq's endpoint, API key, tool schema, and shared rate tracking. Validate tier IDs against the Groq catalog; missing/invalid decisions or unavailable catalogs keep `GROQ_MODEL`. OpenRouter's existing `VYBRID_JEV_*` settings remain independent.
+- Groq's rate-limit fallback defaults to `openai/gpt-oss-20b`, validated against the catalog. Skip the primary, unavailable IDs, and incompatible models; wait on the primary if no verified alternative exists. Legacy Compound routes are disabled by default and gated on live catalog presence.
 - Base URL: `https://api.groq.com/openai/v1` ([OpenAI compatibility](https://console.groq.com/docs/openai))
 - Endpoint: `/chat/completions`
 - Headers:
@@ -360,7 +369,7 @@ The system provides these tools to the AI:
 - Default model: `openai/gpt-oss-120b` (optional override: env `GROQ_MODEL`)
 - Max completion tokens: 8192 default (`VYBRID_MAX_COMPLETION_TOKENS`); compaction requests use 2048. Sent as `max_completion_tokens` to Groq and `max_tokens` to other compatible servers.
 - Temperature: 0.3 default (`VYBRID_TEMPERATURE`); low temperature reduces malformed tool-call JSON
-- Optional `reasoning_effort` (`VYBRID_REASONING_EFFORT`): `low`/`medium`/`high` for GPT-OSS, `none`/`default` for Qwen3 — only sent when the active model supports the configured value
+- Optional `reasoning_effort` (`VYBRID_REASONING_EFFORT`): `low`/`medium`/`high` for GPT-OSS, Qwen 3.8, and Muse Spark Open; `none`/`default` also supported by Qwen3 — only sent when the active model supports the configured value
 - Groq `service_tier` (`VYBRID_GROQ_SERVICE_TIER`, default `auto`) — Groq-only request field
 - Request body: OpenAI-compatible (`model`, `messages`, `tools`, `tool_choice`, `stream`, `max_completion_tokens`/`max_tokens`, `temperature`, optional `reasoning_effort`, `service_tier`) — do not send unsupported fields ([compatibility](https://console.groq.com/docs/openai))
 - Delta may include `reasoning_content` on some models; Groq may omit it

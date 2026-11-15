@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+use super::groq_models::{self, GroqModel};
 use super::openrouter::{fetch_models, ModelQuery, OpenRouterModel};
 
 const DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
@@ -17,7 +18,7 @@ const PRIOR_TASK_MAX_CHARS: usize = 2_000;
 /// Latest task at or below this length is treated as a follow-up.
 const FOLLOW_UP_MAX_CHARS: usize = 80;
 
-/// Below this `task_kind` confidence, keep the pinned OpenRouter model.
+/// Below this `task_kind` confidence, keep the active provider's pinned model.
 pub const CONFIDENCE_FLOOR: f64 = 0.45;
 /// Score index 1 is routine and 2 is involved. At or past the midpoint, coding
 /// work uses the harder coding model and chat/explain uses the prep model.
@@ -151,6 +152,27 @@ pub fn apply_catalog(choice: RouteChoice, fit: CatalogFit, pinned_model: &str) -
     }
 }
 
+/// Groq has no OpenRouter aliases or tool-capability flags. Only select a tier
+/// that is present, active, and known to support the agent's local tools.
+pub fn apply_groq_catalog(
+    choice: RouteChoice,
+    models: Option<&[GroqModel]>,
+    pinned: &str,
+) -> RouteChoice {
+    if choice.is_fallback() {
+        return choice;
+    }
+    let Some(models) = models else {
+        return fallback_choice(pinned, Some("Groq catalog unavailable"));
+    };
+    let fit = match models.iter().find(|m| m.id == choice.model && m.active) {
+        Some(model) if groq_models::supports_local_tools(&model.id) => CatalogFit::Usable,
+        Some(_) => CatalogFit::NoTools,
+        None => CatalogFit::Missing,
+    };
+    apply_catalog(choice, fit, pinned)
+}
+
 pub fn parse_judgment(body: &Value) -> Result<Judgment> {
     let answers = body
         .get("answers")
@@ -209,11 +231,7 @@ pub async fn route_turn(
     pinned: &str,
 ) -> Result<RouteChoice> {
     let api_key = api_key.trim();
-    if api_key.is_empty() {
-        anyhow::bail!("OpenRouter API key is missing");
-    }
-    let judgment = judge(api_key, &task_state(latest_task, previous_task)).await?;
-    let choice = select_tier(&judgment, tiers, pinned);
+    let choice = classify_turn(api_key, latest_task, previous_task, tiers, pinned).await?;
     if choice.is_fallback() {
         return Ok(choice);
     }
@@ -224,7 +242,28 @@ pub async fn route_turn(
     Ok(apply_catalog(choice, fit, pinned))
 }
 
+/// Provider-independent classification. The caller validates the selected ID
+/// against the chat provider's catalog; this request always uses OpenRouter.
+pub async fn classify_turn(
+    api_key: &str,
+    latest_task: &str,
+    previous_task: Option<&str>,
+    tiers: &TierModels,
+    pinned: &str,
+) -> Result<RouteChoice> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        anyhow::bail!("OpenRouter API key is missing");
+    }
+    let judgment = judge(api_key, &task_state(latest_task, previous_task)).await?;
+    Ok(select_tier(&judgment, tiers, pinned))
+}
+
 async fn judge(api_key: &str, state: &Value) -> Result<Judgment> {
+    judge_at(api_key, state, DECISIONS_URL).await
+}
+
+async fn judge_at(api_key: &str, state: &Value, endpoint: &str) -> Result<Judgment> {
     let client = reqwest::Client::builder()
         .timeout(DECISION_TIMEOUT)
         .build()
@@ -235,7 +274,7 @@ async fn judge(api_key: &str, state: &Value) -> Result<Judgment> {
         "questions": questions(),
     });
     let response = client
-        .post(DECISIONS_URL)
+        .post(endpoint)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .header("HTTP-Referer", "https://github.com/SampleBias/vybrid")
@@ -537,5 +576,120 @@ mod tests {
         assert_eq!(questions["consequence"]["type"], "noul");
         assert!(DECISIONS_URL.contains("openrouter.ai/api/alpha/decisions"));
         assert_eq!(JEV_MODEL, "~typesafe/jev-latest");
+    }
+
+    #[test]
+    fn groq_routes_difficulty_using_its_own_models() {
+        let tiers = TierModels {
+            prep: "openai/gpt-oss-120b".into(),
+            code: "openai/gpt-oss-20b".into(),
+            code_hard: "openai/gpt-oss-120b".into(),
+            quick: "openai/gpt-oss-20b".into(),
+        };
+        let models: Vec<GroqModel> = serde_json::from_value(json!([
+            {"id":"openai/gpt-oss-120b"}, {"id":"openai/gpt-oss-20b"}
+        ]))
+        .unwrap();
+        for (kind, complexity, expected) in [
+            ("chat", 0.1, "openai/gpt-oss-20b"),
+            ("implement", 1.0, "openai/gpt-oss-20b"),
+            ("debug", 2.5, "openai/gpt-oss-120b"),
+            ("review", 1.0, "openai/gpt-oss-120b"),
+        ] {
+            let choice = select_tier(&judgment(kind, 0.9, complexity, 0.1, 0.1), &tiers, "pinned");
+            assert_eq!(
+                apply_groq_catalog(choice, Some(&models), "pinned").model,
+                expected
+            );
+        }
+        let choice = select_tier(&judgment("chat", 0.1, 0.1, 0.1, 0.1), &tiers, "pinned");
+        assert_eq!(
+            apply_groq_catalog(choice, Some(&models), "pinned").model,
+            "pinned"
+        );
+    }
+
+    #[test]
+    fn groq_catalog_rejects_aliases_inactive_unknown_and_missing_models() {
+        let models: Vec<GroqModel> = serde_json::from_value(json!([
+            {"id":"openai/gpt-oss-20b", "active":false},
+            {"id":"whisper-large-v3"}, {"id":"unknown/model"}
+        ]))
+        .unwrap();
+        for id in [
+            "~anthropic/claude-opus-latest",
+            "openai/gpt-oss-20b",
+            "whisper-large-v3",
+            "unknown/model",
+            "missing",
+        ] {
+            let route = apply_groq_catalog(choice("code", id), Some(&models), "groq-pinned");
+            assert!(route.is_fallback());
+            assert_eq!(route.model, "groq-pinned");
+        }
+        let route = apply_groq_catalog(choice("code", "openai/gpt-oss-20b"), None, "groq-pinned");
+        assert_eq!(route.note, Some("Groq catalog unavailable"));
+    }
+
+    #[tokio::test]
+    async fn missing_decision_key_does_not_make_a_request() {
+        let error = classify_turn(" ", "task", None, &tiers(), "pinned")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("OpenRouter API key"));
+    }
+
+    #[tokio::test]
+    async fn jev_decision_uses_only_the_openrouter_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/api/alpha/decisions",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                let (headers, payload) = loop {
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length: usize = headers.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                        }).unwrap();
+                        if request.len() >= end + 4 + length {
+                            break (headers, serde_json::from_slice::<Value>(&request[end + 4..end + 4 + length]).unwrap());
+                        }
+                    }
+                };
+                let body = json!({"answers": {
+                    "task_kind":{"choice":"implement", "confidence":0.9}, "complexity":{"score":1.0},
+                    "deep_preparation":{"noul":0.1}, "consequence":{"noul":0.1}
+                }}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                (headers, payload)
+            }).await.unwrap()
+        });
+        let decision = judge_at(
+            "openrouter-test-key",
+            &task_state("do it", Some("add a parser")),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decision.task_kind, "implement");
+        let (headers, payload) = server.await.unwrap();
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer openrouter-test-key"));
+        assert!(!headers.contains("groq-test-key"));
+        assert_eq!(payload["model"], JEV_MODEL);
+        assert_eq!(payload["state"]["prior_task"], "add a parser");
+        assert!(payload.get("messages").is_none());
     }
 }

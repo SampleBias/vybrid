@@ -11,7 +11,7 @@ AI powered coding assistant built from the trenches with Rust to save humanity f
 ## Features
 
 - **Multi-Provider LLM**: Groq (default), [OpenRouter](https://openrouter.ai/) (400+ cloud models), or local [LM Studio](https://lmstudio.ai/)
-- **Jev model routing**: Optional OpenRouter path that asks [Jev](https://openrouter.ai/docs/guides/community/jev) what kind of task you sent, then runs that turn on a prep, coding, or cheap chat model. See [Jev model routing](#jev-model-routing)
+- **Jev model routing**: Optional routing for Groq and OpenRouter that asks [Jev](https://openrouter.ai/docs/guides/community/jev) what kind of task you sent, then chooses a preparation, coding, or quick response model from that provider. See [Jev model routing](#jev-model-routing)
 - **Agent Mode**: Full AI Engineer with file operations, shell commands, and web search
 - **Agent Skills**: Pi-compatible [Agent Skills](https://agentskills.io/specification) — on-demand `SKILL.md` workflows discovered from `~/.vybrid/skills/`, `.vybrid/skills/`, and shared `~/.agents/skills/` paths
 - **Context Compaction**: `/compact` summarizes older conversation history via the LLM to free context; passive overflow compaction still applies automatically during long sessions
@@ -87,8 +87,14 @@ Keys are loaded from **`~/.vybrid/.env`** first, then **`vybrid-rust/.env`** (pr
 GROQ_API_KEY=your_api_key_here
 # Optional: override model (default is openai/gpt-oss-120b)
 # GROQ_MODEL=openai/gpt-oss-120b
-# Optional: current-response fallback after two OSS120B rate-limit waits
-# GROQ_RATE_LIMIT_FALLBACK_MODEL=qwen/qwen3-32b
+# Optional: verified fallback when the primary model would wait or is unavailable
+# GROQ_RATE_LIMIT_FALLBACK_MODEL=openai/gpt-oss-20b
+# Optional: Jev chooses among Groq models. Requires OPENROUTER_API_KEY for decisions.
+# VYBRID_GROQ_JEV_ROUTING=off
+# VYBRID_GROQ_JEV_MODEL_PREP=openai/gpt-oss-120b
+# VYBRID_GROQ_JEV_MODEL_CODE=openai/gpt-oss-20b
+# VYBRID_GROQ_JEV_MODEL_CODE_HARD=openai/gpt-oss-120b
+# VYBRID_GROQ_JEV_MODEL_QUICK=openai/gpt-oss-20b
 # Optional: sampling temperature 0.0–2.0 (default 0.3; low improves tool-call reliability)
 # VYBRID_TEMPERATURE=0.3
 # Optional: GPT-OSS reasoning effort low|medium|high (unset = provider default, medium).
@@ -131,6 +137,16 @@ If you run a compiled binary from a different path, set **`VYBRID_ROOT`** to the
 
 Create a Groq key in the [Groq Console](https://console.groq.com/keys). For OpenRouter, get a key at [openrouter.ai/keys](https://openrouter.ai/keys) and pick a model via **`/menu`** (see [OpenRouter (cloud, multi-provider)](#openrouter-cloud-multi-provider)). For LM Studio, use **`/menu`** → **LM Studio** or set the variables above; see [LM Studio (local, offline)](#lm-studio-local-offline).
 
+### Groq (cloud)
+
+Run **`/menu` → Groq → Select model** to browse recommended coding models, search by model ID/name, or browse by model author. The picker fetches the authenticated Groq catalog from `https://api.groq.com/openai/v1/models`. Selecting a model saves `GROQ_MODEL` in both env files. It does not switch the active provider; use **Switch to Groq** when needed.
+
+Catalogs are cached for six hours under `~/.vybrid/cache/groq_*.json`, scoped to the Groq credential without storing the credential. **Refresh model catalog** fetches a new catalog immediately. A corrupt or unwritable cache does not prevent a fresh API lookup.
+
+Recommended, search, and author views include active chat models with verified support for local function calling. The advanced catalog also displays speech, moderation, inactive, and unknown models, marks them as unsuitable or unverified for coding, and prevents selecting them. Groq's list endpoint does not advertise tool capability; compatibility is maintained explicitly in `src/client/groq_models.rs`. New model IDs need verification before they appear as coding choices.
+
+Groq Jev routing is configured in the same menu. Add an **OpenRouter key for Jev decisions**, choose **Set Jev tier models**, then **Turn Jev routing on**. Jev decisions are billed through OpenRouter, while all chat requests use your Groq API key and Groq endpoint. With just a Groq key, model search and manual selection work normally.
+
 ### OpenRouter (cloud, multi-provider)
 
 Vybrid talks to [OpenRouter](https://openrouter.ai/) through its **OpenAI-compatible** API at `https://openrouter.ai/api/v1/chat/completions` — the same chat flow as Groq and LM Studio, with access to hundreds of models from Anthropic, OpenAI, Google, Meta, DeepSeek, and others.
@@ -158,9 +174,9 @@ Vybrid only sends tool calls to models that support the `tools` parameter. The r
 
 ### Jev model routing
 
-Jev routing is an optional OpenRouter feature. It is off until you turn it on. Groq and LM Studio never use it.
+Jev routing is optional for Groq and OpenRouter, with independent toggles and tier models. Both are off until enabled. LM Studio uses its selected local model directly.
 
-[Jev](https://openrouter.ai/docs/guides/community/jev) (`~typesafe/jev-latest`) is a decision model, not the model that writes code. Vybrid sends it the user task and four typed questions through the OpenRouter Decisions API (`POST https://openrouter.ai/api/alpha/decisions`), using the same `OPENROUTER_API_KEY`. Jev returns a task kind, a difficulty score, and probabilities. Vybrid's own rules then pick one tool-capable chat model and keep that model for the whole turn, including tool rounds, retries, and compaction. The judgment is printed in the terminal and is not added to the conversation, so it does not spend chat-model context.
+[Jev](https://openrouter.ai/docs/guides/community/jev) (`~typesafe/jev-latest`) is a decision model. Vybrid sends it the user task and four typed questions through the OpenRouter Decisions API (`POST https://openrouter.ai/api/alpha/decisions`), using `OPENROUTER_API_KEY`. Jev returns a task kind, a difficulty score, and probabilities. Vybrid maps these to a tool-capable model from the active provider's tier settings. That model handles the turn's tool rounds and compaction, with Groq's separate availability/rate-limit fallback policy still applying. The judgment is printed in the terminal and is not added to the conversation, so it does not spend chat-model context.
 
 #### Turn it on
 
@@ -177,22 +193,39 @@ VYBRID_JEV_ROUTING=on
 
 #### Where a prompt goes
 
+For Groq, enable **`/menu` → Groq → Turn Jev routing on**, or set:
+
+```bash
+VYBRID_LLM_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-120b
+OPENROUTER_API_KEY=your_openrouter_api_key_here
+VYBRID_GROQ_JEV_ROUTING=on
+```
+
+Groq tier defaults are independently configurable through the Groq model picker:
+
+| Tier | Env variable | Default Groq model |
+| --- | --- | --- |
+| Prep | `VYBRID_GROQ_JEV_MODEL_PREP` | `openai/gpt-oss-120b` |
+| Code | `VYBRID_GROQ_JEV_MODEL_CODE` | `openai/gpt-oss-20b` |
+| Code-hard | `VYBRID_GROQ_JEV_MODEL_CODE_HARD` | `openai/gpt-oss-120b` |
+| Quick | `VYBRID_GROQ_JEV_MODEL_QUICK` | `openai/gpt-oss-20b` |
+
 ```mermaid
 flowchart TD
   prompt[You send a task]
   provider{Active provider}
-  groq[Groq chat model]
   localModel[LM Studio model]
-  jevOn{Jev routing on?}
-  pinned[Pinned OPENROUTER_MODEL]
-  decisions["Jev: one Decisions API call"]
-  policy[Vybrid maps the judgment to a tier]
-  loop[Agent tool loop stays on that model]
+  jevOn{Jev enabled for active provider?}
+  pinned[Pinned GROQ_MODEL or OPENROUTER_MODEL]
+  decisions["Jev: one OpenRouter Decisions API call"]
+  policy[Choose a tier from the active provider's models]
+  loop[Agent tool loop on active provider]
 
   prompt --> provider
-  provider -->|Groq| groq --> loop
   provider -->|LM Studio| localModel --> loop
-  provider -->|OpenRouter| jevOn
+  provider -->|Groq or OpenRouter| jevOn
   jevOn -->|"off, timeout, or low confidence"| pinned --> loop
   jevOn -->|on| decisions --> policy --> loop
 ```
@@ -227,7 +260,7 @@ flowchart TD
   codeHard[Code-hard model]
   explainCheck{Hard to explain?}
   quick[Quick model]
-  pinnedModel[Pinned OPENROUTER_MODEL]
+  pinnedModel[Pinned model for active provider]
 
   kind -->|"plan, review, or research"| prep
   kind -->|"implement, debug, or refactor"| codeCheck
@@ -248,7 +281,11 @@ Coding work is hard when complexity is at least halfway from routine toward invo
 | Code-hard | `VYBRID_JEV_MODEL_CODE_HARD` | `openai/gpt-5.3-codex` | Involved or architectural coding, high-risk changes, or coding that still needs deep preparation |
 | Quick | `VYBRID_JEV_MODEL_QUICK` | `~google/gemini-flash-latest` | Chat and simple explanations |
 
-A concrete model id is checked against the cached OpenRouter catalog. If it is missing, or it cannot take tools, Vybrid uses `OPENROUTER_MODEL` instead. Ids that start with `~` are OpenRouter aliases and are accepted without that catalog check. If the catalog request itself fails, the tier model is still used. Any Jev error, timeout, task-kind confidence below 0.45, or an unrecognized task kind also stays on `OPENROUTER_MODEL`.
+For OpenRouter, a concrete model id is checked against its cached catalog. If it is missing or cannot take tools, Vybrid uses `OPENROUTER_MODEL`. IDs starting with `~` are OpenRouter aliases and are accepted without that catalog check. If the OpenRouter catalog request fails, the tier model is still used.
+
+For Groq, every tier ID must be active in the Groq catalog and verified for local tool calling. OpenRouter aliases are invalid on Groq. If discovery fails, the tier is unavailable/incompatible, the decision key is missing, or Jev fails, Vybrid uses `GROQ_MODEL`. Low confidence and unknown task kinds also use the pinned model for either provider.
+
+Groq's availability/rate-limit fallback validates candidates against the same catalog, preferring `GROQ_RATE_LIMIT_FALLBACK_MODEL`, then the pinned Groq model, then the supported GPT-OSS alternatives. It skips the current model and incompatible or absent IDs. Without a verified alternative, Vybrid waits/retries on the current model. This replaces the retired default Qwen fallback with `openai/gpt-oss-20b`. Legacy Compound routing is disabled by default and requires both configured IDs to be active in the catalog when explicitly enabled; it never takes local tools away from an active coding turn.
 
 ### LM Studio (local, offline)
 
@@ -463,7 +500,7 @@ The setup menu is organized by provider so long model lists stay manageable:
 
 | Submenu | What it configures |
 |---------|-------------------|
-| **Groq** | API key, quick setup with optional SerpAPI, switch active provider |
+| **Groq** | API key, model search/selection, catalog refresh, Jev toggle and tier models, OpenRouter decision key, switch active provider |
 | **OpenRouter** | API key, tiered model picker, switch provider, refresh model cache |
 | **LM Studio** | Local server URL, API token, model id |
 | **SerpAPI** | Google search key for the `google_search` tool |
@@ -508,6 +545,7 @@ vybrid-rust/
 │   ├── ui.rs           # Terminal UI helpers
 │   ├── client/
 │   │   ├── groq.rs     # OpenAI-compatible chat client (Groq, OpenRouter, LM Studio)
+│   │   ├── groq_models.rs # Groq catalog, coding compatibility, search, and cache
 │   │   └── openrouter.rs # OpenRouter models catalog API
 │   ├── tools/
 │   │   ├── definitions.rs  # Tool schemas

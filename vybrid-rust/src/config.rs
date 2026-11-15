@@ -18,7 +18,9 @@ pub const DEFAULT_JEV_MODEL_PREP: &str = "~anthropic/claude-opus-latest";
 pub const DEFAULT_JEV_MODEL_CODE: &str = "moonshotai/kimi-k2.7-code";
 pub const DEFAULT_JEV_MODEL_CODE_HARD: &str = "openai/gpt-5.3-codex";
 pub const DEFAULT_JEV_MODEL_QUICK: &str = "~google/gemini-flash-latest";
-pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = "qwen/qwen3-32b";
+pub const DEFAULT_GROQ_MODEL: &str = "openai/gpt-oss-120b";
+pub const DEFAULT_GROQ_FAST_MODEL: &str = "openai/gpt-oss-20b";
+pub const DEFAULT_GROQ_RATE_LIMIT_FALLBACK_MODEL: &str = DEFAULT_GROQ_FAST_MODEL;
 pub const DEFAULT_GROQ_COMPOUND_MODEL: &str = "groq/compound";
 pub const DEFAULT_GROQ_COMPOUND_MINI_MODEL: &str = "groq/compound-mini";
 pub const DEFAULT_GROQ_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
@@ -78,6 +80,8 @@ pub struct Config {
     pub llm_provider: LlmProvider,
     pub groq_api_key: Option<String>,
     pub groq_model: String,
+    pub groq_jev_routing: bool,
+    pub groq_jev_models: crate::client::jev::TierModels,
     pub groq_rate_limit_fallback_model: String,
     pub groq_compound_model: String,
     pub groq_compound_mini_model: String,
@@ -108,7 +112,7 @@ pub struct Config {
     pub retry_context_token_budget: u32,
     pub max_completion_tokens: u32,
     pub temperature: f32,
-    /// `VYBRID_REASONING_EFFORT` — `low`/`medium`/`high` (GPT-OSS) or `none`/`default` (Qwen3).
+    /// `VYBRID_REASONING_EFFORT` — supported values depend on the routed model.
     /// Unset means the provider default (medium for GPT-OSS).
     pub reasoning_effort: Option<String>,
     /// `VYBRID_GROQ_SERVICE_TIER` — `auto`, `on_demand`, `flex`, or `performance`.
@@ -147,8 +151,17 @@ impl Config {
 
         let serpapi_key = std::env::var("SERPAPI_KEY").ok();
 
-        let groq_model =
-            std::env::var("GROQ_MODEL").unwrap_or_else(|_| "openai/gpt-oss-120b".to_string());
+        let groq_model = env_string_or("GROQ_MODEL", DEFAULT_GROQ_MODEL);
+        let groq_jev_routing = std::env::var("VYBRID_GROQ_JEV_ROUTING")
+            .ok()
+            .map(|s| parse_bool_env(&s))
+            .unwrap_or(false);
+        let groq_jev_models = crate::client::jev::TierModels {
+            prep: env_string_or("VYBRID_GROQ_JEV_MODEL_PREP", DEFAULT_GROQ_MODEL),
+            code: env_string_or("VYBRID_GROQ_JEV_MODEL_CODE", DEFAULT_GROQ_FAST_MODEL),
+            code_hard: env_string_or("VYBRID_GROQ_JEV_MODEL_CODE_HARD", DEFAULT_GROQ_MODEL),
+            quick: env_string_or("VYBRID_GROQ_JEV_MODEL_QUICK", DEFAULT_GROQ_FAST_MODEL),
+        };
         let groq_rate_limit_fallback_model = std::env::var("GROQ_RATE_LIMIT_FALLBACK_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
@@ -167,7 +180,7 @@ impl Config {
         let compound_enabled = std::env::var("VYBRID_ENABLE_COMPOUND")
             .ok()
             .map(|s| parse_bool_env(&s))
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         let lm_studio_base_url = std::env::var("LM_STUDIO_BASE_URL")
             .ok()
@@ -247,6 +260,8 @@ impl Config {
             llm_provider,
             groq_api_key,
             groq_model,
+            groq_jev_routing,
+            groq_jev_models,
             groq_rate_limit_fallback_model,
             groq_compound_model,
             groq_compound_mini_model,
@@ -389,6 +404,45 @@ impl Config {
         self.groq_api_key = Some(key);
         self.set_llm_provider(LlmProvider::Groq)?;
         Ok(())
+    }
+
+    pub fn set_groq_model(&mut self, model: String) -> Result<()> {
+        self.groq_model = self.persist_model_slot("GROQ_MODEL", model)?;
+        Ok(())
+    }
+
+    pub fn set_groq_jev_routing(&mut self, enabled: bool) -> Result<()> {
+        let value = if enabled { "on" } else { "off" };
+        self.persist_env_key("VYBRID_GROQ_JEV_ROUTING", value)?;
+        std::env::set_var("VYBRID_GROQ_JEV_ROUTING", value);
+        self.groq_jev_routing = enabled;
+        Ok(())
+    }
+
+    pub fn set_groq_jev_models(&mut self, models: crate::client::jev::TierModels) -> Result<()> {
+        if [&models.prep, &models.code, &models.code_hard, &models.quick]
+            .iter()
+            .any(|m| m.trim().is_empty())
+        {
+            anyhow::bail!("Groq Jev tier model IDs must not be empty.");
+        }
+        self.groq_jev_models.prep =
+            self.persist_model_slot("VYBRID_GROQ_JEV_MODEL_PREP", models.prep)?;
+        self.groq_jev_models.code =
+            self.persist_model_slot("VYBRID_GROQ_JEV_MODEL_CODE", models.code)?;
+        self.groq_jev_models.code_hard =
+            self.persist_model_slot("VYBRID_GROQ_JEV_MODEL_CODE_HARD", models.code_hard)?;
+        self.groq_jev_models.quick =
+            self.persist_model_slot("VYBRID_GROQ_JEV_MODEL_QUICK", models.quick)?;
+        Ok(())
+    }
+
+    pub fn jev_enabled(&self) -> bool {
+        match self.llm_provider {
+            LlmProvider::Groq => self.groq_jev_routing,
+            LlmProvider::OpenRouter => self.jev_routing,
+            LlmProvider::LmStudio => false,
+        }
     }
 
     /// Writes or updates `VYBRID_LLM_PROVIDER` (`groq`, `lmstudio`, or `openrouter`).
@@ -614,7 +668,8 @@ fn parse_u32_env(key: &str, default: u32) -> u32 {
 /// Whether the active model accepts `low` / `medium` / `high` reasoning effort.
 pub fn model_supports_thinking_levels(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    if m.contains("gpt-oss") {
+    // Current Groq reasoning options: https://console.groq.com/docs/reasoning
+    if m.contains("gpt-oss") || m == "qwen/qwen3.8-27b" || m == "meta-models/muse-spark-open" {
         return true;
     }
     if m.contains("qwen3") || m.contains("compound") {
@@ -653,6 +708,7 @@ pub fn effective_reasoning_effort<'a>(model: &str, configured: Option<&'a str>) 
     if m.contains("qwen3") {
         return match effort {
             "none" | "default" => Some(effort),
+            "low" | "medium" | "high" if m == "qwen/qwen3.8-27b" => Some(effort),
             _ => None,
         };
     }
@@ -762,12 +818,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn effective_chat_client_params_openrouter() {
-        let config = Config {
+    fn test_config() -> Config {
+        Config {
             llm_provider: LlmProvider::OpenRouter,
             groq_api_key: None,
             groq_model: String::new(),
+            groq_jev_routing: false,
+            groq_jev_models: crate::client::jev::TierModels {
+                prep: DEFAULT_GROQ_MODEL.into(),
+                code: DEFAULT_GROQ_FAST_MODEL.into(),
+                code_hard: DEFAULT_GROQ_MODEL.into(),
+                quick: DEFAULT_GROQ_FAST_MODEL.into(),
+            },
             groq_rate_limit_fallback_model: String::new(),
             groq_compound_model: String::new(),
             groq_compound_mini_model: String::new(),
@@ -798,12 +860,115 @@ mod tests {
             reasoning_effort: None,
             groq_service_tier: DEFAULT_GROQ_SERVICE_TIER.to_string(),
             max_tool_rounds: DEFAULT_MAX_TOOL_ROUNDS,
-        };
+        }
+    }
+
+    #[test]
+    fn effective_chat_client_params_openrouter() {
+        let config = test_config();
         let params = config.effective_chat_client_params().unwrap();
         assert_eq!(params.0, "or-key");
         assert_eq!(params.1, OPENROUTER_BASE_URL);
         assert_eq!(params.2, "anthropic/claude-sonnet-4");
         assert!(config.build_chat_client().is_some());
+    }
+
+    #[test]
+    fn groq_routing_and_chat_credentials_are_independent_of_openrouter() {
+        let mut config = test_config();
+        config.llm_provider = LlmProvider::Groq;
+        config.groq_api_key = Some("groq-key".into());
+        config.groq_model = DEFAULT_GROQ_MODEL.into();
+        config.jev_routing = true;
+        assert!(!config.jev_enabled());
+        config.groq_jev_routing = true;
+        assert!(config.jev_enabled());
+        assert_eq!(
+            config.effective_chat_client_params().unwrap(),
+            (
+                "groq-key".into(),
+                GROQ_BASE_URL.into(),
+                DEFAULT_GROQ_MODEL.into()
+            )
+        );
+        config.openrouter_api_key = None;
+        assert!(config.build_chat_client().is_some());
+        config.llm_provider = LlmProvider::LmStudio;
+        assert!(!config.jev_enabled());
+        config.llm_provider = LlmProvider::OpenRouter;
+        config.jev_routing = false;
+        assert!(!config.jev_enabled());
+    }
+
+    #[test]
+    fn groq_model_and_tiers_persist_to_both_env_files_without_changing_openrouter() {
+        let keys = [
+            "GROQ_MODEL",
+            "VYBRID_GROQ_JEV_ROUTING",
+            "VYBRID_GROQ_JEV_MODEL_PREP",
+            "VYBRID_GROQ_JEV_MODEL_CODE",
+            "VYBRID_GROQ_JEV_MODEL_CODE_HARD",
+            "VYBRID_GROQ_JEV_MODEL_QUICK",
+        ];
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    if let Some(value) = value {
+                        std::env::set_var(key, value);
+                    } else {
+                        std::env::remove_var(key);
+                    }
+                }
+            }
+        }
+        let _restore = RestoreEnv(
+            keys.iter()
+                .map(|&key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        let directory =
+            std::env::temp_dir().join(format!("vybrid-groq-config-{}", uuid::Uuid::new_v4()));
+        let mut config = test_config();
+        config.env_file_path = directory.join("project.env");
+        config.global_env_file_path = directory.join("global.env");
+        for path in [&config.env_file_path, &config.global_env_file_path] {
+            merge_env_file(path, "OPENROUTER_MODEL", "keep-openrouter-model").unwrap();
+            merge_env_file(path, "OPENROUTER_API_KEY", "keep-openrouter-key").unwrap();
+            merge_env_file(path, "VYBRID_JEV_ROUTING", "off").unwrap();
+        }
+        config
+            .set_groq_model(" openai/gpt-oss-20b ".into())
+            .unwrap();
+        config.set_groq_jev_routing(true).unwrap();
+        config
+            .set_groq_jev_models(crate::client::jev::TierModels {
+                prep: DEFAULT_GROQ_MODEL.into(),
+                code: DEFAULT_GROQ_FAST_MODEL.into(),
+                code_hard: "qwen/qwen3.8-27b".into(),
+                quick: DEFAULT_GROQ_FAST_MODEL.into(),
+            })
+            .unwrap();
+        assert_eq!(config.llm_provider, LlmProvider::OpenRouter);
+        assert!(!config.jev_routing);
+        assert_eq!(config.groq_model, DEFAULT_GROQ_FAST_MODEL);
+        assert!(config.set_groq_model(" ".into()).is_err());
+        for path in [&config.env_file_path, &config.global_env_file_path] {
+            let env: std::collections::HashMap<_, _> = dotenvy::from_path_iter(path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(env["GROQ_MODEL"], DEFAULT_GROQ_FAST_MODEL);
+            assert_eq!(env["VYBRID_GROQ_JEV_ROUTING"], "on");
+            assert_eq!(env["VYBRID_GROQ_JEV_MODEL_PREP"], DEFAULT_GROQ_MODEL);
+            assert_eq!(env["VYBRID_GROQ_JEV_MODEL_CODE"], DEFAULT_GROQ_FAST_MODEL);
+            assert_eq!(env["VYBRID_GROQ_JEV_MODEL_CODE_HARD"], "qwen/qwen3.8-27b");
+            assert_eq!(env["VYBRID_GROQ_JEV_MODEL_QUICK"], DEFAULT_GROQ_FAST_MODEL);
+            assert_eq!(env["OPENROUTER_MODEL"], "keep-openrouter-model");
+            assert_eq!(env["OPENROUTER_API_KEY"], "keep-openrouter-key");
+            assert_eq!(env["VYBRID_JEV_ROUTING"], "off");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -823,6 +988,22 @@ mod tests {
         assert_eq!(
             effective_reasoning_effort("openai/gpt-oss-120b", None),
             Some("low")
+        );
+        assert_eq!(
+            effective_reasoning_effort("qwen/qwen3.8-27b", Some("high")),
+            Some("high")
+        );
+        assert_eq!(
+            effective_reasoning_effort("qwen/qwen3.8-27b", Some("none")),
+            Some("none")
+        );
+        assert_eq!(
+            effective_reasoning_effort("meta-models/muse-spark-open", Some("medium")),
+            Some("medium")
+        );
+        assert_eq!(
+            effective_reasoning_effort("minimaxai/minimax-m2.7", Some("high")),
+            None
         );
     }
 

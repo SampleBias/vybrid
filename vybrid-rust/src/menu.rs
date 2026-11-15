@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{Input, Select};
+use dialoguer::{Input, Password, Select};
 
 use crate::client::groq::GroqClient;
+use crate::client::groq_models::{self, ModelQuery as GroqModelQuery};
 use crate::client::openrouter::{
     clear_model_cache, fetch_models, format_model_label, ModelQuery, POPULAR_PROVIDERS,
 };
@@ -73,13 +74,25 @@ pub async fn handle_menu(
 async fn handle_groq_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
     loop {
         let items = vec![
-            "Add Groq + optional SerpAPI keys (quick setup)",
-            "Add or update Groq API key only",
-            "Switch to Groq",
-            "Back",
+            "Add Groq + optional SerpAPI keys (quick setup)".to_string(),
+            "Add or update Groq API key only".to_string(),
+            "Switch to Groq".to_string(),
+            "Select model".to_string(),
+            format!(
+                "Turn Jev routing {}",
+                if config.groq_jev_routing { "off" } else { "on" }
+            ),
+            "Set Jev tier models".to_string(),
+            "Refresh model catalog".to_string(),
+            "Add or update OpenRouter key for Jev decisions".to_string(),
+            "Back".to_string(),
         ];
         let sel = Select::new()
-            .with_prompt("Groq")
+            .with_prompt(format!(
+                "Groq (current: {}, jev {})",
+                config.groq_model,
+                if config.groq_jev_routing { "on" } else { "off" }
+            ))
             .items(&items)
             .max_length(MENU_PAGE_SIZE)
             .default(0)
@@ -158,10 +171,184 @@ async fn handle_groq_menu(config: &mut Config, client: &mut Option<GroqClient>) 
                     );
                 }
             }
+            3 => match handle_groq_model_picker(config, &config.groq_model).await {
+                Ok(Some(model)) => {
+                    config.set_groq_model(model)?;
+                    *client = config.build_chat_client();
+                    println!(
+                        "{}",
+                        style(format!(
+                            "Saved GROQ_MODEL={} — settings:\n  {}",
+                            config.groq_model,
+                            saved_env_locations(config)
+                        ))
+                        .green()
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => ui::print_error(&error.to_string()),
+            },
+            4 => {
+                if !config.groq_jev_routing
+                    && config
+                        .openrouter_api_key
+                        .as_deref()
+                        .is_none_or(|k| k.trim().is_empty())
+                {
+                    ui::print_error("Jev needs an OpenRouter API key for decisions. Use 'Add or update OpenRouter key for Jev decisions'. Chat will still use your Groq key.");
+                    continue;
+                }
+                config.set_groq_jev_routing(!config.groq_jev_routing)?;
+                println!("{}", style(format!("Groq Jev routing {}. Jev decisions use OpenRouter; chat uses Groq. {} is the pinned fallback.",
+                    if config.groq_jev_routing { "on" } else { "off" }, config.groq_model)).green());
+            }
+            5 => {
+                if let Err(error) = handle_groq_jev_tiers(config).await {
+                    ui::print_error(&error.to_string());
+                }
+            }
+            6 => {
+                match groq_models::fetch_models(config.groq_api_key.as_deref().unwrap_or(""), true)
+                    .await
+                {
+                    Ok(models) => println!(
+                        "{}",
+                        style(format!("Groq catalog refreshed ({} models).", models.len())).green()
+                    ),
+                    Err(error) => ui::print_error(&error.to_string()),
+                }
+            }
+            7 => {
+                let key = Password::new()
+                    .with_prompt("OpenRouter API key (Jev decisions only; billed to OpenRouter)")
+                    .interact()
+                    .context("No OpenRouter key entered")?;
+                config.set_openrouter_api_key(key)?;
+                *client = config.build_chat_client();
+                println!(
+                    "{}",
+                    style("Saved OpenRouter key for Jev decisions. Groq chat uses GROQ_API_KEY.")
+                        .green()
+                );
+            }
             _ => break,
         }
     }
     Ok(())
+}
+
+async fn handle_groq_model_picker(config: &Config, current: &str) -> Result<Option<String>> {
+    println!("{}", style("Fetching models from Groq…").dim());
+    let models =
+        groq_models::fetch_models(config.groq_api_key.as_deref().unwrap_or(""), false).await?;
+    loop {
+        let mode = Select::new()
+            .with_prompt("Choose a Groq model")
+            .items(&[
+                "Recommended for coding",
+                "Search by name",
+                "Browse by model author",
+                "Advanced: full catalog",
+                "Back",
+            ])
+            .max_length(MENU_PAGE_SIZE)
+            .interact_opt()?;
+        let query = match mode {
+            Some(0) => GroqModelQuery::Recommended,
+            Some(1) => {
+                let term: String = Input::new()
+                    .with_prompt("Search model ID/name (e.g. gpt-oss, qwen)")
+                    .interact_text()?;
+                if term.trim().is_empty() {
+                    continue;
+                }
+                GroqModelQuery::Search(term)
+            }
+            Some(2) => {
+                let mut authors: Vec<_> = models
+                    .iter()
+                    .filter(|m| m.supports_agent())
+                    .map(|m| m.owned_by.clone())
+                    .collect();
+                authors.sort();
+                authors.dedup();
+                if authors.is_empty() {
+                    ui::print_error("No verified coding models found in this catalog.");
+                    continue;
+                }
+                let Some(index) = Select::new()
+                    .with_prompt("Model author")
+                    .items(&authors)
+                    .max_length(MODEL_PAGE_SIZE)
+                    .interact_opt()?
+                else {
+                    continue;
+                };
+                GroqModelQuery::Author(authors[index].clone())
+            }
+            Some(3) => GroqModelQuery::FullCatalog,
+            _ => return Ok(None),
+        };
+        let matches = groq_models::filter_models(&models, &query);
+        if matches.is_empty() {
+            ui::print_error("No coding models matched. Try another search or refresh the catalog.");
+            continue;
+        }
+        let labels: Vec<_> = matches.iter().map(|m| m.label()).collect();
+        let default = matches.iter().position(|m| m.id == current).unwrap_or(0);
+        let Some(index) = Select::new()
+            .with_prompt(format!("Select model ({} found)", matches.len()))
+            .items(&labels)
+            .default(default)
+            .max_length(MODEL_PAGE_SIZE)
+            .interact_opt()?
+        else {
+            continue;
+        };
+        if !matches[index].supports_agent() {
+            ui::print_error("This model is inactive or not verified for coding with local tools. Select a model from Recommended for coding.");
+            continue;
+        }
+        return Ok(Some(matches[index].id.clone()));
+    }
+}
+
+async fn handle_groq_jev_tiers(config: &mut Config) -> Result<()> {
+    loop {
+        let tiers = &config.groq_jev_models;
+        let labels = [
+            format!("Prep (planning/review): {}", tiers.prep),
+            format!("Code (routine coding): {}", tiers.code),
+            format!("Code-hard (difficult coding): {}", tiers.code_hard),
+            format!("Quick (chat/explanations): {}", tiers.quick),
+            "Back".into(),
+        ];
+        let Some(tier) = Select::new()
+            .with_prompt("Groq Jev tier models")
+            .items(&labels)
+            .interact_opt()?
+        else {
+            return Ok(());
+        };
+        let current = match tier {
+            0 => &tiers.prep,
+            1 => &tiers.code,
+            2 => &tiers.code_hard,
+            3 => &tiers.quick,
+            _ => return Ok(()),
+        };
+        if let Some(model) = handle_groq_model_picker(config, current).await? {
+            let mut updated = config.groq_jev_models.clone();
+            match tier {
+                0 => updated.prep = model,
+                1 => updated.code = model,
+                2 => updated.code_hard = model,
+                _ => updated.quick = model,
+            }
+            config.set_groq_jev_models(updated)?;
+            println!("{}", style("Saved Groq Jev tier models.").green());
+        }
+    }
 }
 
 async fn handle_openrouter_menu(

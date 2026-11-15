@@ -1214,6 +1214,40 @@ mod tests {
     }
 
     #[test]
+    fn routed_groq_models_keep_credentials_tools_and_shared_rate_tracking() {
+        let primary = GroqClient::new(
+            "groq-key".into(),
+            "https://api.groq.com/openai/v1".into(),
+            "openai/gpt-oss-120b".into(),
+            RequestTuning::default(),
+        )
+        .with_task_id("task-id");
+        let routed = primary.with_model("openai/gpt-oss-20b");
+        assert_eq!(routed.api_key, "groq-key");
+        assert_eq!(routed.base_url, primary.base_url);
+        assert_eq!(routed.task_id.as_deref(), Some("task-id"));
+        assert!(Arc::ptr_eq(&primary.rate_headers, &routed.rate_headers));
+        assert!(Arc::ptr_eq(&primary.rate_window, &routed.rate_window));
+        let messages = [Message {
+            role: "user".into(),
+            content: Some("task".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let request = serde_json::to_value(routed.build_request(
+            &messages,
+            Some(crate::tools::definitions::get_all_tools()),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(request["model"], "openai/gpt-oss-20b");
+        assert_eq!(request["tool_choice"], "auto");
+        assert!(!request["tools"].as_array().unwrap().is_empty());
+        assert!(request.get("max_completion_tokens").is_some());
+        assert!(request.get("max_tokens").is_none());
+    }
+
+    #[test]
     fn non_groq_requests_use_max_tokens_and_skip_groq_params() {
         let client = GroqClient::new(
             "lm-studio".to_string(),
