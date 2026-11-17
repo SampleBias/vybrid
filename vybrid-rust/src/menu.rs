@@ -74,18 +74,11 @@ pub async fn handle_menu(
 async fn handle_groq_menu(config: &mut Config, client: &mut Option<GroqClient>) -> Result<()> {
     loop {
         let items = vec![
-            "Add Groq + optional SerpAPI keys (quick setup)".to_string(),
-            "Add or update Groq API key only".to_string(),
-            "Switch to Groq".to_string(),
-            "Select model".to_string(),
-            format!(
-                "Turn Jev routing {}",
-                if config.groq_jev_routing { "off" } else { "on" }
-            ),
-            "Set Jev tier models".to_string(),
-            "Refresh model catalog".to_string(),
-            "Add or update OpenRouter key for Jev decisions".to_string(),
-            "Back".to_string(),
+            "Add or update Groq API key",
+            "Switch to Groq",
+            "Select model",
+            "Advanced settings",
+            "Back",
         ];
         let sel = Select::new()
             .with_prompt(format!(
@@ -99,39 +92,34 @@ async fn handle_groq_menu(config: &mut Config, client: &mut Option<GroqClient>) 
             .interact()
             .context("Groq menu cancelled")?;
 
-        match sel {
-            0 => {
-                let key: String = Input::new()
-                    .with_prompt("Groq API key")
-                    .interact_text()
-                    .context("No API key entered")?;
-                let key = key.trim().to_string();
-                if key.is_empty() {
-                    ui::print_error("Groq API key was empty.");
-                    continue;
-                }
-                config.set_groq_api_key(key)?;
-                *client = config.build_chat_client();
-
-                let serp: String = Input::new()
-                    .with_prompt("SerpAPI key (optional — Enter to skip)")
-                    .allow_empty(true)
-                    .interact_text()
-                    .context("SerpAPI prompt failed")?;
-                let serp = serp.trim();
-                if !serp.is_empty() {
-                    config.set_serpapi_key(serp.to_string())?;
-                }
-
-                println!(
-                    "{}",
-                    style(format!(
-                        "Saved key(s) — you can start chatting. Files updated:\n  {}",
-                        saved_env_locations(config)
-                    ))
-                    .green()
-                );
+        let sel = if sel == 3 {
+            let advanced = vec![
+                format!(
+                    "Turn Jev routing {}",
+                    if config.groq_jev_routing { "off" } else { "on" }
+                ),
+                "Set Jev tier models".to_string(),
+                "Refresh model catalog".to_string(),
+                "Add or update OpenRouter key for Jev decisions".to_string(),
+                "Back".to_string(),
+            ];
+            let choice = Select::new()
+                .with_prompt("Groq advanced settings")
+                .items(&advanced)
+                .default(0)
+                .interact()
+                .context("Groq advanced menu cancelled")?;
+            if choice == 4 {
+                continue;
             }
+            choice + 4
+        } else if sel == 4 {
+            break;
+        } else {
+            sel + 1
+        };
+
+        match sel {
             1 => {
                 let key: String = Input::new()
                     .with_prompt("Groq API key")

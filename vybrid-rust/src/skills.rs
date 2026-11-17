@@ -113,6 +113,7 @@ fn discovery_roots() -> Vec<(PathBuf, bool)> {
     if let Some(home) = dirs::home_dir() {
         roots.push((home.join(".vybrid").join("skills"), true));
         roots.push((home.join(".agents").join("skills"), false));
+        roots.push((home.join("skillz_library").join("skills"), false));
     }
 
     roots.push((project_root.join(".vybrid").join("skills"), true));

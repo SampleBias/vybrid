@@ -1921,7 +1921,7 @@ fn handle_skills_command(
     match parts.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
         None | Some("list") | Some("") => {
             println!();
-            println!("{}", style("Loaded Skills:").cyan().bold());
+            println!("{}", style("Available Skills:").cyan().bold());
             println!("{}", style("─".repeat(40)).dim());
             if skill_registry.skills().is_empty() {
                 println!("{}", style("No skills found.").dim());
@@ -1938,9 +1938,18 @@ fn handle_skills_command(
                     } else {
                         ""
                     };
+                    let active =
+                        conversation.has_context_snapshot(&format!("skill:{}", skill.name));
+                    let name = if active {
+                        style(&skill.name).yellow().bold()
+                    } else {
+                        style(&skill.name)
+                    };
+                    let status = if active { " (active)" } else { "" };
                     println!(
-                        "  {} — {}{}",
-                        style(&skill.name).yellow(),
+                        "  {}{} — {}{}",
+                        name,
+                        style(status).yellow(),
                         skill.description,
                         style(hidden).dim()
                     );
@@ -2017,13 +2026,17 @@ fn handle_skill_load_by_name(
 ) {
     match skill_registry.load_body(name, user_args) {
         Ok(body) => {
+            let location = skill_registry
+                .get(name)
+                .map(|skill| skill.path.display().to_string())
+                .unwrap_or_default();
             conversation.set_context_snapshot(
                 &format!("skill:{name}"),
-                &format!("[Skill: {name}]\n\n{body}"),
+                &format!("[Skill: {name}]\nLocation: {location}\nResolve relative paths from the skill directory.\n\n{body}"),
             );
             println!(
                 "{}",
-                style(format!("Loaded skill '{name}' into the conversation.")).green()
+                style(format!("Skill '{name}' is active in this conversation.")).yellow()
             );
         }
         Err(e) => ui::print_error(&format!("{e}")),

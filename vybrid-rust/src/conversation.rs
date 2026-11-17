@@ -159,6 +159,10 @@ impl Conversation {
         true
     }
 
+    pub fn has_context_snapshot(&self, key: &str) -> bool {
+        self.pinned.contains_key(key)
+    }
+
     fn missing_pins(&self, floor: usize) -> Vec<&Message> {
         let tail = &self.messages[floor.min(self.messages.len())..];
         let mut missing: Vec<&Message> = Vec::new();

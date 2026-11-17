@@ -141,11 +141,11 @@ Create a Groq key in the [Groq Console](https://console.groq.com/keys). For Open
 
 Run **`/menu` → Groq → Select model** to browse recommended coding models, search by model ID/name, or browse by model author. The picker fetches the authenticated Groq catalog from `https://api.groq.com/openai/v1/models`. Selecting a model saves `GROQ_MODEL` in both env files. It does not switch the active provider; use **Switch to Groq** when needed.
 
-Catalogs are cached for six hours under `~/.vybrid/cache/groq_*.json`, scoped to the Groq credential without storing the credential. **Refresh model catalog** fetches a new catalog immediately. A corrupt or unwritable cache does not prevent a fresh API lookup.
+Catalogs are cached for six hours under `~/.vybrid/cache/groq_*.json`, scoped to the Groq credential without storing the credential. **Advanced settings → Refresh model catalog** fetches a new catalog immediately. A corrupt or unwritable cache does not prevent a fresh API lookup.
 
 Recommended, search, and author views include active chat models with verified support for local function calling. The advanced catalog also displays speech, moderation, inactive, and unknown models, marks them as unsuitable or unverified for coding, and prevents selecting them. Groq's list endpoint does not advertise tool capability; compatibility is maintained explicitly in `src/client/groq_models.rs`. New model IDs need verification before they appear as coding choices.
 
-Groq Jev routing is configured in the same menu. Add an **OpenRouter key for Jev decisions**, choose **Set Jev tier models**, then **Turn Jev routing on**. Jev decisions are billed through OpenRouter, while all chat requests use your Groq API key and Groq endpoint. With just a Groq key, model search and manual selection work normally.
+Groq Jev routing is configured under **Groq → Advanced settings**. Add an **OpenRouter key for Jev decisions**, choose **Set Jev tier models**, then **Turn Jev routing on**. Jev decisions are billed through OpenRouter, while all chat requests use your Groq API key and Groq endpoint. With just a Groq key, model search and manual selection work normally.
 
 ### OpenRouter (cloud, multi-provider)
 
@@ -193,7 +193,7 @@ VYBRID_JEV_ROUTING=on
 
 #### Where a prompt goes
 
-For Groq, enable **`/menu` → Groq → Turn Jev routing on**, or set:
+For Groq, enable **`/menu` → Groq → Advanced settings → Turn Jev routing on**, or set:
 
 ```bash
 VYBRID_LLM_PROVIDER=groq
@@ -445,10 +445,13 @@ Vybrid implements the [Agent Skills standard](https://agentskills.io/specificati
 |-------|------|
 | Global | `~/.vybrid/skills/` |
 | Global (shared) | `~/.agents/skills/` |
+| Global (skillz library) | `~/skillz_library/skills/` |
 | Project | `.vybrid/skills/` under the project root |
 | Project (shared) | `.agents/skills/` walking up from the current directory |
 
 Copy the example skill from [`vybrid-rust/skills/rust-compile-fix-loop/`](vybrid-rust/skills/rust-compile-fix-loop/) into one of those directories, then run **`/skills reload`**.
+
+If `~/skillz_library/skills/` exists, Vybrid discovers its `packet`, `patrs`, `amark`, `vers`, `qc`, and `ut-mode` skills automatically. Run `/skills` to list discovered skills, `/skills path` to check the search paths, and `/skills reload` after changing the library. Activate one explicitly with `/skill:packet` or `/skills load ut-mode`, optionally followed by task details. The agent can also select skills when their descriptions match the task. Earlier search paths take precedence when names collide. Explicitly activated skills appear in yellow with an `(active)` label in `/skills` until `/new` starts a new conversation. Automatic skill selection by the agent is not tracked by this indicator.
 
 Minimal `SKILL.md` shape:
 
