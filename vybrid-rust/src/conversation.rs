@@ -1,6 +1,8 @@
 use crate::client::groq::Message;
+use crate::tools::output::{truncate_utf8_middle, ToolOutputStore};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 #[allow(dead_code)]
 pub const REQUEST_CONTEXT_TOKEN_BUDGET: u32 = 36_000;
@@ -14,7 +16,7 @@ const COMPACTION_MARKER: &str = "[Vybrid context summary] Earlier messages were 
 pub const MANUAL_COMPACTION_PREFIX: &str = "[Vybrid compaction summary]";
 pub const COMPACT_KEEP_RECENT: usize = 8;
 pub const COMPACT_MIN_TO_SUMMARIZE: usize = 4;
-const COMPACT_TRANSCRIPT_MAX_CHARS: usize = 24_000;
+const COMPACT_TRANSCRIPT_MAX_BYTES: usize = 12_000;
 
 fn compaction_marker_message() -> Message {
     Message {
@@ -72,6 +74,96 @@ pub(crate) fn estimate_message_tokens(message: &Message) -> u32 {
         chars += id.len();
     }
     chars.div_ceil(4).min(u32::MAX as usize) as u32
+}
+
+struct SummaryPlan {
+    prefix: Vec<Message>,
+    first_kept_index: usize,
+    covered_task_keys: Vec<String>,
+}
+
+/// A single generation may retry the same latest tool batch with a smaller
+/// budget. Keep its archive paths stable while leaving full history intact.
+#[derive(Default)]
+pub struct ToolResultWindow {
+    archives: HashMap<usize, PathBuf>,
+}
+
+impl ToolResultWindow {
+    pub fn fit(
+        &mut self,
+        messages: &mut Cow<'_, [Message]>,
+        budget: u32,
+        store: &ToolOutputStore,
+    ) -> anyhow::Result<u32> {
+        let tokens = |items: &[Message]| {
+            items
+                .iter()
+                .map(estimate_message_tokens)
+                .fold(0, u32::saturating_add)
+        };
+        let total = tokens(messages);
+        if total <= budget {
+            return Ok(total);
+        }
+        // Ordinary windowing has already discarded older complete groups.
+        // Keep the assistant call, every result ID, and the pinned messages.
+        let count = messages
+            .iter()
+            .rev()
+            .take_while(|m| m.role == "tool")
+            .count();
+        if count == 0 {
+            return Ok(total);
+        }
+        let start = messages.len() - count;
+        let fixed = tokens(&messages[..start]);
+        let mut available = (budget.saturating_sub(fixed) as usize).saturating_mul(4);
+        for result in &messages[start..] {
+            available =
+                available.saturating_sub(result.tool_call_id.as_ref().map_or(0, String::len) + 3);
+        }
+        // Let small results keep their full content and share the rest among
+        // the larger results. Positions remain stable across retries.
+        let mut sizes: Vec<_> = messages[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.content.as_ref().map_or(0, String::len), i))
+            .collect();
+        sizes.sort_unstable();
+        for (n, (size, i)) in sizes.into_iter().enumerate() {
+            let allowance = available / (count - n);
+            if size <= allowance {
+                available -= size;
+                continue;
+            }
+            let content = messages[start + i].content.as_deref().unwrap_or_default();
+            let path = match self.archives.entry(i) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(store.archive_text("tool-result", content)?)
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            };
+            let reference = format!(
+                "Full tool result ({size} bytes): `{}`. Retrieve with read_file.\n",
+                path.display()
+            );
+            // Leave room for the omitted-byte marker as well as the archive reference.
+            let preview_bytes = allowance.saturating_sub(reference.len() + 64);
+            let preview = if preview_bytes == 0 {
+                reference
+            } else {
+                reference + &truncate_utf8_middle(content, preview_bytes, "Tool result")
+            };
+            if preview.len() < size {
+                available = available.saturating_sub(preview.len());
+                messages.to_mut()[start + i].content = Some(preview);
+            } else {
+                available = available.saturating_sub(size);
+            }
+        }
+        Ok(tokens(messages))
+    }
 }
 
 /// Manages conversation history
@@ -203,7 +295,10 @@ impl Conversation {
     }
 
     pub fn estimate_active_tokens(&self) -> u32 {
-        self.tokens_from(self.request_floor.max(1))
+        if self.request_floor <= 1 {
+            return self.estimate_context_tokens();
+        }
+        self.tokens_from(self.request_floor)
     }
 
     pub fn add_tool_result(&mut self, tool_call_id: &str, result: &str) {
@@ -301,60 +396,64 @@ impl Conversation {
         );
     }
 
-    /// Returns `(first_kept_index, transcript_text)` for manual compaction, or None if
-    /// there is too little history to summarize.
+    /// Preserve recent messages and the entire tool group crossing the boundary.
+    pub fn first_recent_group(&self, keep_recent: usize) -> usize {
+        let mut start = self
+            .messages
+            .len()
+            .saturating_sub(keep_recent.max(1))
+            .max(1);
+        while start > 1 && self.messages[start].role == "tool" {
+            start -= 1;
+        }
+        start
+    }
+
+    /// Only remove complete groups that fit in the summary request.
     pub fn compactable_transcript(&self, keep_recent: usize) -> Option<(usize, String)> {
-        if self.messages.len() <= 1 {
-            return None;
-        }
-
-        let last_idx = self.messages.len().saturating_sub(1);
-        let mut first_kept = last_idx.saturating_sub(keep_recent.saturating_sub(1));
-        if first_kept <= 1 {
-            return None;
-        }
-
-        while first_kept < last_idx && self.messages[first_kept].role == "tool" {
-            first_kept += 1;
-        }
-
-        let to_summarize = first_kept.saturating_sub(1);
-        if to_summarize < COMPACT_MIN_TO_SUMMARIZE {
+        let first_kept = self.first_recent_group(keep_recent);
+        if first_kept.saturating_sub(1) < COMPACT_MIN_TO_SUMMARIZE {
             return None;
         }
 
         let mut transcript = String::new();
         let mut covered = 1;
-        while covered < first_kept {
+        'groups: while covered < first_kept {
             let end = self.group_end(covered);
             if end > first_kept {
                 break;
             }
-            let mut group = String::new();
+            let start = transcript.len();
             for message in &self.messages[covered..end] {
-                group.push_str(&format!(
-                    "[{}] {}\n",
-                    message.role,
-                    message.content.as_deref().unwrap_or("")
-                ));
-                if let Some(calls) = &message.tool_calls {
-                    for call in calls {
-                        group.push_str(&format!(
-                            "[tool call {}] {} {}\n",
-                            call.id, call.function.name, call.function.arguments
-                        ));
+                let fields = [
+                    "[",
+                    &message.role,
+                    "] ",
+                    message.content.as_deref().unwrap_or(""),
+                    "\n",
+                ];
+                let call_fields = message.tool_calls.iter().flatten().flat_map(|call| {
+                    [
+                        "[tool call ",
+                        &call.id,
+                        "] ",
+                        &call.function.name,
+                        " ",
+                        &call.function.arguments,
+                        "\n",
+                    ]
+                });
+                for field in fields.into_iter().chain(call_fields).chain(["\n"]) {
+                    if field.len() > COMPACT_TRANSCRIPT_MAX_BYTES - transcript.len() {
+                        transcript.truncate(start);
+                        break 'groups;
                     }
+                    transcript.push_str(field);
                 }
-                group.push('\n');
             }
-            // Never delete a group whose complete text was not provided.
-            if transcript.len() + group.len() > COMPACT_TRANSCRIPT_MAX_CHARS {
-                break;
-            }
-            transcript.push_str(&group);
             covered = end;
         }
-        first_kept = covered;
+        let first_kept = covered;
 
         if transcript.trim().is_empty() || first_kept.saturating_sub(1) < COMPACT_MIN_TO_SUMMARIZE {
             return None;
@@ -364,12 +463,41 @@ impl Conversation {
     }
 
     pub fn apply_manual_compaction(&mut self, summary: &str, first_kept_index: usize) -> bool {
+        let Some(plan) = self.plan_summary(summary, first_kept_index, true) else {
+            return false;
+        };
+        self.install_summary(plan);
+        true
+    }
+
+    /// Keep user instructions verbatim when installing a local excerpt. Archive
+    /// only if the replacement fits, and commit only after the write succeeds.
+    pub fn apply_archived_excerpt(
+        &mut self,
+        excerpt: &str,
+        end: usize,
+        archive: impl FnOnce(&[Message]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
+        let Some(plan) = self.plan_summary(excerpt, end, false) else {
+            return Ok(false);
+        };
+        archive(&self.messages[1..end])?;
+        self.install_summary(plan);
+        Ok(true)
+    }
+
+    fn plan_summary(
+        &self,
+        summary: &str,
+        first_kept_index: usize,
+        summarize_tasks: bool,
+    ) -> Option<SummaryPlan> {
         if summary.trim().is_empty()
             || first_kept_index <= 1
             || first_kept_index >= self.messages.len()
             || self.messages[first_kept_index].role == "tool"
         {
-            return false;
+            return None;
         }
 
         let summary_message = Message {
@@ -379,12 +507,13 @@ impl Conversation {
             tool_call_id: None,
         };
 
-        let mut next = vec![self.messages[0].clone(), summary_message.clone()];
+        let mut next = vec![self.messages[0].clone(), summary_message];
         let covered_tasks: Vec<_> = self
             .pinned
             .iter()
             .filter(|(key, message)| {
-                key.starts_with("task_history:")
+                summarize_tasks
+                    && key.starts_with("task_history:")
                     && self.messages[1..first_kept_index]
                         .iter()
                         .any(|m| m.content == message.content)
@@ -408,21 +537,27 @@ impl Conversation {
             pins.retain(|m| m.content != old_summary.content);
         }
         next.extend(pins.into_iter().cloned());
-        next.extend_from_slice(&self.messages[first_kept_index..]);
         let next_tokens = next
             .iter()
+            .chain(&self.messages[first_kept_index..])
             .map(estimate_message_tokens)
             .fold(0, u32::saturating_add);
-        if next_tokens >= self.estimate_context_tokens() {
-            return false;
-        }
-        self.messages = next;
-        for (key, _) in covered_tasks {
+        (next_tokens < self.estimate_active_tokens()).then(|| SummaryPlan {
+            prefix: next,
+            first_kept_index,
+            covered_task_keys: covered_tasks.into_iter().map(|(key, _)| key).collect(),
+        })
+    }
+
+    fn install_summary(&mut self, mut plan: SummaryPlan) {
+        self.pinned.insert("summary".into(), plan.prefix[1].clone());
+        plan.prefix
+            .extend(self.messages.drain(plan.first_kept_index..));
+        self.messages = plan.prefix;
+        for key in plan.covered_task_keys {
             self.pinned.remove(&key);
         }
-        self.pinned.insert("summary".into(), summary_message);
         self.request_floor = 1;
-        true
     }
 
     /// Rough token estimate for the context meter (~4 chars per token for mixed text/code).

@@ -35,6 +35,9 @@ pub enum ModelQuery {
     Provider(String),
     /// Complete catalog (advanced).
     FullCatalog,
+    /// Fresh coding-capable catalog ordered by OpenRouter's intelligence index
+    /// for Jev tier recommendations.
+    JevRecommendations,
 }
 
 impl ModelQuery {
@@ -44,6 +47,7 @@ impl ModelQuery {
             Self::Search(term) => format!("search:{}", term.trim().to_ascii_lowercase()),
             Self::Provider(author) => format!("provider:{}", author.trim().to_ascii_lowercase()),
             Self::FullCatalog => "full".to_string(),
+            Self::JevRecommendations => "jev-recommendations".to_string(),
         }
     }
 
@@ -63,6 +67,9 @@ impl ModelQuery {
                 ("sort", "most-popular".to_string()),
             ],
             Self::FullCatalog => vec![],
+            Self::JevRecommendations => {
+                vec![("sort", "intelligence-high-to-low".to_string())]
+            }
         }
     }
 }
@@ -180,7 +187,9 @@ fn parse_models(data: Vec<ApiModel>) -> Vec<OpenRouterModel> {
 /// Apply query-specific filters that cannot be expressed as combined API params.
 fn post_filter(models: Vec<OpenRouterModel>, query: &ModelQuery) -> Vec<OpenRouterModel> {
     match query {
-        ModelQuery::Recommended => models.into_iter().filter(|m| m.supports_tools).collect(),
+        ModelQuery::Recommended | ModelQuery::JevRecommendations => {
+            models.into_iter().filter(|m| m.supports_tools).collect()
+        }
         _ => models,
     }
 }
@@ -280,6 +289,59 @@ pub fn format_model_label(model: &OpenRouterModel, show_no_tools: bool) -> Strin
             model.id, model.name, ctx, pricing
         )
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct JevRecommendation {
+    pub band: &'static str,
+    pub model: OpenRouterModel,
+}
+
+/// Pick the highest-intelligence catalog model from each third of the live
+/// price range. The API response is already sorted by its intelligence index.
+pub fn jev_recommendations(models: &[OpenRouterModel]) -> Vec<JevRecommendation> {
+    let mut priced: Vec<(usize, &OpenRouterModel, f64)> = models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| model.supports_tools)
+        .filter_map(|(rank, model)| {
+            let prompt = model.prompt_price.as_deref()?.parse::<f64>().ok()?;
+            let completion = model.completion_price.as_deref()?.parse::<f64>().ok()?;
+            let average = (prompt + completion) / 2.0;
+            (average.is_finite() && average >= 0.0).then_some((rank, model, average))
+        })
+        .collect();
+    priced.sort_by(|left, right| left.2.total_cmp(&right.2));
+
+    let count = priced.len();
+    let base = count / 3;
+    let remainder = count % 3;
+    let budget_end = base + usize::from(remainder > 0);
+    let balanced_end = budget_end + base + usize::from(remainder > 1);
+    let bands = [
+        (
+            "Premium · strongest in the high-cost range",
+            balanced_end,
+            count,
+        ),
+        (
+            "Mid-cost · strongest balanced option",
+            budget_end,
+            balanced_end,
+        ),
+        ("Budget · best intelligence for the price", 0, budget_end),
+    ];
+
+    bands
+        .into_iter()
+        .filter_map(|(band, start, end)| {
+            let candidate = priced.get(start..end)?.iter().min_by_key(|item| item.0)?;
+            Some(JevRecommendation {
+                band,
+                model: candidate.1.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Invalidate all cached OpenRouter model lists.

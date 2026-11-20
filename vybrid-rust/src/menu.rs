@@ -7,7 +7,8 @@ use dialoguer::{Input, Password, Select};
 use crate::client::groq::GroqClient;
 use crate::client::groq_models::{self, ModelQuery as GroqModelQuery};
 use crate::client::openrouter::{
-    clear_model_cache, fetch_models, format_model_label, ModelQuery, POPULAR_PROVIDERS,
+    clear_model_cache, fetch_models, format_model_label, ModelQuery, OpenRouterModel,
+    POPULAR_PROVIDERS,
 };
 use crate::config::{Config, LlmProvider, DEFAULT_LM_STUDIO_BASE_URL};
 use crate::lsp::RustLspManager;
@@ -98,7 +99,7 @@ async fn handle_groq_menu(config: &mut Config, client: &mut Option<GroqClient>) 
                     "Turn Jev routing {}",
                     if config.groq_jev_routing { "off" } else { "on" }
                 ),
-                "Set Jev tier models".to_string(),
+                "Choose Jev tier models".to_string(),
                 "Refresh model catalog".to_string(),
                 "Add or update OpenRouter key for Jev decisions".to_string(),
                 "Back".to_string(),
@@ -302,6 +303,10 @@ async fn handle_groq_model_picker(config: &Config, current: &str) -> Result<Opti
 }
 
 async fn handle_groq_jev_tiers(config: &mut Config) -> Result<()> {
+    println!("{}", style("Fetching the latest Groq model catalog…").dim());
+    let models =
+        groq_models::fetch_models(config.groq_api_key.as_deref().unwrap_or(""), true).await?;
+    println!("{}", style("Groq's catalog does not publish live price or quality scores. Recommendations use verified coding models currently available to your account.").dim());
     loop {
         let tiers = &config.groq_jev_models;
         let labels = [
@@ -318,14 +323,16 @@ async fn handle_groq_jev_tiers(config: &mut Config) -> Result<()> {
         else {
             return Ok(());
         };
-        let current = match tier {
-            0 => &tiers.prep,
-            1 => &tiers.code,
-            2 => &tiers.code_hard,
-            3 => &tiers.quick,
+        let (tier_name, current) = match tier {
+            0 => ("Prep (planning/review)", tiers.prep.clone()),
+            1 => ("Code (routine coding)", tiers.code.clone()),
+            2 => ("Code-hard (difficult coding)", tiers.code_hard.clone()),
+            3 => ("Quick (chat/explanations)", tiers.quick.clone()),
             _ => return Ok(()),
         };
-        if let Some(model) = handle_groq_model_picker(config, current).await? {
+        if let Some(model) =
+            handle_groq_jev_model_picker(config, &models, tier_name, &current).await?
+        {
             let mut updated = config.groq_jev_models.clone();
             match tier {
                 0 => updated.prep = model,
@@ -337,6 +344,44 @@ async fn handle_groq_jev_tiers(config: &mut Config) -> Result<()> {
             println!("{}", style("Saved Groq Jev tier models.").green());
         }
     }
+}
+
+async fn handle_groq_jev_model_picker(
+    config: &Config,
+    models: &[groq_models::GroqModel],
+    tier_name: &str,
+    current: &str,
+) -> Result<Option<String>> {
+    let recommendations = groq_models::jev_recommendations(models);
+    let mut items: Vec<String> = recommendations
+        .iter()
+        .map(|recommendation| format!("{} — {}", recommendation.band, recommendation.model.label()))
+        .collect();
+    items.push("Browse all verified models from this catalog".to_string());
+    items.push("Back".to_string());
+
+    let Some(selection) = Select::new()
+        .with_prompt(format!("Choose a Groq model for {tier_name}"))
+        .items(&items)
+        .default(
+            recommendations
+                .iter()
+                .position(|recommendation| recommendation.model.id == current)
+                .unwrap_or(0),
+        )
+        .max_length(MODEL_PAGE_SIZE)
+        .interact_opt()?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(recommendation) = recommendations.get(selection) {
+        return Ok(Some(recommendation.model.id.clone()));
+    }
+    if selection == recommendations.len() {
+        return handle_groq_model_picker(config, current).await;
+    }
+    Ok(None)
 }
 
 async fn handle_openrouter_menu(
@@ -353,7 +398,7 @@ async fn handle_openrouter_menu(
             } else {
                 "Turn Jev routing on".to_string()
             },
-            "Set Jev tier models".to_string(),
+            "Choose Jev tier models".to_string(),
             "Refresh model catalog".to_string(),
             "Back".to_string(),
         ];
@@ -484,34 +529,160 @@ async fn handle_openrouter_menu(
 }
 
 async fn handle_jev_tier_models(config: &mut Config) -> Result<()> {
-    let prep: String = Input::new()
-        .with_prompt("Prep model (planning, review, research, deep preparation)")
-        .default(config.jev_model_prep.clone())
-        .interact_text()
-        .context("Prep model prompt cancelled")?;
-    config.set_jev_model_prep(prep)?;
+    let api_key = config
+        .openrouter_api_key
+        .as_deref()
+        .context("OpenRouter API key missing")?;
+    println!(
+        "{}",
+        style("Fetching the latest OpenRouter model catalog…").dim()
+    );
+    let models = fetch_models(api_key, &ModelQuery::JevRecommendations, true).await?;
+    if models.is_empty() {
+        anyhow::bail!("The latest OpenRouter catalog returned no tool-capable models.");
+    }
 
-    let code: String = Input::new()
-        .with_prompt("Coding model (routine implement, debug, refactor)")
-        .default(config.jev_model_code.clone())
-        .interact_text()
-        .context("Coding model prompt cancelled")?;
-    config.set_jev_model_code(code)?;
+    loop {
+        let tiers = config.jev_tier_models();
+        let labels = [
+            format!("Prep (planning/review): {}", tiers.prep),
+            format!("Code (routine coding): {}", tiers.code),
+            format!("Code-hard (difficult coding): {}", tiers.code_hard),
+            format!("Quick (chat/explanations): {}", tiers.quick),
+            "Back".to_string(),
+        ];
+        let Some(tier) = Select::new()
+            .with_prompt("OpenRouter Jev tier models")
+            .items(&labels)
+            .default(0)
+            .interact_opt()?
+        else {
+            return Ok(());
+        };
+        let (tier_name, current) = match tier {
+            0 => ("Prep (planning/review)", tiers.prep),
+            1 => ("Code (routine coding)", tiers.code),
+            2 => ("Code-hard (difficult coding)", tiers.code_hard),
+            3 => ("Quick (chat/explanations)", tiers.quick),
+            _ => return Ok(()),
+        };
+        let Some(model) = handle_openrouter_jev_model_picker(&models, tier_name, &current).await?
+        else {
+            continue;
+        };
+        match tier {
+            0 => config.set_jev_model_prep(model)?,
+            1 => config.set_jev_model_code(model)?,
+            2 => config.set_jev_model_code_hard(model)?,
+            _ => config.set_jev_model_quick(model)?,
+        }
+        println!("{}", style("Saved Jev tier model.").green());
+    }
+}
 
-    let code_hard: String = Input::new()
-        .with_prompt("Hard coding model (involved coding, high risk, or deep preparation)")
-        .default(config.jev_model_code_hard.clone())
-        .interact_text()
-        .context("Hard coding model prompt cancelled")?;
-    config.set_jev_model_code_hard(code_hard)?;
+async fn handle_openrouter_jev_model_picker(
+    models: &[OpenRouterModel],
+    tier_name: &str,
+    current: &str,
+) -> Result<Option<String>> {
+    loop {
+        let recommendations = crate::client::openrouter::jev_recommendations(models);
+        let mut items: Vec<String> = recommendations
+            .iter()
+            .map(|recommendation| {
+                format!(
+                    "{} — {}",
+                    recommendation.band,
+                    format_model_label(&recommendation.model, false)
+                )
+            })
+            .collect();
+        items.push("Search the refreshed catalog".to_string());
+        items.push("Browse the refreshed catalog".to_string());
+        items.push("Back".to_string());
 
-    let quick: String = Input::new()
-        .with_prompt("Quick model (chat and simple explanations)")
-        .default(config.jev_model_quick.clone())
-        .interact_text()
-        .context("Quick model prompt cancelled")?;
-    config.set_jev_model_quick(quick)?;
-    Ok(())
+        let Some(selection) = Select::new()
+            .with_prompt(format!("Choose an OpenRouter model for {tier_name}"))
+            .items(&items)
+            .default(
+                recommendations
+                    .iter()
+                    .position(|recommendation| recommendation.model.id == current)
+                    .unwrap_or(0),
+            )
+            .max_length(MODEL_PAGE_SIZE)
+            .interact_opt()?
+        else {
+            return Ok(None);
+        };
+
+        if let Some(recommendation) = recommendations.get(selection) {
+            return Ok(Some(recommendation.model.id.clone()));
+        }
+        if selection == recommendations.len() {
+            let term: String = Input::new()
+                .with_prompt("Search refreshed catalog by model name or ID")
+                .interact_text()?;
+            let term = term.trim().to_ascii_lowercase();
+            if term.is_empty() {
+                continue;
+            }
+            let matches: Vec<_> = models
+                .iter()
+                .filter(|model| {
+                    model.supports_tools
+                        && (model.id.to_ascii_lowercase().contains(&term)
+                            || model.name.to_ascii_lowercase().contains(&term)
+                            || model.description.to_ascii_lowercase().contains(&term))
+                })
+                .collect();
+            if matches.is_empty() {
+                ui::print_error("No tool-capable models matched that search.");
+                continue;
+            }
+            if let Some(model) =
+                select_openrouter_catalog_model(&matches, current, "Search results")?
+            {
+                return Ok(Some(model));
+            }
+            continue;
+        }
+        if selection == recommendations.len() + 1 {
+            let matches: Vec<_> = models.iter().filter(|model| model.supports_tools).collect();
+            if let Some(model) =
+                select_openrouter_catalog_model(&matches, current, "Current catalog")?
+            {
+                return Ok(Some(model));
+            }
+            continue;
+        }
+        return Ok(None);
+    }
+}
+
+fn select_openrouter_catalog_model(
+    models: &[&OpenRouterModel],
+    current: &str,
+    prompt: &str,
+) -> Result<Option<String>> {
+    let labels: Vec<_> = models
+        .iter()
+        .map(|model| format_model_label(model, false))
+        .collect();
+    let default = models
+        .iter()
+        .position(|model| model.id == current)
+        .unwrap_or(0);
+    let Some(index) = Select::new()
+        .with_prompt(format!("{prompt} ({} models)", models.len()))
+        .items(&labels)
+        .default(default)
+        .max_length(MODEL_PAGE_SIZE)
+        .interact_opt()?
+    else {
+        return Ok(None);
+    };
+    Ok(models.get(index).map(|model| model.id.clone()))
 }
 
 async fn handle_openrouter_model_picker(config: &Config) -> Result<Option<String>> {

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use vybrid::client::groq::{FunctionCall, Message, ToolCall};
-use vybrid::conversation::Conversation;
+use vybrid::conversation::{Conversation, ToolResultWindow};
 use vybrid::tools::{cargo, executor, file_ops, grep, output, shell};
 
 struct Fixture(PathBuf);
@@ -68,6 +68,223 @@ fn oversized_latest_batch_preserves_every_call_and_result() {
     assert!(request
         .iter()
         .any(|m| m.content.as_deref() == Some("Preserve public API compatibility.")));
+}
+
+#[test]
+fn oversized_file_batch_fits_both_budgets_and_reuses_exact_archives() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let mut window = ToolResultWindow::default();
+    let mut c = Conversation::new("system");
+    c.add_task_message("Keep both files.");
+    c.add_assistant_message(Message {
+        role: "assistant".into(),
+        content: None,
+        tool_call_id: None,
+        tool_calls: Some(vec![call("a"), call("b")]),
+    });
+    let originals = ["α", "β"].map(|ch| ch.repeat(64 * 1024));
+    c.add_tool_result("a", &originals[0]);
+    c.add_tool_result("b", &originals[1]);
+    let mut previous = usize::MAX;
+    for budget in [36_000, 18_000] {
+        let mut request = c.messages_for_request_with_budget(budget);
+        assert!(window.fit(&mut request, budget, &store).unwrap() <= budget);
+        let bytes = serde_json::to_vec(&request).unwrap().len();
+        assert!(bytes < previous);
+        previous = bytes;
+        assert!(request
+            .iter()
+            .any(|m| m.content.as_deref() == Some("Keep both files.")));
+        assert_eq!(
+            request
+                .iter()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flatten()
+                .count(),
+            2
+        );
+        let results: Vec<_> = request.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(results.len(), 2);
+        for (i, result) in results.into_iter().enumerate() {
+            assert_eq!(result.tool_call_id.as_deref(), Some(["a", "b"][i]));
+            let preview = result.content.as_deref().unwrap();
+            let path = preview.split('`').nth(1).unwrap();
+            assert_eq!(fs::read_to_string(path).unwrap(), originals[i]);
+        }
+    }
+    assert_eq!(
+        fs::read_dir(fixture.0.join("tool-results"))
+            .unwrap()
+            .count(),
+        2
+    );
+    assert_eq!(
+        c.messages.last().unwrap().content.as_ref(),
+        Some(&originals[1])
+    );
+    let mut spacious = c.messages_for_request_with_budget(80_000);
+    window.fit(&mut spacious, 80_000, &store).unwrap();
+    assert_eq!(
+        spacious.last().unwrap().content.as_ref(),
+        Some(&originals[1])
+    );
+}
+
+#[tokio::test]
+async fn write_tools_require_explicit_text_and_accept_explicit_empty_strings() {
+    use serde_json::{json, Value};
+    let fixture = Fixture::new();
+    let path = fixture.file("data.txt", "keep me");
+    for (tool, key) in [
+        ("create_file", "content"),
+        ("edit_file", "new_snippet"),
+        ("edit_file", "new_string"),
+    ] {
+        for bad in [None, Some(Value::Null), Some(json!(123))] {
+            let mut args = json!({"file_path": path, "old_string": "keep"});
+            if let Some(bad) = bad {
+                args[key] = bad;
+            }
+            assert!(executor::execute_tool(tool, &args.to_string())
+                .await
+                .is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "keep me");
+        }
+    }
+    executor::execute_tool(
+        "edit_file",
+        &json!({"path":path, "original_snippet":"keep", "new_string":""}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), " me");
+    executor::execute_tool(
+        "create_file",
+        &json!({"file_path":path, "content":""}).to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::metadata(path).unwrap().len(), 0);
+}
+
+#[test]
+fn grep_distinguishes_unsearched_inputs_from_a_genuine_miss() {
+    let fixture = Fixture::new();
+    let path = fixture.file("data.txt", "haystack");
+    let missing = fixture.0.join("missing");
+    let empty_glob = fixture.0.join("*.rs");
+    for (input, hint) in [
+        (&fixture.0, "**/*.rs"),
+        (&missing, "missing"),
+        (&empty_glob, "No files matched"),
+    ] {
+        let error = grep::enhanced_grep("needle", &[input.to_str().unwrap()], 0, true, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("No files searched") && error.contains(hint),
+            "{error}"
+        );
+    }
+    let mixed = grep::enhanced_grep(
+        "needle",
+        &[path.to_str().unwrap(), missing.to_str().unwrap()],
+        0,
+        true,
+        10,
+    )
+    .unwrap();
+    assert!(
+        mixed.contains("No matches found")
+            && mixed.contains("in 1 file")
+            && mixed.contains("missing")
+    );
+}
+
+#[test]
+fn cached_and_uncached_reads_resume_on_the_same_unicode_boundary() {
+    let fixture = Fixture::new();
+    let source = format!("start\n{}🦀{}", "a".repeat(249), "z".repeat(54));
+    let path = fixture.file("data.txt", &source);
+    let cache = file_ops::FileReadCache::default();
+    for cache in [None, Some(&cache), Some(&cache)] {
+        let first = file_ops::read_file_with_options_cached(
+            path.to_str().unwrap(),
+            Some(1),
+            Some(2),
+            Some(256),
+            cache,
+        )
+        .unwrap();
+        let (header, body) = first.split_once("\n\n").unwrap();
+        let offset: usize = header
+            .split("next_byte: ")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(body.len(), offset);
+        assert!(
+            header.contains("returned_bytes: 255")
+                && header.contains("returned_lines: 1-2")
+                && header.contains("more: true")
+        );
+        let second = file_ops::read_streamed_range(
+            path.to_str().unwrap(),
+            1,
+            None,
+            Some(256),
+            Some(offset as u64),
+        )
+        .unwrap();
+        assert!(second.contains("more: false"));
+        assert_eq!(
+            format!("{body}{}", second.split_once("\n\n").unwrap().1),
+            source
+        );
+    }
+}
+
+#[tokio::test]
+async fn command_outcomes_use_the_real_exit_status_and_keep_output() {
+    use serde_json::json;
+    let fixture = Fixture::new();
+    let runtime = executor::ToolRuntime {
+        output_store: fixture.store(),
+        ..Default::default()
+    };
+    for (cmd, code) in [
+        ("echo 'Command failed (exit code 5)'", 0),
+        ("echo diagnostic >&2; exit 7", 7),
+    ] {
+        let outcome = executor::execute_tool_outcome(
+            "execute_bash_command",
+            &json!({"command": cmd}).to_string(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.success(), code == 0);
+        assert_eq!(outcome.exit_status.unwrap().code(), Some(code));
+        assert!(outcome.output.contains(if code == 0 {
+            "exit code 5"
+        } else {
+            "diagnostic"
+        }));
+    }
+    let failed = executor::execute_tool_outcome(
+        "run_cargo",
+        &json!({"subcommand":"check", "manifest_path": fixture.0.join("missing.toml")}).to_string(),
+        &runtime,
+    )
+    .await
+    .unwrap();
+    assert!(!failed.success());
+    assert!(failed.output.contains("missing.toml") && failed.output.contains("exit code"));
 }
 
 #[test]

@@ -1,4 +1,5 @@
 pub mod client;
+pub mod compaction;
 pub mod config;
 pub mod conversation;
 pub mod lsp;

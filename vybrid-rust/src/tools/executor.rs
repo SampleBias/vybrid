@@ -21,6 +21,29 @@ pub struct ToolRuntime {
     pub task_id: Option<String>,
 }
 
+#[derive(Debug)]
+pub struct ToolOutcome {
+    pub output: String,
+    pub exit_status: Option<std::process::ExitStatus>,
+}
+
+impl ToolOutcome {
+    fn command(
+        name: &str,
+        (text, status): (String, std::process::ExitStatus),
+        runtime: &ToolRuntime,
+    ) -> Result<Self> {
+        Ok(Self {
+            output: runtime.output_store.maybe_offload(name, text)?,
+            exit_status: Some(status),
+        })
+    }
+
+    pub fn success(&self) -> bool {
+        self.exit_status.is_none_or(|status| status.success())
+    }
+}
+
 /// Tools that never mutate project or session state. Rounds consisting solely of
 /// these can run concurrently without changing observable behavior.
 pub fn is_read_only_tool(name: &str) -> bool {
@@ -53,14 +76,27 @@ pub async fn execute_tool_with_context(
     arguments: &str,
     runtime: &ToolRuntime,
 ) -> Result<String> {
+    execute_tool_outcome(name, arguments, runtime)
+        .await
+        .map(|outcome| outcome.output)
+}
+
+pub async fn execute_tool_outcome(
+    name: &str,
+    arguments: &str,
+    runtime: &ToolRuntime,
+) -> Result<ToolOutcome> {
     let started = std::time::Instant::now();
     let result = execute_tool_scheduled(name, arguments, runtime).await;
     crate::metrics::tool(
         runtime.task_id.as_deref(),
         name,
         started,
-        result.is_ok(),
-        result.as_ref().map(|s| s.len()).unwrap_or(0),
+        result.as_ref().is_ok_and(|outcome| outcome.success()),
+        result
+            .as_ref()
+            .map(|outcome| outcome.output.len())
+            .unwrap_or(0),
     );
     result
 }
@@ -69,7 +105,7 @@ async fn execute_tool_scheduled(
     name: &str,
     arguments: &str,
     runtime: &ToolRuntime,
-) -> Result<String> {
+) -> Result<ToolOutcome> {
     if !matches!(
         name,
         "execute_bash_command"
@@ -93,7 +129,11 @@ async fn execute_tool_scheduled(
     execute_tool_inner(name, arguments, runtime).await
 }
 
-async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) -> Result<String> {
+async fn execute_tool_inner(
+    name: &str,
+    arguments: &str,
+    runtime: &ToolRuntime,
+) -> Result<ToolOutcome> {
     // Tool arguments arrive as a JSON string from the model. Treat malformed
     // JSON as recoverable feedback instead of silently executing with `{}`.
     let args: Value = serde_json::from_str(arguments).map_err(|e| {
@@ -112,21 +152,16 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
             let line_count = args["line_count"].as_u64().map(|n| n as usize);
             let max_bytes = args["max_bytes"].as_u64().map(|n| n as usize);
             if let Some(start_byte) = args["start_byte"].as_u64() {
-                return file_ops::read_streamed_range(
+                file_ops::read_streamed_range(path, 1, line_count, max_bytes, Some(start_byte))
+            } else {
+                file_ops::read_file_with_options_cached(
                     path,
-                    1,
+                    start_line,
                     line_count,
                     max_bytes,
-                    Some(start_byte),
-                );
+                    Some(&runtime.file_read_cache),
+                )
             }
-            file_ops::read_file_with_options_cached(
-                path,
-                start_line,
-                line_count,
-                max_bytes,
-                Some(&runtime.file_read_cache),
-            )
         }
 
         "read_multiple_files" => {
@@ -143,7 +178,12 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                 .as_str()
                 .or_else(|| args["file_path"].as_str())
                 .unwrap_or("");
-            let content = args["content"].as_str().unwrap_or("");
+            let content = args["content"]
+                .as_str()
+                .ok_or_else(|| anyhow!("create_file: content must be a string"))?;
+            if path.trim().is_empty() {
+                anyhow::bail!("create_file: provide a path or file_path");
+            }
             file_ops::create_file(path, content)
         }
 
@@ -186,10 +226,6 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                 .as_str()
                 .or_else(|| args["old_string"].as_str())
                 .unwrap_or("");
-            let new = args["new_snippet"]
-                .as_str()
-                .or_else(|| args["new_string"].as_str())
-                .unwrap_or("");
             if path.is_empty() {
                 return Err(anyhow!(
                     "edit_file: missing path or file_path — provide the file to edit"
@@ -200,6 +236,10 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                     "edit_file: missing original_snippet or old_string — exact text to find in the file"
                 ));
             }
+            let new = args["new_snippet"]
+                .as_str()
+                .or_else(|| args["new_string"].as_str())
+                .ok_or_else(|| anyhow!("edit_file: new_snippet or new_string must be a string"))?;
             let dry_run = args["dry_run"].as_bool().unwrap_or(false);
             let context_before = args["context_before"].as_str();
             let context_after = args["context_after"].as_str();
@@ -218,8 +258,14 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
             let command = args["command"].as_str().unwrap_or("");
             let description = args["description"].as_str();
             let working_dir = args["working_directory"].as_str();
-            shell::execute_bash_with_store(command, description, working_dir, &runtime.output_store)
-                .await
+            let report = shell::execute_bash_report(
+                command,
+                description,
+                working_dir,
+                &runtime.output_store,
+            )
+            .await?;
+            return ToolOutcome::command(name, report, runtime);
         }
 
         "run_cargo" => {
@@ -246,7 +292,7 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                 })
                 .unwrap_or_default();
             let working_dir = args["working_directory"].as_str();
-            cargo::run_cargo_with_store(
+            let report = cargo::run_cargo_report(
                 subcommand,
                 release,
                 package,
@@ -256,7 +302,8 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                 diagnostic_format,
                 &runtime.output_store,
             )
-            .await
+            .await?;
+            return ToolOutcome::command(name, report, runtime);
         }
 
         "explain_rust_diagnostic" => {
@@ -292,7 +339,10 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
                 .or_else(|| args["path"].as_str())
                 .map(str::to_string);
             let Some(rust_lsp) = runtime.rust_lsp.as_ref() else {
-                return Ok("Rust LSP is not available in this session.".to_string());
+                return Ok(ToolOutcome {
+                    output: "Rust LSP is not available in this session.".into(),
+                    exit_status: None,
+                });
             };
             rust_lsp
                 .query(RustLspQuery {
@@ -392,11 +442,15 @@ async fn execute_tool_inner(name: &str, arguments: &str, runtime: &ToolRuntime) 
 
     // Explicit file ranges are already bounded and carry their source location.
     // Preserve them intact, including when retrieving a saved tool result.
-    if name == "read_file" || name == "read_multiple_files" {
-        result
+    let output = if name == "read_file" || name == "read_multiple_files" {
+        result?
     } else {
-        result.and_then(|output| runtime.output_store.maybe_offload(name, output))
-    }
+        runtime.output_store.maybe_offload(name, result?)?
+    };
+    Ok(ToolOutcome {
+        output,
+        exit_status: None,
+    })
 }
 
 /// Execute a tool synchronously

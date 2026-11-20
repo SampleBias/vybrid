@@ -1,7 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Local;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
-use super::file_ops::{append_to_file, create_file, file_exists, read_file};
+use super::file_ops::{append_to_file, create_file, file_exists, normalize_path};
 
 /// Create the mandatory project structure files
 pub fn create_structure(project_name: Option<&str>, overwrite_existing: bool) -> Result<String> {
@@ -228,15 +231,19 @@ This project is currently under active development. This document maintains cont
 
 /// Get current incomplete todo items
 pub fn get_current_todo_items() -> Result<String> {
-    let todo_path = "tasks/todo.md";
+    read_incomplete_tasks(Path::new(&normalize_path("tasks/todo.md")))
+}
 
-    if !file_exists(todo_path) {
-        return Ok(
-            "No todo.md file found. Use create_project_structure to initialize.".to_string(),
-        );
-    }
-
-    let content = read_file(todo_path)?;
+fn read_incomplete_tasks(path: &Path) -> Result<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(
+                "No todo.md file found. Use create_project_structure to initialize.".to_string(),
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("Reading {}", path.display())),
+    };
     let incomplete: Vec<&str> = content
         .lines()
         .filter(|line| line.trim().starts_with("- [ ]"))
@@ -255,42 +262,80 @@ pub fn get_current_todo_items() -> Result<String> {
 
 /// Mark a todo item as complete
 pub fn mark_todo_complete(task_description: &str) -> Result<String> {
-    let todo_path = "tasks/todo.md";
+    mark_task_in_file(
+        Path::new(&normalize_path("tasks/todo.md")),
+        task_description,
+    )
+}
 
-    if !file_exists(todo_path) {
-        return Err(anyhow::anyhow!("No todo.md file found"));
-    }
-
-    let content_result = read_file(todo_path)?;
-    // Extract just the file content (skip the "Content of 'path':" header)
-    let content = content_result
-        .lines()
-        .skip(2) // Skip "Content of 'path':" and empty line
-        .collect::<Vec<&str>>()
-        .join("\n");
-
-    let mut found = false;
-    let updated_lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            if line.contains("- [ ]") && line.contains(task_description) {
-                found = true;
-                line.replace("- [ ]", "- [x]")
-            } else {
-                line.to_string()
+fn mark_task_in_file(path: &Path, task_description: &str) -> Result<String> {
+    let task_description = task_description.trim();
+    anyhow::ensure!(!task_description.is_empty(), "Provide a task description");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Opening {}", path.display()))?;
+    file.lock()?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let mut offset = 0;
+    let mut matches = Vec::new();
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(description) = trimmed.strip_prefix("- [ ]") {
+            if trimmed.trim_end().contains(task_description) {
+                let exact = description.trim() == task_description
+                    || trimmed.trim_end() == task_description;
+                matches.push((offset + line.len() - trimmed.len() + 3, exact));
             }
-        })
-        .collect();
-
-    if !found {
-        return Err(anyhow::anyhow!(
-            "Task '{}' not found in todo.md",
-            task_description
-        ));
+        }
+        offset += line.len();
     }
-
-    let updated_content = updated_lines.join("\n");
-    create_file(todo_path, &updated_content)?;
+    if matches.iter().any(|(_, exact)| *exact) {
+        matches.retain(|(_, exact)| *exact);
+    }
+    let position = match matches.as_slice() {
+        [(position, _)] => *position,
+        [] => anyhow::bail!("Task '{task_description}' not found in todo.md"),
+        _ => anyhow::bail!(
+            "Multiple incomplete tasks match '{task_description}'. Provide a unique description."
+        ),
+    };
+    file.seek(SeekFrom::Start(position as u64))?;
+    file.write_all(b"x")?;
 
     Ok(format!("Marked task as complete: {}", task_description))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completing_a_late_task_changes_only_its_checkbox() {
+        let path = std::env::temp_dir().join(format!("vybrid-todo-{}", uuid::Uuid::new_v4()));
+        for ending in ["", "\r\n"] {
+            let content = format!(
+                "{}\n- [ ] Ship tests\r\n  - [ ] Ship\r\n- [ ] Café 🦀{ending}",
+                "# notes\r\n".repeat(3_000)
+            );
+            fs::write(&path, &content).unwrap();
+            let incomplete = read_incomplete_tasks(&path).unwrap();
+            assert!(incomplete.contains("Incomplete tasks (3)") && incomplete.contains("Café 🦀"));
+            for bad in ["", "Sh", "nonexistent"] {
+                assert!(mark_task_in_file(&path, bad).is_err());
+                assert_eq!(fs::read_to_string(&path).unwrap(), content);
+            }
+            mark_task_in_file(&path, "Ship").unwrap();
+            let expected = content.replace("- [ ] Ship\r", "- [x] Ship\r");
+            assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+            mark_task_in_file(&path, "🦀").unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                expected.replace("- [ ] Café", "- [x] Café")
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
 }

@@ -260,6 +260,31 @@ pub async fn run_cargo_with_store(
     diagnostic_format: DiagnosticFormat,
     store: &super::output::ToolOutputStore,
 ) -> Result<String> {
+    run_cargo_report(
+        subcommand,
+        release,
+        package,
+        manifest_path,
+        extra_args,
+        working_directory,
+        diagnostic_format,
+        store,
+    )
+    .await
+    .map(|(output, _)| output)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_cargo_report(
+    subcommand: &str,
+    release: bool,
+    package: Option<&str>,
+    manifest_path: Option<&str>,
+    extra_args: &[String],
+    working_directory: Option<&str>,
+    diagnostic_format: DiagnosticFormat,
+    store: &super::output::ToolOutputStore,
+) -> Result<(String, std::process::ExitStatus)> {
     if subcommand.trim().is_empty() {
         return Err(anyhow!(
             "run_cargo: subcommand is required (e.g. check, build, test)"
@@ -386,7 +411,7 @@ pub async fn run_cargo_with_store(
         combined = format!("Command failed (exit code {})\n{}", exit_code, combined);
     }
 
-    Ok(combined)
+    Ok((combined, status))
 }
 
 #[cfg(test)]

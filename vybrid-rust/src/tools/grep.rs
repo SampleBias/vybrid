@@ -29,147 +29,170 @@ pub fn enhanced_grep(
 
     let mut results = Vec::new();
     let mut total_matches = 0;
+    let mut searched = 0;
 
     // Traverse globs lazily so the match limit also bounds directory traversal.
-    let expanded_paths = expand_paths(file_paths)?;
     let mut visited = HashSet::new();
 
     let max_matches = max_matches.max(1);
-    for path in expanded_paths {
-        if total_matches >= max_matches {
-            break;
-        }
-        let path_str = path.to_string_lossy();
+    'inputs: for input in file_paths {
+        for entry in expand_path(input)? {
+            let path = match entry {
+                Ok(path) => path,
+                Err(reason) => {
+                    results.push(reason);
+                    continue;
+                }
+            };
+            let path_str = path.to_string_lossy();
 
-        // Skip non-files
-        if !path.is_file() {
-            continue;
-        }
-        if !visited.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
-            continue;
-        }
-
-        // Read file content
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                results.push(format!("Error reading '{}': {}", path_str, e));
+            if !visited.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
                 continue;
             }
-        };
 
-        let lines: Vec<&str> = content.lines().collect();
-        let mut file_matches = Vec::new();
-        let mut matched_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut actual_matches = std::collections::HashSet::new();
-
-        // Find all matching lines
-        for (line_num, line) in lines.iter().enumerate() {
-            if regex.is_match(line) {
-                if total_matches + actual_matches.len() >= max_matches {
-                    break;
+            // Read file content
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    results.push(format!("Error reading '{}': {}", path_str, e));
+                    continue;
                 }
-                matched_lines.insert(line_num);
-                actual_matches.insert(line_num);
+            };
 
-                // Add context lines
-                let start = line_num.saturating_sub(context_lines);
-                let end = line_num
-                    .saturating_add(context_lines)
-                    .saturating_add(1)
-                    .min(lines.len());
+            let lines: Vec<&str> = content.lines().collect();
+            searched += 1;
+            let mut file_matches = Vec::new();
+            let mut matched_lines: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            let mut actual_matches = std::collections::HashSet::new();
 
-                for ctx_num in start..end {
-                    matched_lines.insert(ctx_num);
-                }
-                if total_matches + actual_matches.len() >= max_matches {
-                    break;
-                }
-            }
-        }
+            // Find all matching lines
+            for (line_num, line) in lines.iter().enumerate() {
+                if regex.is_match(line) {
+                    if total_matches + actual_matches.len() >= max_matches {
+                        break;
+                    }
+                    matched_lines.insert(line_num);
+                    actual_matches.insert(line_num);
 
-        if !matched_lines.is_empty() {
-            let mut sorted_lines: Vec<usize> = matched_lines.into_iter().collect();
-            sorted_lines.sort();
+                    // Add context lines
+                    let start = line_num.saturating_sub(context_lines);
+                    let end = line_num
+                        .saturating_add(context_lines)
+                        .saturating_add(1)
+                        .min(lines.len());
 
-            let mut file_result = format!("=== {} ===\n", path_str);
-            let mut last_line: Option<usize> = None;
-
-            for line_num in sorted_lines {
-                // Add separator if there's a gap
-                if let Some(last) = last_line {
-                    if line_num > last + 1 {
-                        file_result.push_str("...\n");
+                    for ctx_num in start..end {
+                        matched_lines.insert(ctx_num);
+                    }
+                    if total_matches + actual_matches.len() >= max_matches {
+                        break;
                     }
                 }
-
-                let line = lines[line_num];
-                let is_match = actual_matches.contains(&line_num);
-                let prefix = if is_match { ">" } else { " " };
-
-                file_result.push_str(&format!("{} {:4}: {}\n", prefix, line_num + 1, line));
-
-                if is_match {
-                    total_matches += 1;
-                }
-
-                last_line = Some(line_num);
             }
 
-            file_matches.push(file_result);
-        }
+            if !matched_lines.is_empty() {
+                let mut sorted_lines: Vec<usize> = matched_lines.into_iter().collect();
+                sorted_lines.sort();
 
-        if !file_matches.is_empty() {
-            results.extend(file_matches);
+                let mut file_result = format!("=== {} ===\n", path_str);
+                let mut last_line: Option<usize> = None;
+
+                for line_num in sorted_lines {
+                    // Add separator if there's a gap
+                    if let Some(last) = last_line {
+                        if line_num > last + 1 {
+                            file_result.push_str("...\n");
+                        }
+                    }
+
+                    let line = lines[line_num];
+                    let is_match = actual_matches.contains(&line_num);
+                    let prefix = if is_match { ">" } else { " " };
+
+                    file_result.push_str(&format!("{} {:4}: {}\n", prefix, line_num + 1, line));
+
+                    if is_match {
+                        total_matches += 1;
+                    }
+
+                    last_line = Some(line_num);
+                }
+
+                file_matches.push(file_result);
+            }
+
+            if !file_matches.is_empty() {
+                results.extend(file_matches);
+            }
+            if total_matches >= max_matches {
+                break 'inputs;
+            }
         }
     }
 
-    if results.is_empty() {
-        Ok(format!("No matches found for pattern '{}'", pattern))
+    let header = if searched == 0 {
+        return Err(anyhow::anyhow!(
+            "No files searched. {}",
+            truncate_output(&results.join("\n"), MAX_GREP_OUTPUT_BYTES)
+        ));
+    } else if total_matches == 0 {
+        format!("No matches found for pattern '{pattern}' in {searched} file(s).")
     } else {
         let limit_note = if total_matches >= max_matches {
             "\n[Match limit reached; narrow the scope or increase max_matches for more.]"
         } else {
             ""
         };
-        let header = format!(
+        format!(
             "Found {} match(es) for pattern '{}'{}\n{}\n",
             total_matches,
             pattern,
             limit_note,
             "-".repeat(50)
-        );
-        Ok(truncate_output(
-            &(header + &results.join("\n")),
-            MAX_GREP_OUTPUT_BYTES,
-        ))
-    }
+        )
+    };
+    Ok(truncate_output(
+        &(header + "\n" + &results.join("\n")),
+        MAX_GREP_OUTPUT_BYTES,
+    ))
 }
 
 /// Expand file paths including glob patterns
-fn expand_paths(paths: &[&str]) -> Result<impl Iterator<Item = PathBuf>> {
-    let mut expanded: Vec<Box<dyn Iterator<Item = PathBuf>>> = Vec::new();
+type SearchPaths = Box<dyn Iterator<Item = Result<PathBuf, String>>>;
+fn expand_path(path: &str) -> Result<SearchPaths> {
+    let normalized = super::file_ops::normalize_path(path);
 
-    for path in paths {
-        let normalized = super::file_ops::normalize_path(path);
-
-        // Check if it contains glob characters
-        if normalized.contains('*') || normalized.contains('?') || normalized.contains('[') {
-            let entries = glob(&normalized)
-                .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", path, e))?;
-            expanded.push(Box::new(entries.filter_map(move |entry| match entry {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    crate::ui::eprintln_status(format!("Glob error for '{normalized}': {e}"));
-                    None
-                }
-            })));
-        } else {
-            expanded.push(Box::new(std::iter::once(PathBuf::from(normalized))));
+    // Check if it contains glob characters
+    if normalized.contains('*') || normalized.contains('?') || normalized.contains('[') {
+        let mut entries = glob(&normalized)
+            .map_err(|e| anyhow::anyhow!("Invalid glob pattern '{}': {}", path, e))?
+            .filter_map(|entry| match entry {
+                Ok(path) if !path.is_file() => None,
+                Ok(path) => Some(Ok(path)),
+                Err(e) => Some(Err(format!("Glob error: {e}"))),
+            })
+            .peekable();
+        if entries.peek().is_some() {
+            return Ok(Box::new(entries));
         }
+        Ok(Box::new(std::iter::once(Err(format!(
+            "No files matched '{path}'."
+        )))))
+    } else {
+        let literal = PathBuf::from(normalized);
+        let entry = if literal.is_dir() {
+            Err(format!(
+                "'{path}' is a directory. Use a file glob such as '{}/**/*.rs'.",
+                path.trim_end_matches('/')
+            ))
+        } else if literal.is_file() {
+            Ok(literal)
+        } else {
+            Err(format!("'{path}' is missing or is not a regular file."))
+        };
+        Ok(Box::new(std::iter::once(entry)))
     }
-
-    Ok(expanded.into_iter().flatten())
 }
 
 /// Simple grep for quick searches (no context)

@@ -33,6 +33,17 @@ pub async fn execute_bash_with_store(
     working_directory: Option<&str>,
     store: &super::output::ToolOutputStore,
 ) -> Result<String> {
+    execute_bash_report(command, description, working_directory, store)
+        .await
+        .map(|(output, _)| output)
+}
+
+pub(super) async fn execute_bash_report(
+    command: &str,
+    description: Option<&str>,
+    working_directory: Option<&str>,
+    store: &super::output::ToolOutputStore,
+) -> Result<(String, std::process::ExitStatus)> {
     if let Some(desc) = description {
         crate::ui::eprintln_status(format!("Executing: {command} ({desc})"));
     } else {
@@ -114,7 +125,7 @@ pub async fn execute_bash_with_store(
         result = format!("Command failed (exit code {})\n{}", exit_code, result);
     }
 
-    Ok(result)
+    Ok((result, status))
 }
 
 /// Execute a simple command synchronously (for quick operations)

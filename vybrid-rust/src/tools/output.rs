@@ -57,11 +57,7 @@ impl ToolOutputStore {
         ))
     }
 
-    pub fn maybe_offload(&self, tool_name: &str, output: String) -> Result<String> {
-        if output.len() <= OFFLOAD_THRESHOLD_BYTES {
-            return Ok(output);
-        }
-
+    pub(crate) fn archive_text(&self, tool_name: &str, output: &str) -> Result<PathBuf> {
         fs::create_dir_all(&self.dir)
             .with_context(|| format!("Failed to create tool output dir {}", self.dir.display()))?;
         let id = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -72,9 +68,16 @@ impl ToolOutputStore {
             uuid::Uuid::new_v4()
         );
         let path = self.dir.join(file_name);
-        fs::write(&path, &output)
+        fs::write(&path, output)
             .with_context(|| format!("Failed to offload tool result {}", path.display()))?;
+        Ok(path)
+    }
 
+    pub fn maybe_offload(&self, tool_name: &str, output: String) -> Result<String> {
+        if output.len() <= OFFLOAD_THRESHOLD_BYTES {
+            return Ok(output);
+        }
+        let path = self.archive_text(tool_name, &output)?;
         let preview = truncate_utf8_middle(&output, PREVIEW_BYTES, "Preview");
         let truncated = output.len() > PREVIEW_BYTES;
         let omitted_note = if truncated {

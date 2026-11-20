@@ -32,6 +32,12 @@ pub struct GroqModel {
     pub context_window: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct JevRecommendation {
+    pub band: &'static str,
+    pub model: GroqModel,
+}
+
 fn active_default() -> bool {
     true
 }
@@ -84,6 +90,58 @@ pub fn supports_local_tools(model: &str) -> bool {
 
 pub fn is_available(models: &[GroqModel], id: &str) -> bool {
     models.iter().any(|m| m.id == id && m.supports_agent())
+}
+
+/// Groq's live models endpoint publishes availability and context size, but
+/// not price or quality scores. Keep these recommendation profiles explicit,
+/// and intersect them with the freshly fetched catalog and verified tool IDs.
+pub fn jev_recommendations(models: &[GroqModel]) -> Vec<JevRecommendation> {
+    let bands: [(&str, &[&str]); 3] = [
+        (
+            "Premium · strongest available model",
+            &[
+                "meta-models/muse-spark-open",
+                "minimaxai/minimax-m2.7",
+                "qwen/qwen3.8-27b",
+            ],
+        ),
+        (
+            "Mid-cost · strong capability and cost balance",
+            &[
+                "openai/gpt-oss-120b",
+                "moonshotai/kimi-k2-instruct-0905",
+                "qwen/qwen3.6-27b",
+                "qwen/qwen3-32b",
+                "llama-3.3-70b-versatile",
+            ],
+        ),
+        (
+            "Budget · best performance for the cost",
+            &["openai/gpt-oss-20b", "llama-3.1-8b-instant"],
+        ),
+    ];
+    let mut selected = Vec::new();
+    for (band, preferred_ids) in bands {
+        let model = preferred_ids
+            .iter()
+            .find_map(|id| {
+                models
+                    .iter()
+                    .find(|model| model.id == *id && model.supports_agent())
+            })
+            .filter(|model| {
+                !selected
+                    .iter()
+                    .any(|item: &JevRecommendation| item.model.id == model.id)
+            });
+        if let Some(model) = model {
+            selected.push(JevRecommendation {
+                band,
+                model: model.clone(),
+            });
+        }
+    }
+    selected
 }
 
 pub fn filter_models(models: &[GroqModel], query: &ModelQuery) -> Vec<GroqModel> {

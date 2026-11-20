@@ -120,3 +120,135 @@ async fn summary_requests_reject_incomplete_finish_reasons() {
         assert_eq!(server.await.unwrap()["max_tokens"], 2048);
     }
 }
+
+#[tokio::test]
+async fn incomplete_compaction_archives_exact_history_and_keeps_the_recent_tool_group() {
+    use vybrid::client::groq::{FunctionCall, Message, ToolCall};
+    use vybrid::compaction::{Compaction, Compactor};
+
+    let mut c = Conversation::new("system");
+    c.add_task_message("Keep diagnostics in Spanish.");
+    for i in 0..12 {
+        c.add_user_message(&format!("decision {i} {}", "ñ".repeat(160)));
+    }
+    let end = c.messages.len();
+    c.add_assistant_message(Message {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "call-1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+        tool_call_id: None,
+    });
+    c.add_tool_result("call-1", "resultado");
+    for i in 0..7 {
+        c.add_user_message(&format!("recent {i}"));
+    }
+    let original = serde_json::to_value(&c.messages[1..end]).unwrap();
+    let tail = serde_json::to_value(&c.messages[end..]).unwrap();
+    let before = c.estimate_active_tokens();
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    let mut compactor = Compactor::new(dir.clone());
+    let body = json!({"choices":[{"message":{"role":"assistant","content":"partial answer"},"finish_reason":"length"}]}).to_string();
+    let (client, exchange) = mock_response(body, "application/json", None).await;
+    let Compaction::Archived(path) = compactor
+        .compact(Some(&client), &mut c, "focus")
+        .await
+        .unwrap()
+    else {
+        panic!("expected local compaction");
+    };
+    assert!(c.estimate_active_tokens() < before);
+    let request = exchange.await.unwrap();
+    assert!(request["max_tokens"].as_u64().unwrap() < 2048);
+    assert!(c.messages[1]
+        .content
+        .as_ref()
+        .unwrap()
+        .contains(path.to_str().unwrap()));
+    assert!(c
+        .messages
+        .iter()
+        .any(|m| m.content.as_deref() == Some("Keep diagnostics in Spanish.")));
+    let archived: Vec<Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(json!(archived), original);
+    assert_eq!(
+        serde_json::to_value(&c.messages[c.messages.len() - 9..]).unwrap(),
+        tail
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn oversized_old_message_survives_archive_failure_and_can_be_compacted_offline() {
+    use vybrid::compaction::{Compaction, Compactor};
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    std::fs::write(&dir, "blocks creation of the archive directory").unwrap();
+    let mut compactor = Compactor::new(dir.clone());
+    let mut c = Conversation::new("system");
+    let large = "🦀".repeat(25_000);
+    c.add_user_message(&large);
+    for i in 0..8 {
+        c.add_user_message(&format!("recent {i}"));
+    }
+    assert!(c.compactable_transcript(8).is_none());
+    let before = serde_json::to_value(&c.messages).unwrap();
+    assert!(compactor.compact(None, &mut c, "").await.is_err());
+    assert_eq!(serde_json::to_value(&c.messages).unwrap(), before);
+    std::fs::remove_file(&dir).unwrap();
+
+    let Compaction::Archived(path) = compactor.compact(None, &mut c, "").await.unwrap() else {
+        panic!("expected an archive");
+    };
+    let stored: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(stored["content"], large);
+    assert!(c.estimate_active_tokens() < 300);
+    assert!(matches!(
+        compactor.compact(None, &mut c, "").await.unwrap(),
+        Compaction::Unchanged
+    ));
+    assert_eq!(
+        std::fs::read_dir(dir.join("compactions")).unwrap().count(),
+        1
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn completed_compaction_keeps_the_models_summary_without_creating_an_archive() {
+    use vybrid::compaction::{Compaction, Compactor};
+    let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+    let mut compactor = Compactor::new(dir.clone());
+    let mut c = Conversation::new("system");
+    for i in 0..24 {
+        c.add_user_message(&format!("round {i} {}", "x".repeat(480)));
+    }
+    let body = json!({"choices":[{"message":{"role":"assistant","content":"Keep parser.rs compatible."},"finish_reason":"stop"}]}).to_string();
+    let (client, exchange) = mock_response(body, "application/json", None).await;
+    let before = c.estimate_active_tokens();
+    let result = compactor
+        .compact(Some(&client), &mut c, "Remember parser.rs")
+        .await
+        .unwrap();
+    assert!(matches!(result, Compaction::Summarized));
+    assert!(c.estimate_active_tokens() < before);
+    assert!(c.messages[1]
+        .content
+        .as_ref()
+        .unwrap()
+        .contains("Keep parser.rs compatible."));
+    assert!(exchange.await.unwrap()["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Remember parser.rs"));
+    assert!(!dir.exists());
+}

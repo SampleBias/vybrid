@@ -47,6 +47,9 @@ fn stream_api_error_user_message(body: &Value) -> String {
         .unwrap_or("Unknown API error");
     let msg = simplify_tool_validation_message(raw_msg);
     let code = err.get("code").and_then(|c| c.as_str());
+    if code == Some("context_length_exceeded") {
+        return format!("context_length_exceeded: {msg}");
+    }
     let hint = match code {
         Some("failed_generation") => {
             " Retry with smaller tool calls: inspect first, split edits into smaller `edit_file`/`create_file` calls, or describe a large patch as text instead of emitting one huge function call."
@@ -113,6 +116,11 @@ const PROMPT_CACHE_CREDIT_PERCENT: u32 = 80;
 struct RequestCacheShape {
     message_hashes: Vec<u64>,
     tools_hash: u64,
+}
+
+pub(crate) struct PreparedChatStream {
+    pub(crate) body: String,
+    cache_shape: RequestCacheShape,
 }
 
 #[derive(Debug, Clone)]
@@ -710,15 +718,32 @@ impl GroqClient {
         Ok(response)
     }
 
+    pub(crate) fn prepare_chat_stream(
+        &self,
+        messages: &[Message],
+        tools: Option<&[Tool]>,
+    ) -> Result<PreparedChatStream> {
+        let request = self.build_request(messages, tools, true);
+        let body = serde_json::to_string(&request).context("Failed to serialize chat request")?;
+        let cache_shape = request_cache_shape(messages, tools);
+        Ok(PreparedChatStream { body, cache_shape })
+    }
+
     /// Stream chat completion response
     pub async fn chat_stream(
         &self,
         messages: &[Message],
         tools: Option<&[Tool]>,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send>>> {
-        let request = self.build_request(messages, tools, true);
-        let body = serde_json::to_string(&request).context("Failed to serialize chat request")?;
-        let cache_shape = request_cache_shape(messages, tools);
+        self.stream_prepared(self.prepare_chat_stream(messages, tools)?)
+            .await
+    }
+
+    pub(crate) async fn stream_prepared(
+        &self,
+        prepared: PreparedChatStream,
+    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send>>> {
+        let PreparedChatStream { body, cache_shape } = prepared;
         let full_estimate = (body.len() / 4) as u32 + self.tuning.max_completion_tokens;
         let estimated_tokens = self.cache_aware_estimate(full_estimate, &cache_shape);
         let mut metrics = crate::metrics::RequestMetrics::new(

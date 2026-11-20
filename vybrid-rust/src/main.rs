@@ -1,4 +1,5 @@
 mod client;
+mod compaction;
 mod config;
 mod conversation;
 mod lsp;
@@ -14,7 +15,7 @@ mod skills;
 mod tools;
 mod ui;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use console::style;
 use dialoguer::Confirm;
 use futures::StreamExt;
@@ -24,14 +25,15 @@ use std::io::{self, Write};
 use crate::client::groq::{GroqClient, Message, Tool, ToolCall, Usage};
 use crate::client::groq_models::{self, GroqModel};
 use crate::client::jev;
+use crate::compaction::{Compaction, Compactor};
 use crate::config::{Config, LlmProvider};
-use crate::conversation::{Conversation, COMPACT_KEEP_RECENT};
+use crate::conversation::{Conversation, ToolResultWindow};
 use crate::lsp::RustLspManager;
 use crate::memory::{AutoDreamOutcome, MemoryStore};
 use crate::project_docs::ProjectDocs;
 use crate::skills::SkillRegistry;
 use crate::tools::definitions::get_all_tools;
-use crate::tools::executor::{execute_tool_with_context, is_read_only_tool, ToolRuntime};
+use crate::tools::executor::{execute_tool_outcome, is_read_only_tool, ToolOutcome, ToolRuntime};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -225,14 +227,12 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
         }
 
         if input.starts_with("/compact") {
-            if let Some(ref c) = client {
-                if let Err(e) = handle_compact_command(input, c, &mut conversation).await {
-                    ui::print_error(&format!("Compact failed: {}", e));
-                }
-            } else {
-                ui::print_error(
-                    "Compact requires a configured LLM provider. Use /menu to set up API keys.",
-                );
+            let mut compactor = Compactor::new(config.progress_dir.clone());
+            if let Err(error) =
+                handle_compact_command(input, client.as_ref(), &mut conversation, &mut compactor)
+                    .await
+            {
+                ui::print_error(&format!("Could not compact history: {error:#}"));
             }
             continue;
         }
@@ -470,6 +470,7 @@ fn sync_session_after_directory_change(
     tool_runtime: &mut ToolRuntime,
 ) {
     if memory_store.sync_project_root() {
+        tool_runtime.memory = Some(memory_store.clone());
         println!(
             "{}",
             style("Project context updated for the new directory.").dim()
@@ -513,6 +514,7 @@ struct TurnState {
     max_rounds: u32,
     context_token_budget: u32,
     retry_context_token_budget: u32,
+    compactor: Compactor,
     /// Counts of identical read-only tool calls since the last mutating tool ran.
     repeated_tool_calls: std::collections::HashMap<String, u32>,
 }
@@ -523,6 +525,7 @@ impl TurnState {
             max_rounds: config.max_tool_rounds,
             context_token_budget: config.context_token_budget,
             retry_context_token_budget: config.retry_context_token_budget,
+            compactor: Compactor::new(config.progress_dir.clone()),
             repeated_tool_calls: std::collections::HashMap::new(),
         }
     }
@@ -740,9 +743,35 @@ fn is_tool_argument_json_error(e: &anyhow::Error) -> bool {
 }
 
 fn is_context_length_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
+    let s = e.to_string().to_ascii_lowercase();
     s.contains("context_length_exceeded")
-        || s.contains("Please reduce the length of the messages or completion")
+        || s.contains("maximum context length")
+        || s.contains("please reduce the length of the messages or completion")
+}
+
+#[derive(Default)]
+struct ContextRetry {
+    budget: Option<u32>,
+    rejected: Option<(usize, anyhow::Error)>,
+}
+
+impl ContextRetry {
+    fn reduce(&mut self, bytes: usize, tokens: u32, retry_cap: u32, error: anyhow::Error) {
+        self.budget = Some((tokens / 2).clamp(1, retry_cap.max(1)));
+        self.rejected = Some((bytes, error));
+    }
+
+    fn check_size(&mut self, bytes: usize) -> Result<()> {
+        if let Some((previous, error)) = self.rejected.take() {
+            if bytes >= previous {
+                return Err(error.context("The remaining task, tool calls, and required context cannot be reduced further. Use a larger-context model or shorten the task"));
+            }
+            ui::eprintln_status(format!(
+                "Retrying with a smaller context ({previous} → {bytes} request bytes)."
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn is_rate_limit_error(e: &anyhow::Error) -> bool {
@@ -866,7 +895,8 @@ async fn process_ai_response(
     // Only shrink the request after a genuine context-length rejection. Shrinking on
     // every retry used to rewrite the message prefix, invalidating Groq's prompt
     // cache exactly when rate limits made cached (free) tokens most valuable.
-    let mut shrink_context = false;
+    let mut context_retry = ContextRetry::default();
+    let mut tool_window = ToolResultWindow::default();
     let mut compaction_budget_handled = None;
     let mut last_usage: Option<Usage>;
     let mut finish_reason: Option<String>;
@@ -883,11 +913,15 @@ async fn process_ai_response(
         last_usage = None;
         finish_reason = None;
 
-        let request_budget = if route_state.mode == RouteMode::Primary && !shrink_context {
+        let route_budget = if route_state.mode == RouteMode::Primary {
             turn.context_token_budget
         } else {
             turn.retry_context_token_budget
         };
+        let request_budget = context_retry
+            .budget
+            .unwrap_or(route_budget)
+            .min(route_budget);
 
         let request_client = route_state.client_for_request(client);
         let request_tools = if final_answer_only {
@@ -902,28 +936,55 @@ async fn process_ai_response(
             // Bounded summaries, at a compaction boundary only. If a provider is
             // unavailable, the synchronous window still preserves task anchors
             // and complete tool groups.
-            let mut compact_spinner = Some(ui::SpinnerGuard::status("compact"));
+            let mut compact_spinner = ui::SpinnerGuard::status("compact");
+            let before = conversation.estimate_active_tokens();
+            let mut outcome = Compaction::Unchanged;
             for _ in 0..3 {
-                match summarize_conversation(&request_client, conversation, "Preserve the task, constraints, decisions, exact paths, verification results and remaining work.").await {
-                    Ok(true) if conversation.estimate_active_tokens() > request_budget * 3 / 4 => continue,
-                    Ok(_) => break,
-                    Err(e) => {
-                        dismiss_spinner(&mut compact_spinner).await;
-                        eprintln!("Compaction deferred: {e}");
+                match turn
+                    .compactor
+                    .compact(
+                        Some(&request_client),
+                        conversation,
+                        compaction::DEFAULT_FOCUS,
+                    )
+                    .await
+                {
+                    Ok(Compaction::Unchanged) => break,
+                    Ok(result) => outcome = result,
+                    Err(error) => {
+                        compact_spinner.finish().await;
+                        ui::eprintln_status(format!("Using the recent message window. Could not archive older history: {error:#}"));
                         break;
                     }
                 }
+                if conversation.estimate_active_tokens() <= request_budget.saturating_mul(3) / 4
+                    || matches!(outcome, Compaction::Archived(_))
+                {
+                    break;
+                }
             }
-            dismiss_spinner(&mut compact_spinner).await;
+            compact_spinner.finish().await;
+            if !matches!(outcome, Compaction::Unchanged) {
+                ui::eprintln_status(outcome.status(before, conversation.estimate_active_tokens()));
+            }
         }
-        let mut spinner = Some(ui::SpinnerGuard::thinking());
-        let stream = {
-            let request_messages =
+        let (prepared, tokens) = {
+            let mut request_messages =
                 request_messages_for_route(conversation, request_budget, route_state);
-            request_client
-                .chat_stream(&request_messages, request_tools)
-                .await
+            let tokens = tool_window.fit(
+                &mut request_messages,
+                request_budget,
+                &tool_runtime.output_store,
+            )?;
+            (
+                request_client.prepare_chat_stream(&request_messages, request_tools)?,
+                tokens,
+            )
         };
+        let request_bytes = prepared.body.len();
+        context_retry.check_size(request_bytes)?;
+        let mut spinner = Some(ui::SpinnerGuard::thinking());
+        let stream = request_client.stream_prepared(prepared).await;
         let stream = match stream {
             Ok(s) => s,
             Err(e) => {
@@ -991,14 +1052,11 @@ async fn process_ai_response(
                     continue 'stream;
                 }
                 if attempt < MAX_STREAM_ATTEMPTS && is_context_length_error(&e) {
-                    shrink_context = true;
-                    println!(
-                        "{}",
-                        style(format!(
-                            "Context was too large for the provider — retrying with a compacted {}k-token request...",
-                            turn.retry_context_token_budget / 1_000
-                        ))
-                        .yellow()
+                    context_retry.reduce(
+                        request_bytes,
+                        tokens.min(request_budget),
+                        turn.retry_context_token_budget,
+                        e,
                     );
                     continue 'stream;
                 }
@@ -1093,6 +1151,18 @@ async fn process_ai_response(
                 Err(e) => {
                     dismiss_spinner(&mut spinner).await;
                     println!();
+                    if attempt < MAX_STREAM_ATTEMPTS
+                        && !content_started
+                        && is_context_length_error(&e)
+                    {
+                        context_retry.reduce(
+                            request_bytes,
+                            tokens.min(request_budget),
+                            turn.retry_context_token_budget,
+                            e,
+                        );
+                        continue 'stream;
+                    }
                     if attempt < MAX_STREAM_ATTEMPTS
                         && !content_started
                         && is_unavailable_model_error(&e)
@@ -1257,13 +1327,13 @@ async fn process_ai_response(
                 .iter()
                 .all(|tc| is_read_only_tool(&tc.function.name));
 
-        let results: Vec<Result<String>> = if run_concurrently {
+        let results: Vec<Result<ToolOutcome>> = if run_concurrently {
             for tool_call in &executable {
                 ui::print_tool_call(&tool_call.function.name);
             }
             let mut spinner = ui::SpinnerGuard::running(format!("{} tools", executable.len()));
             let results = futures::future::join_all(executable.iter().map(|tc| {
-                execute_tool_with_context(&tc.function.name, &tc.function.arguments, tool_runtime)
+                execute_tool_outcome(&tc.function.name, &tc.function.arguments, tool_runtime)
             }))
             .await;
             spinner.finish().await;
@@ -1273,7 +1343,7 @@ async fn process_ai_response(
             for tool_call in &executable {
                 ui::print_tool_call(&tool_call.function.name);
                 let mut spinner = ui::SpinnerGuard::running(tool_call.function.name.clone());
-                let result = execute_tool_with_context(
+                let result = execute_tool_outcome(
                     &tool_call.function.name,
                     &tool_call.function.arguments,
                     tool_runtime,
@@ -1287,13 +1357,18 @@ async fn process_ai_response(
 
         for (tool_call, result) in executable.iter().zip(results) {
             match &result {
-                Ok(output) => {
-                    ui::print_tool_result(&tool_call.function.name, true);
+                Ok(outcome) => {
+                    ui::print_tool_result(&tool_call.function.name, outcome.success());
                     // Show brief output for some tools
                     if tool_call.function.name == "execute_bash_command"
                         || tool_call.function.name == "run_cargo"
                     {
-                        let preview: String = output.lines().take(5).collect::<Vec<_>>().join("\n");
+                        let preview: String = outcome
+                            .output
+                            .lines()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .join("\n");
                         if !preview.is_empty() {
                             println!("    {}", style(preview).dim());
                         }
@@ -1307,7 +1382,9 @@ async fn process_ai_response(
 
             // Add compacted tool result to conversation. The terminal still shows previews, but
             // the model should not carry large repeated tool payloads across every follow-up turn.
-            let result_str = result.unwrap_or_else(|e| format!("Error: {}", e));
+            let result_str = result
+                .map(|outcome| outcome.output)
+                .unwrap_or_else(|e| format!("Error: {}", e));
             // The tool result already has a bounded presentation and exact
             // retrieval location. Do not shorten fresh evidence a second time.
             let mut history_result = result_str;
@@ -2045,80 +2122,183 @@ fn handle_skill_load_by_name(
 
 async fn handle_compact_command(
     input: &str,
-    client: &GroqClient,
+    client: Option<&GroqClient>,
     conversation: &mut Conversation,
+    compactor: &mut Compactor,
 ) -> Result<()> {
     let focus = input
         .strip_prefix("/compact")
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(
-            "Preserve task goal, files edited, compiler errors, key decisions, and remaining work.",
-        );
-
-    let before_tokens = conversation.estimate_context_tokens();
+        .unwrap_or(compaction::DEFAULT_FOCUS);
+    let before = conversation.estimate_active_tokens();
     let mut spinner = ui::SpinnerGuard::status("compact");
-    let result = summarize_conversation(client, conversation, focus).await;
+    let result = compactor.compact(client, conversation, focus).await;
     spinner.finish().await;
-    if !result? {
-        println!("No complete history range could be reduced; the conversation was preserved.");
-        return Ok(());
-    }
     println!(
-        "Compacted conversation (~{} → ~{} estimated tokens). Recent messages preserved.",
-        before_tokens,
-        conversation.estimate_context_tokens()
+        "{}",
+        result?.status(before, conversation.estimate_active_tokens())
     );
     Ok(())
-}
-
-async fn summarize_conversation(
-    client: &GroqClient,
-    conversation: &mut Conversation,
-    focus: &str,
-) -> Result<bool> {
-    let Some((first_kept, transcript)) = conversation.compactable_transcript(COMPACT_KEEP_RECENT)
-    else {
-        return Ok(false);
-    };
-    let summary_request = vec![
-        Message {
-            role: "system".to_string(),
-            content: Some(
-                "You summarize coding-agent conversation history for context compaction. \
-                 Output a dense bullet summary only. Preserve exact file paths, error codes, \
-                 symbol names, commands run, decisions made, and unfinished tasks. \
-                 Do not invent details."
-                    .to_string(),
-            ),
-            tool_calls: None,
-            tool_call_id: None,
-        },
-        Message {
-            role: "user".to_string(),
-            content: Some(format!(
-                "Summarize the conversation transcript below.\n\nFocus: {focus}\n\n---\n{transcript}"
-            )),
-            tool_calls: None,
-            tool_call_id: None,
-        },
-    ];
-
-    let response = client
-        .with_completion_limit(2_048)
-        .chat(&summary_request, None)
-        .await
-        .context("Compaction summarization request failed")?;
-    let summary = response
-        .content
-        .filter(|s| !s.trim().is_empty())
-        .context("Compaction returned an empty summary; history preserved")?;
-    Ok(conversation.apply_manual_compaction(&summary, first_kept))
 }
 
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn context_retry_requires_a_strictly_smaller_wire_request() {
+        let mut retry = ContextRetry::default();
+        retry.reduce(
+            10_000,
+            900,
+            18_000,
+            anyhow::anyhow!("context_length_exceeded"),
+        );
+        assert_eq!(retry.budget, Some(450));
+        retry.check_size(5_000).unwrap();
+        retry.reduce(
+            5_000,
+            450,
+            18_000,
+            anyhow::anyhow!("context_length_exceeded"),
+        );
+        assert_eq!(retry.budget, Some(225));
+        let error = retry.check_size(5_000).unwrap_err();
+        assert!(format!("{error:#}").contains("context_length_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn context_rejections_shrink_real_requests_until_generation_succeeds() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let error =
+                r#"{"error":{"message":"Input too long","code":"context_length_exceeded"}}"#;
+            let mut sizes = vec![];
+            for (status, body) in [
+                ("400 Bad Request", error.to_owned()),
+                ("200 OK", format!("data: {error}\n\n")),
+                ("200 OK", "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".into()),
+            ] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut length: Option<usize> = None;
+                loop {
+                    let mut line = String::new();
+                    assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" { break; }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse().unwrap()); }
+                    }
+                }
+                let mut request = vec![0; length.unwrap()];
+                socket.read_exact(&mut request).await.unwrap();
+                sizes.push(request.len());
+                let json: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(json["messages"].as_array().unwrap().last().unwrap()["tool_call_id"], "call_1");
+                let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            }
+            sizes
+        });
+        let root =
+            std::env::temp_dir().join(format!("vybrid-context-retry-{}", uuid::Uuid::new_v4()));
+        let rt = ToolRuntime {
+            output_store: tools::output::ToolOutputStore::new(&root),
+            ..Default::default()
+        };
+        let mut turn = TurnState {
+            max_rounds: 4,
+            context_token_budget: 36_000,
+            retry_context_token_budget: 18_000,
+            compactor: Compactor::new(root.clone()),
+            repeated_tool_calls: Default::default(),
+        };
+        let mut route = RouteState::new(false, String::new(), String::new(), String::new(), false);
+        let mut c = Conversation::new("system");
+        c.add_task_message("Read the file.");
+        c.add_assistant_message(Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: client::groq::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"file_path":"data.txt"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+        });
+        c.add_tool_result("call_1", &"evidence ".repeat(30_000));
+        let client = GroqClient::new(
+            "test".into(),
+            format!("http://{addr}/v1"),
+            "test".into(),
+            Default::default(),
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            process_ai_response(&client, &mut c, &rt, 0, "local", &mut route, &mut turn),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sizes = server.await.unwrap();
+        assert!(sizes.windows(2).all(|pair| pair[0] > pair[1]), "{sizes:?}");
+        assert_eq!(
+            c.messages.last().unwrap().content.as_deref(),
+            Some("Recovered")
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("tool-results"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changing_project_rebinds_user_and_tool_memory_to_one_session() {
+        let root = std::env::temp_dir().join(format!("vybrid-rebind-{}", uuid::Uuid::new_v4()));
+        let mut store =
+            MemoryStore::with_project_root(root.join("old-project"), root.join("messages"), "old");
+        let mut runtime = ToolRuntime {
+            memory: Some(store.clone()),
+            ..Default::default()
+        };
+        let mut c = Conversation::new("system");
+        c.add_task_message("before-switch");
+        record_latest_memory_message(&store, &c);
+        let old_path = store.transcript_path();
+        sync_session_after_directory_change(&mut store, &mut runtime);
+        let tools = runtime.memory.as_ref().unwrap();
+        assert_ne!(store.transcript_path(), old_path);
+        assert_eq!(store.transcript_path(), tools.transcript_path());
+        c.add_task_message("after-switch user");
+        record_latest_memory_message(&store, &c);
+        c.add_assistant_message(Message {
+            role: "assistant".into(),
+            content: Some("after-switch assistant".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        record_latest_memory_message(tools, &c);
+        c.add_tool_result("call", "after-switch tool result");
+        record_latest_memory_message(tools, &c);
+        let found = tools.search_transcripts("after-switch", true, 10).unwrap();
+        for role in ["user", "assistant", "tool result"] {
+            assert!(found.contains(&format!("after-switch {role}")));
+        }
+        assert!(!found.contains("before-switch"));
+        assert!(!std::fs::read_to_string(old_path)
+            .unwrap()
+            .contains("after-switch"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn only_model_availability_errors_trigger_model_fallback() {

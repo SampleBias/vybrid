@@ -206,7 +206,7 @@ pub fn read_file_with_options_cached(
     let limit = max_bytes
         .unwrap_or(DEFAULT_READ_FILE_BYTES)
         .clamp(MIN_READ_FILE_BYTES, MAX_READ_FILE_BYTES);
-    let (body, truncated) = truncate_utf8(selected, limit);
+    let body = &selected[..selected.floor_char_boundary(limit)];
     let display_path = crate::project_context::root_relative(file_path);
 
     let mut header = format!(
@@ -226,7 +226,7 @@ pub fn read_file_with_options_cached(
             header.push_str(&format!(", returned_lines: {}-{}", start, end));
         }
     }
-    if truncated {
+    if body.len() < selected.len() {
         header.push_str(", truncated: true");
     }
     header.push_str(&format!(
@@ -541,26 +541,6 @@ fn occurrence_previews(content: &str, matches: &[usize], max_previews: usize) ->
 pub fn file_exists(path: &str) -> bool {
     let normalized = normalize_path(path);
     Path::new(&normalized).exists()
-}
-
-fn truncate_utf8(content: &str, max_bytes: usize) -> (String, bool) {
-    if content.len() <= max_bytes {
-        return (content.to_string(), false);
-    }
-    let split = content
-        .char_indices()
-        .take_while(|(idx, _)| *idx < max_bytes)
-        .last()
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .unwrap_or(0);
-    (
-        format!(
-            "{}\n\n[File output truncated at {} bytes; read a narrower line range for more.]",
-            &content[..split],
-            max_bytes
-        ),
-        true,
-    )
 }
 
 /// Append content to a file
