@@ -1,6 +1,6 @@
 [package]
 name = "vybrid"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "AI powered coding assistant built from the trenches with Rust to save humanity from bloat."
 authors = ["Vybrid Team"]
@@ -28,6 +28,8 @@ dotenvy = "0.15"
 dialoguer = "0.11"
 console = "0.15"
 rustyline = "18.0.0"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }

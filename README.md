@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/vybrid-banner.png" alt="Vybrid — AI Coding Assistant from the Trenches built in Rust" width="800" />
+  <img src="assets/vybrid-banner.png" alt="Vybrid — Agentic Coding Harness from the Trenches built in Rust" width="800" />
 </p>
 
 # Vybrid
 
-AI powered coding assistant built from the trenches with Rust to save humanity from bloat.
+Agentic Coding Harness from the Trenches built in Rust.
 
 **Repository:** [github.com/SampleBias/vybrid](https://github.com/SampleBias/vybrid)
 
@@ -383,7 +383,9 @@ vybrid
 
 ### Startup
 
-Vybrid starts directly in **Agent Mode** with all tools available.
+Vybrid starts directly in **Agent Mode** with all tools available. The context meter sits above the framed `You>` prompt. Long prompts and pasted text wrap as you type.
+
+When Jev routing is enabled, `jev` shows the elapsed time while it selects a model. A violet-to-pink glyph animation runs while Vybrid waits for the model. If the provider streams thinking text, it appears in an open-sided box. The answer begins at `Assistant>`. Piped sessions use plain prompts and responses.
 
 ### Agent Mode Commands
 
@@ -545,7 +547,8 @@ vybrid-rust/
 │   ├── lsp.rs          # Optional rust-analyzer LSP client
 │   ├── project_docs.rs # Project-specific docs context
 │   ├── rust_agent_reference.rs # Rust workflow and diagnostic guidance
-│   ├── ui.rs           # Terminal UI helpers
+│   ├── ui.rs           # Banner, status indicators, and loading animation
+│   ├── ui/             # Interactive prompt and streamed response rendering
 │   ├── client/
 │   │   ├── groq.rs     # OpenAI-compatible chat client (Groq, OpenRouter, LM Studio)
 │   │   ├── groq_models.rs # Groq catalog, coding compatibility, search, and cache
@@ -605,7 +608,13 @@ Vybrid also stores runtime data in `~/.vybrid/`:
 
 ## Changelog
 
-### Unreleased
+### 1.1.2
+
+- Framed the chat prompt so its lower rule follows wrapped input and paste.
+- Added a violet border around streamed thinking text and updated the model loader with a violet-to-pink gradient.
+- Updated the startup banner to “Agentic Coding Harness from the Trenches built in Rust.”
+
+### 1.1.1
 
 - **Harness efficiency and correctness**: Task-preserving compaction, project-context snapshots, UTF-8-safe streaming and previews, bounded file/log handling, corrected grep limits, synchronized LSP edits, capability-preserving fallback, and optional local attempt/usage metrics.
 

@@ -115,6 +115,7 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     let mut memory_store = MemoryStore::new(config.messages_dir.clone());
     let mut skill_registry = SkillRegistry::discover();
     let mut conversation = Conversation::new(&build_system_prompt(&skill_registry));
+    let mut prompt = ui::ChatPrompt::new()?;
     let mut tool_runtime = ToolRuntime {
         rust_lsp: Some(rust_lsp.clone()),
         memory: Some(memory_store.clone()),
@@ -133,12 +134,8 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
             config.reasoning_effort.as_deref(),
             &rust_lsp_status,
         );
-        print!("{} ", style("You>").magenta().bold());
-        io::stdout().flush()?;
-
-        // Read on a blocking thread so the Tokio runtime (spinner, LSP, Ctrl-C
-        // handling) is never stalled while waiting on the user.
-        let input = match read_stdin_line().await {
+        // Let Tokio service the LSP and other tasks while the terminal waits for input.
+        let input = match tokio::task::block_in_place(|| prompt.read_line()) {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(e) => {
@@ -383,20 +380,6 @@ async fn run_agent_mode(mut config: Config) -> Result<()> {
     run_autodream_idle_consolidation(&memory_store);
 
     Ok(())
-}
-
-/// Blocking stdin read off the async runtime. `Ok(None)` signals EOF.
-async fn read_stdin_line() -> io::Result<Option<String>> {
-    tokio::task::spawn_blocking(|| {
-        let mut line = String::new();
-        match io::stdin().read_line(&mut line) {
-            Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(line)),
-            Err(e) => Err(e),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| Err(io::Error::other(format!("stdin task failed: {e}"))))
 }
 
 /// One Jev decision for this user turn. The returned client is used for the whole tool loop.
@@ -886,9 +869,7 @@ async fn process_ai_response(
     /// reasoning before reporting malformed tool JSON, so retry after thinking but before content.
     const MAX_STREAM_ATTEMPTS: u32 = 5;
 
-    let mut reasoning_started: bool;
     let mut content_started: bool;
-    let mut terminal_out = ui::TerminalWriter::new();
     let mut final_content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut rate_limit_note_added = false;
@@ -905,9 +886,8 @@ async fn process_ai_response(
     'stream: loop {
         attempt += 1;
 
-        reasoning_started = false;
+        let mut display = ui::ResponseDisplay::default();
         content_started = false;
-        terminal_out.reset();
         final_content.clear();
         tool_calls.clear();
         last_usage = None;
@@ -1088,12 +1068,7 @@ async fn process_ai_response(
                             .as_deref()
                             .filter(|text| !text.is_empty())
                         {
-                            if !reasoning_started {
-                                println!();
-                                println!("{}", style("Thinking:").blue().dim());
-                                reasoning_started = true;
-                            }
-                            print!("{}", style(terminal_out.push(reasoning)).dim());
+                            print!("{}", display.thinking(reasoning));
                             io::stdout().flush()?;
                         }
 
@@ -1104,20 +1079,18 @@ async fn process_ai_response(
                             .as_deref()
                             .filter(|text| !text.is_empty())
                         {
-                            if !content_started {
-                                if reasoning_started {
-                                    print!("\r\n\r\n");
-                                }
-                                print!("{} ", style("Assistant>").cyan().bold());
-                                content_started = true;
-                            }
-                            print!("{}", terminal_out.push(content));
+                            content_started = true;
+                            print!("{}", display.answer(content));
                             io::stdout().flush()?;
                             final_content.push_str(content);
                         }
 
                         // Handle tool calls
                         if let Some(tc_deltas) = &choice.delta.tool_calls {
+                            if !tc_deltas.is_empty() {
+                                print!("{}", display.finish());
+                                io::stdout().flush()?;
+                            }
                             for tc_delta in tc_deltas {
                                 while tool_calls.len() <= tc_delta.index {
                                     tool_calls.push(ToolCall {
@@ -1150,6 +1123,7 @@ async fn process_ai_response(
                 }
                 Err(e) => {
                     dismiss_spinner(&mut spinner).await;
+                    print!("{}", display.finish());
                     println!();
                     if attempt < MAX_STREAM_ATTEMPTS
                         && !content_started
@@ -1235,6 +1209,8 @@ async fn process_ai_response(
         }
 
         dismiss_spinner(&mut spinner).await;
+        print!("{}", display.finish());
+        io::stdout().flush()?;
 
         if let Some(problem) = incomplete_completion_reason(
             finish_reason.as_deref(),
@@ -1262,11 +1238,6 @@ async fn process_ai_response(
         }
 
         break 'stream;
-    }
-
-    if content_started || reasoning_started {
-        print!("{}\r\n", terminal_out.finish());
-        io::stdout().flush()?;
     }
 
     if let Some(usage) = &last_usage {

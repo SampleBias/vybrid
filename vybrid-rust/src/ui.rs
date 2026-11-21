@@ -7,6 +7,24 @@ use std::sync::{Arc, Mutex};
 
 use crate::lsp::{RustLspState, RustLspStatus};
 
+mod prompt;
+mod response;
+pub use prompt::ChatPrompt;
+pub use response::ResponseDisplay;
+
+fn interactive_terminal() -> bool {
+    use std::io::{self, IsTerminal};
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && !matches!(
+            std::env::var("TERM")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "dumb" | "emacs" | "cons25"
+        )
+}
+
 /// Approximate `openai/gpt-oss-120b` context window (tokens). Used only for the CLI meter.
 pub const CONTEXT_WINDOW_TOKENS: u32 = 131_072;
 
@@ -48,9 +66,13 @@ impl SpinnerGuard {
 
     fn spawn(kind: SpinnerKind) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        if !interactive_terminal() || !Term::stderr().is_term() {
+            return Self { stop, handle: None };
+        }
         let stop_clone = stop.clone();
         let handle = tokio::spawn(async move {
             let started = std::time::Instant::now();
+            let color = console::colors_enabled_stderr();
             let mut tick = 0u32;
             loop {
                 let frame = render_spinner_frame(&kind, tick, started.elapsed().as_secs());
@@ -59,6 +81,11 @@ impl SpinnerGuard {
                     if stop_clone.load(Ordering::Relaxed) {
                         break;
                     }
+                    let frame = if color {
+                        frame.into()
+                    } else {
+                        console::strip_ansi_codes(&frame)
+                    };
                     eprint!("\r\x1b[2K{frame}");
                     let _ = std::io::stderr().flush();
                 }
@@ -94,7 +121,10 @@ impl Drop for SpinnerGuard {
 /// Print a full stderr line without appending it to the spinner's current row.
 pub fn eprintln_status(line: impl std::fmt::Display) {
     let _guard = lock_activity();
-    eprintln!("\r\x1b[2K{line}");
+    if interactive_terminal() && Term::stderr().is_term() {
+        eprint!("\r\x1b[2K");
+    }
+    eprintln!("{line}");
 }
 
 fn activity_draw() -> &'static Mutex<()> {
@@ -157,9 +187,10 @@ fn glyph_frame(tick: u32) -> [char; SPINNER_GLYPHS] {
 }
 
 fn glyph_color(index: usize) -> (u8, u8, u8) {
-    let span = SPINNER_GLYPHS.saturating_sub(1).max(1);
-    let blue = (index * 255 / span) as u8;
-    (255 - blue, 0, blue)
+    let span = SPINNER_GLYPHS - 1;
+    let blend =
+        |violet: usize, pink: usize| ((violet * (span - index) + pink * index) / span) as u8;
+    (blend(169, 255), blend(112, 92), blend(255, 184))
 }
 
 /// Eight filled/empty circles as a discrete ring plus rough token counts.
@@ -277,7 +308,7 @@ pub fn display_banner() {
     println!("{}", style(banner).magenta());
     println!(
         "{}",
-        style("AI Coding Assistant from the Trenches built in Rust").dim()
+        style("Agentic Coding Harness from the Trenches built in Rust").dim()
     );
     println!(
         "{}",
@@ -450,8 +481,8 @@ mod tests {
         assert_eq!(glyphs.len(), SPINNER_GLYPHS);
         assert!(glyphs.iter().all(|glyph| SPINNER_RUNES.contains(glyph)));
         assert_ne!(glyph_frame(0), glyph_frame(1));
-        assert_eq!(glyph_color(0), (255, 0, 0));
-        assert_eq!(glyph_color(SPINNER_GLYPHS - 1), (0, 0, 255));
+        assert_eq!(glyph_color(0), (169, 112, 255));
+        assert_eq!(glyph_color(SPINNER_GLYPHS - 1), (255, 92, 184));
 
         let thinking = render_spinner_frame(&SpinnerKind::Thinking, 16, 4);
         assert!(thinking.contains("\x1b[38;2;"));
